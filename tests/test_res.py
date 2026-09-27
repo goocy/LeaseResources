@@ -1087,6 +1087,38 @@ class T15ScanDoesNotBlock(Base):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
+class T16StableRecords(Base):
+    """A long tool command that keeps spawning and reaping short children, some of which are res.py, is one record
+    for its whole life: one "seen", one "ended"."""
+
+    def test_child_churn_keeps_one_record(self):
+        w = World("churn", {"unleased_after_seconds": 3})
+        fake = fake_claude(w, self)
+        (w.allowed / "res.py").write_text("import time\ntime.sleep(0.8)\n")          # an ignored name, short-lived
+        (w.allowed / "churn.py").write_text(
+            "import subprocess, sys, time\nend = time.time() + 16\nwhile time.time() < end:\n"
+            "    subprocess.call([sys.executable, 'res.py'])\n    subprocess.call([sys.executable, '-c', 'pass'])\n"
+            "    time.sleep(0.3)\n")
+        w.dispatcher("Altiplano")
+        cmd = ("echo shell-snapshots-fake >nul & " + q(PYTHON) + " churn.py" if WINDOWS
+               else "true shell-snapshots-fake; " + q(PYTHON) + " churn.py")
+        shell = subprocess.Popen(fake + [cmd], cwd=str(w.allowed), env=w.env("Altiplano"))
+        shell.wait(40)
+
+        def rows():
+            path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
+            return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
+        mine = lambda: [r for r in rows() if any("churn.py" in c for c in r.get("commands", [])) or "churn.py" in r.get("shell", "")]
+        seen = w.wait(lambda: [r for r in mine() if r["event"] == "seen"], 10, "seen record")
+        keys = {r["key"] for r in seen}
+        w.wait(lambda: [r for r in rows() if r["event"] == "ended" and r["key"] in keys], 15, "ended record")
+        ended = [r for r in rows() if r["event"] == "ended" and r["key"] in keys]
+        measured("churn.records", {"seen": len(seen), "ended": len(ended), "lifetime": ended[0].get("lifetime")})
+        self.assertEqual(len(seen), 1, seen)
+        self.assertEqual(len(ended), 1, ended)
+        self.assertGreaterEqual(ended[0]["lifetime"], 14)
+
+
 def main():
     SCRATCH.mkdir(parents=True, exist_ok=True)
     print("scratch: " + str(SCRATCH), flush=True)

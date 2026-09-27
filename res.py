@@ -2323,10 +2323,13 @@ class Dispatcher:
             if lifetime >= after:                     # ended between two scans after running long enough
                 self.write_seen(key, dict(rec, age=lifetime), now, note="recorded at its end; it ended between two scans")
                 self.end_record(key, now)
-        for key in list(self.unleased_seen):
-            if key not in found:
-                self.end_record(key, now)
         live_keys = {key_of(pid) for pid in info}
+        for key in list(self.unleased_seen):
+            # A record ends only when its process ends: whether it qualifies can flicker with its children (a test
+            # suite spawning short res.py children is skipped in the scans that catch one), which must not split one
+            # command into several records (Moosfels round 4: four pairs for one suite run).
+            if key not in live_keys:
+                self.end_record(key, now)
         self.env_cache = {k: v for k, v in self.env_cache.items() if k in live_keys}
         self.tool_members = {k: v for k, v in self.tool_members.items() if k in live_keys}
 
