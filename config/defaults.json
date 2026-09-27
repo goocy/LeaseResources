@@ -31,7 +31,7 @@
 
   "allowed_programs": ["python", "pythonw", "py", "powershell", "pwsh"],
   "allowed_roots": ["~/ResilioSync/Services", "~/ResilioSync/Projects", "~/ResilioSync/Tools"],
-  "check_local_runs": true,
+  "check_local_runs": false,
 
   "disk_default_bytes_per_s": 150000000,
   "disk_capacity": {},

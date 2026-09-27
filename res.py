@@ -1034,11 +1034,16 @@ def cmd_release(args, config: dict) -> None:
 
 # ---------------------------------------------------------------- run and the runner
 
-def start_runner(machine: str, ident: str) -> subprocess.Popen:
+def start_runner(machine: str, ident: str, program: list, cwd: str) -> subprocess.Popen:
+    """Start the detached runner on exactly this program. What it runs travels in a launch file in the local folder,
+    which is never synced, not in the synced order: nothing written into leases/ by another machine can change what a
+    runner executes, and a check made before this call covers exactly what runs (no swap between check and start)."""
+    launch = LOCAL_DIR / "launch" / (ident + ".json")
+    write_json(launch, {"argv": list(program), "cwd": cwd, "machine": machine, "lease": ident, "written": now_iso()})
     python = venv_python(windowless=True)
     if not python.exists():
         python = Path(sys.executable)
-    argv = [str(python), "-B", str(SCRIPT), "_runner", machine, ident]
+    argv = [str(python), "-B", str(SCRIPT), "_runner", machine, ident, str(launch)]
     return popen_detached(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                           cwd=str(SERVICE_DIR), env=dict(os.environ, LEASERES_MACHINE=machine))
 
@@ -1062,11 +1067,16 @@ def cmd_run(args, config: dict) -> None:
         raise SystemExit(args.lease + " already has a run order; one lease, one run.")
     cwd = os.path.abspath(args.cwd or os.getcwd())
     local_start = target == here and state == "granted"
-    if target == here and config.get("check_local_runs", True):
+    # A direct local run is started by this very process for the session that typed it, so it may run any program
+    # (D-260927-7). Everything else is started later by a dispatcher from the synced folder and keeps the program rule;
+    # a queued local run is checked now as well, so the refusal comes at once instead of by mail.
+    if (not local_start or config.get("check_local_runs", False)) and target == here:
         ok, reason, script = check_program(argv, cwd, config)
         if not ok:
             log(here, "REFUSED run of " + args.lease + ": " + reason + " (" + " ".join(argv) + ")")
-            raise SystemExit("Refused: " + reason + ". Every refusal is logged.")
+            raise SystemExit("Refused: " + reason + ". Only a run on a lease already granted on this machine may use any"
+                             + " program; queued and cross-machine runs are started from the synced folder and must be a"
+                             + " script under the allowed roots. Every refusal is logged.")
     order = {"lease": args.lease, "argv": resolve_interpreter(argv) if target == here else argv, "cwd": cwd,
              "from_machine": here, "ordered": now_iso(), "start": "res" if local_start else "dispatcher",
              "desk": lease.get("desk", "")}
@@ -1080,7 +1090,8 @@ def cmd_run(args, config: dict) -> None:
         print("Run order written; the dispatcher " + where + "starts it when the lease is granted (now: " + str(state)
               + "), and mails " + lease.get("desk", "") + " when it starts and ends.\n  " + str(path))
         return
-    start_runner(target, args.lease)
+    log(here, "local run " + args.lease + " started by res itself (program rule not applied): " + " ".join(order["argv"]))
+    start_runner(target, args.lease, order["argv"], cwd)
     run_path = side_path(target, args.lease, ".run.json")
     deadline = time.monotonic() + 10
     run = {}
@@ -1121,16 +1132,23 @@ def cmd_run(args, config: dict) -> None:
 def cmd_runner(args, config: dict) -> None:
     """The detached parent of a leased job: starts it with unbuffered output into the log, records pid and exit code."""
     machine, ident = args.machine, args.ident
-    order = read_json(side_path(machine, ident, ".order.json"))
+    launch = Path(args.launch)
     run_path = side_path(machine, ident, ".run.json")
     me = psutil.Process()
     run = {"runner_pid": me.pid, "runner_create_time": me.create_time(), "started": now_iso()}
-    argv = order.get("argv") or []
+    if not under(launch.resolve(), (LOCAL_DIR / "launch").resolve()):
+        write_json(run_path, dict(run, error="launch file outside the local folder: " + str(launch), ended=now_iso(), exit=None))
+        return
+    order = read_json(launch)
+    try:
+        launch.unlink()
+    except OSError:
+        pass
+    argv = resolve_interpreter(order.get("argv") or [])
     cwd = order.get("cwd") or str(Path.home())
-    if order.get("from_machine") and order.get("from_machine") != machine:
-        cwd = translate_path(cwd)
-        argv = [argv[0]] + [translate_path(a) if ("/" in a or chr(92) in a) else a for a in argv[1:]]
-    argv = resolve_interpreter(argv)
+    if not argv:
+        write_json(run_path, dict(run, error="empty launch file", ended=now_iso(), exit=None))
+        return
     env = dict(os.environ, PYTHONUNBUFFERED="1", LEASERES_LEASE=ident)
     env.pop("LEASERES_REEXEC", None)
     if sys.platform == "darwin":
@@ -1493,10 +1511,12 @@ class Dispatcher:
         order = read_json(side_path(self.machine, lease["id"], ".order.json"))
         if not order or order.get("start") != "dispatcher":
             return
+        # Everything here comes from the synced folder, whatever machine the file claims to be from: the program
+        # rule always applies, and exactly the checked program is handed to the runner.
         argv = list(order.get("argv") or [])
-        cwd = order.get("cwd") or ""
-        if order.get("from_machine") != self.machine:
-            cwd = translate_path(cwd)
+        cwd = translate_path(order.get("cwd") or "") or str(Path.home())
+        if argv:
+            argv = [argv[0]] + [translate_path(a) if ("/" in a or chr(92) in a) else a for a in argv[1:]]
         ok, reason, script = check_program(argv, cwd, self.config)
         if not ok:
             log(self.machine, "REFUSED run of " + lease["id"] + " ordered from " + str(order.get("from_machine")) + ": " + reason
@@ -1510,7 +1530,7 @@ class Dispatcher:
         lease.update(state="starting", starting=now_iso())
         self.save(lease)
         log(self.machine, "starting run of " + lease["id"] + ": " + " ".join(argv))
-        start_runner(self.machine, lease["id"])
+        start_runner(self.machine, lease["id"], resolve_interpreter(argv), cwd)
 
     def handle_orders(self) -> None:
         for lease in self.leases():
@@ -2018,6 +2038,7 @@ def main() -> None:
     p = sub.add_parser("_runner")
     p.add_argument("machine")
     p.add_argument("ident")
+    p.add_argument("launch")
     args = parser.parse_args()
     config = load_config()
     handlers = {"now": cmd_now, "mine": cmd_mine, "trial": cmd_trial, "request": cmd_request, "extend": cmd_extend,

@@ -504,43 +504,70 @@ class T6CrossMachine(unittest.TestCase):
 
 
 class T8Safety(unittest.TestCase):
-    """R8: programs outside the allowed roots, non-interpreters and inline code are refused and logged, locally and when
-    ordered from another machine; a symlink out of the root does not help."""
+    """R8 after D-260927-7: a session's direct local run may use any program; anything that arrives through the synced
+    folder (orders from another machine, and files planted there claiming to be local) keeps the program rule in full,
+    is refused and logged, and never runs."""
 
-    def test_refusals(self):
+    def test_local_bypass_and_synced_refusals(self):
         w = World("safety")
         w.dispatcher("Altiplano")
         w.dispatcher("Mistral")
         (w.allowed / "link.py").symlink_to(w.outside / "evil.py")
+        marker = w.root / "marker-local.txt"
+        shell = ["/bin/sh", "-c", "echo local-ok; echo ran > " + str(marker)]
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        run = w.res("Altiplano", "run", "--lease", lid, "--", *shell)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        w.wait(lambda: w.lease("Altiplano", lid).get("state") == "finished", 20, "local shell run finished")
+        self.assertTrue(marker.exists())
+        self.assertIn("local-ok", (w.data / "leases" / "Altiplano" / (lid + ".log")).read_text())
+        self.assertIn("program rule not applied", w.logtext("Altiplano"))
+        measured("R8.local_nonpython_run", w.lease("Altiplano", lid).get("state"))
+
         cases = {
-            "shell": ["/bin/sh", "-c", "echo hi"],
+            "shell": ["/bin/sh", "-c", "echo remote > " + str(w.root / "marker-remote.txt")],
             "outside": ["python3", str(w.outside / "evil.py")],
             "inline": ["python3", "-c", "print(1)"],
             "module": ["python3", "-m", "http.server"],
             "symlink": ["python3", str(w.allowed / "link.py")],
         }
-        results = {}
+        remote = {}
         for name, argv in cases.items():
-            lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
-            run = w.res("Altiplano", "run", "--lease", lid, "--", *argv)
-            results[name] = (run.returncode, (run.stdout + run.stderr).strip().splitlines()[-1][:120])
-            self.assertNotEqual(run.returncode, 0, name)
-            self.assertIn("Refused", run.stdout + run.stderr, name)
-            self.assertFalse((w.data / "leases" / "Altiplano" / (lid + ".run.json")).exists(), name)
-        measured("R8.local_refusals", results)
-        log = w.logtext("Altiplano")
-        self.assertEqual(log.count("REFUSED"), len(cases))
-        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--on", "Mistral", "--desk", "Altiplano:Owner").stdout)
-        w.wait(lambda: w.lease("Mistral", lid).get("state") == "granted", 15, "remote grant")
-        w.res("Altiplano", "run", "--lease", lid, "--on", "Mistral", "--", "python3", str(w.outside / "evil.py"))
-        refused = w.wait(lambda: w.mail_matching("refused"), 15, "remote refusal mail")
-        self.assertIn("outside the allowed roots", refused[0]["body"])
-        self.assertIn("REFUSED", w.logtext("Mistral"))
-        self.assertFalse((w.data / "leases" / "Mistral" / (lid + ".log")).exists())
-        measured("R8.remote_refusal", w.lease("Mistral", lid).get("answer"))
-        ok_lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
-        ok = w.res("Altiplano", "run", "--lease", ok_lid, "--", "python3", str(w.allowed / "sleepy.py"), "1")
-        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            rid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--on", "Mistral", "--desk", "Altiplano:Owner").stdout)
+            w.wait(lambda: w.lease("Mistral", rid).get("state") == "granted", 15, "remote grant " + name)
+            w.res("Altiplano", "run", "--lease", rid, "--on", "Mistral", "--", *argv)
+            w.wait(lambda: w.lease("Mistral", rid).get("state") == "refused", 15, "remote refusal " + name)
+            self.assertFalse((w.data / "leases" / "Mistral" / (rid + ".run.json")).exists(), name)
+            remote[name] = w.lease("Mistral", rid).get("answer", "")[:100]
+        self.assertFalse((w.root / "marker-remote.txt").exists())
+        self.assertEqual(w.logtext("Mistral").count("REFUSED"), len(cases))
+        w.wait(lambda: len([m for m in w.mail_matching("refused") if m["machine"] == "Mistral"]) == len(cases), 10, "refusal mails")
+        measured("R8.remote_refusals", remote)
+
+        spoof_marker = w.root / "marker-spoof.txt"
+        spoofs = {}
+        for start in ["res", "dispatcher"]:
+            sid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+            order = {"lease": sid, "argv": ["/bin/sh", "-c", "echo spoof > " + str(spoof_marker)], "cwd": str(w.allowed),
+                     "from_machine": "Altiplano", "ordered": time.strftime("%Y-%m-%dT%H:%M:%S-05:00"), "start": start,
+                     "desk": "Altiplano:Owner"}
+            (w.data / "leases" / "Altiplano" / (sid + ".order.json")).write_text(json.dumps(order))
+            spoofs[start] = sid
+        w.wait(lambda: w.lease("Altiplano", spoofs["dispatcher"]).get("state") == "refused", 15, "planted dispatcher order refused")
+        time.sleep(4)
+        self.assertFalse(spoof_marker.exists(), "a planted order must never run")
+        self.assertNotIn(w.lease("Altiplano", spoofs["res"]).get("state"), ("running", "finished", "starting"))
+        self.assertIn("REFUSED run of " + spoofs["dispatcher"], w.logtext("Altiplano"))
+        measured("R8.planted_orders", {k: w.lease("Altiplano", v).get("state") for k, v in spoofs.items()})
+
+        qid = None
+        blocker = lease_id(w.res("Altiplano", "request", "--need", "ram=20G", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        qid = lease_id(w.res("Altiplano", "request", "--need", "ram=20G", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        if w.lease("Altiplano", qid).get("state") == "queued":
+            q = w.res("Altiplano", "run", "--lease", qid, "--", *shell)
+            self.assertNotEqual(q.returncode, 0)
+            self.assertIn("Refused", q.stdout + q.stderr)
+            measured("R8.queued_local_shell", "refused at once")
         w.stop()
 
 
