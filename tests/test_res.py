@@ -394,6 +394,12 @@ class T4Overrun(unittest.TestCase):
         self.assertIn("still holding", fin[0]["body"])
         self.assertIn("done", fin[0]["body"])
         measured("R4.completion_subject", fin[0]["subject"])
+        peak = w.lease("Altiplano", lid).get("peak", {})
+        measured("R4.recorded_peaks", {d: round(v) for d, v in peak.items()})
+        self.assertGreaterEqual(peak.get("ram", 0), 600e6)
+        peak_line = [l for l in fin[0]["body"].splitlines() if l.startswith("Peak use")][0]
+        measured("R4.completion_peak_line", peak_line)
+        self.assertNotIn("ram 0 B", peak_line)
         measured("R4.overrun_mails", len(w.mail_matching("uses more ram")))
         w.stop()
 
@@ -554,6 +560,9 @@ class T9HistoryAndCompliance(unittest.TestCase):
         self.assertIn("far from that", run.stdout)
         fin = w.mail_matching("finished")
         self.assertIn("Earlier runs", fin[-1]["body"])
+        short_peak = w.lease("Altiplano", lid).get("peak", {})
+        measured("R-history.short_job_peaks", {d: round(v) for d, v in short_peak.items()})
+        self.assertGreater(short_peak.get("ram", 0), 1e6, "a 2-second job must still have its RAM peak recorded")
         w.stop()
 
     def test_unleased_detection(self):

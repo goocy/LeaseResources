@@ -1307,6 +1307,7 @@ class Dispatcher:
         self.overrun_counts = collections.defaultdict(int)
         self.log_sizes = {}                           # lease id -> (size, monotonic time of last growth)
         self.last_written = {}                        # lease id -> monotonic time of the last peak write
+        self.peaks = {}                               # lease id -> {dim: peak}, kept between the throttled writes
         self.unleased_seen = {}                       # key -> record
         self.learned = read_json(LOCAL_DIR / "learned_peaks.json")
         self.learned_dirty = False
@@ -1630,9 +1631,11 @@ class Dispatcher:
             changed = False
             measured = self.last_measured.get(ident, {})
             peaks = lease.setdefault("peak", {})
+            peaks.update({d: max(v, peaks.get(d, 0.0)) for d, v in self.peaks.get(ident, {}).items()})
             for dim, value in measured.items():
                 if value > peaks.get(dim, 0.0):
                     peaks[dim] = value
+            self.peaks[ident] = dict(peaks)
             need = lease.get("need") or {}
             for dim, value in measured.items():
                 if dim in system_only:
@@ -1714,6 +1717,8 @@ class Dispatcher:
         started = parse_iso(lease.get("started") or run.get("started"))
         seconds = (parse_iso(end) or time.time()) - started if started else None
         lease.update(state=state, ended=end, exit=run.get("exit"), seconds=seconds)
+        peaks = lease.setdefault("peak", {})
+        peaks.update({d: max(v, peaks.get(d, 0.0)) for d, v in self.peaks.pop(ident, {}).items()})
         if not lease.get("run_key"):
             order = read_json(side_path(self.machine, ident, ".order.json"))
             lease["run_key"] = command_key(order.get("argv") or [])
@@ -1728,8 +1733,9 @@ class Dispatcher:
         log_path = side_path(self.machine, ident, ".log")
         need = lease.get("need") or {}
         peaks = lease.get("peak") or {}
-        compare = "; ".join(d + " " + human(peaks.get(d, 0.0), kind_of(d)) + " of " + human(need.get(d, 0.0), kind_of(d))
-                            for d in sorted(set(need) | set(peaks)))
+        machine_only = self.meter.system_only()
+        compare = "; ".join(d + " " + ("not measurable per process" if d in machine_only else human(peaks.get(d, 0.0), kind_of(d)))
+                            + " of " + human(need.get(d, 0.0), kind_of(d)) for d in sorted(set(need) | set(peaks)))
         if lost:
             head = ("The leased job " + ident + " on " + self.machine + " is lost: its runner is gone without recording an end"
                     + " (a reboot, a crash or a kill). It is not restarted.")
