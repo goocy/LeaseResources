@@ -22,10 +22,18 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 SERVICE = HERE.parent
-RES = SERVICE / "res.py"
+WINDOWS = sys.platform == "win32"
 PYTHON = sys.executable
 SCRATCH = Path(os.environ.get("LEASERES_TEST_SCRATCH") or tempfile.gettempdir()) / ("leaseres-tests-" + time.strftime("%H%M%S"))
 RESULTS = {}
+# The suite runs its own copy of the code, never the synced service files: touching those (the keeper test did) restarts
+# the production dispatcher on every machine (found on Moosfels, 2026-09-27).
+CODE = SCRATCH / "code"
+CODE.mkdir(parents=True, exist_ok=True)
+for _name in ["res.py", "probes.py"]:
+    shutil.copy2(SERVICE / _name, CODE / _name)
+RES = CODE / "res.py"
+sys.path.insert(0, str(CODE))
 
 import psutil  # noqa: E402
 
@@ -186,14 +194,34 @@ int main(int argc, char **argv) {
 """
 
 
-def fake_claude(world, case):
-    if sys.platform == "win32" or shutil.which("cc") is None:
-        case.skipTest("no C compiler for the fake Claude process")
-    source = world.root / "fake_claude.c"
-    source.write_text(FAKE_CLAUDE_C)
-    fake = world.root / "claude"
-    subprocess.run(["cc", "-o", str(fake), str(source)], check=True)
-    return fake
+FAKE_CLAUDE_PY = """import os, subprocess, sys
+# Stands in for a Claude process where no compiled stub is available (Windows): it is found through the CLAUDE_PID
+# its children inherit, as the detector finds a Claude process of any name, and runs argv[1] through the platform
+# shell (cmd.exe /c on Windows, /bin/sh -c in a new session elsewhere), as the tools do.
+os.environ["CLAUDE_PID"] = str(os.getpid())
+os.environ["CLAUDECODE"] = "1"
+extra = {} if os.name == "nt" else {"start_new_session": True, "executable": "/bin/sh"}
+sys.exit(subprocess.call(sys.argv[1], shell=True, **extra))
+"""
+
+
+def fake_claude(world, case) -> list:
+    """The command prefix of a stand-in Claude process: a compiled stub named claude where a C compiler exists (macOS,
+    Linux), otherwise a Python script identified through CLAUDE_PID (Windows)."""
+    if not WINDOWS and shutil.which("cc") is not None and os.environ.get("LEASERES_TEST_FAKE") != "python":
+        source = world.root / "fake_claude.c"
+        source.write_text(FAKE_CLAUDE_C)
+        fake = world.root / "claude"
+        subprocess.run(["cc", "-o", str(fake), str(source)], check=True)
+        return [str(fake)]
+    script = world.root / "fake_claude.py"
+    script.write_text(FAKE_CLAUDE_PY)
+    return [PYTHON, str(script)]
+
+
+def q(path) -> str:
+    """A path quoted for the platform shell."""
+    return '"' + str(path) + '"' if WINDOWS else "'" + str(path) + "'"
 
 
 class T11Mine(Base):
@@ -209,13 +237,18 @@ class T11Mine(Base):
             "    while time.time() < end:\n        fh.write(chunk)\n        fh.flush()\n        os.fsync(fh.fileno())\n")
         out = w.root / "mine.txt"
         env = w.env("Altiplano")
-        cmd = ("'" + PYTHON + "' busy.py & '" + PYTHON + "' writer.py & sleep 1.5; '" + PYTHON + "' -B '" + str(RES) + "' mine > '" + str(out) + "'; wait")
-        subprocess.run([str(fake), cmd], cwd=str(w.allowed), env=env, timeout=60)
+        if WINDOWS:
+            cmd = ('start "" /b ' + q(PYTHON) + ' busy.py & start "" /b ' + q(PYTHON) + ' writer.py & ' + q(PYTHON)
+                   + ' -c "import time; time.sleep(1.5)" & ' + q(PYTHON) + ' -B ' + q(RES) + ' mine > ' + q(out))
+        else:
+            cmd = (q(PYTHON) + " busy.py & " + q(PYTHON) + " writer.py & sleep 1.5; " + q(PYTHON) + " -B " + q(RES)
+                   + " mine > " + q(out) + "; wait")
+        subprocess.run(fake + [cmd], cwd=str(w.allowed), env=env, timeout=60)
         text = out.read_text()
         rows = {}
         for line in text.splitlines():
             words = line.split()
-            if words and words[0].isdigit() and "sh -c" not in line and ("busy.py" in line or "writer.py" in line):
+            if words and words[0].isdigit() and "sh -c" not in line and "cmd.exe" not in line and ("busy.py" in line or "writer.py" in line):
                 rows["busy" if "busy.py" in line else "writer"] = line
         measured("mine.busy_row", " ".join(rows.get("busy", "").split()[:8]))
         measured("mine.writer_row", " ".join(rows.get("writer", "").split()[:8]))
@@ -239,13 +272,16 @@ class T12Escapes(Base):
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
         leased = w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleeper.py"), "14", CLAUDECODE="1")
         self.assertEqual(leased.returncode, 0, leased.stdout + leased.stderr)
-        jobs = [
-            "true shell-snapshots-fake; nohup " + PYTHON + " sleeper.py 15 >/dev/null 2>&1 &",
-            "true shell-snapshots-fake; nohup /bin/sleep 17 >/dev/null 2>&1 & sleep 3",
-            "true shell-snapshots-fake; " + PYTHON + " -c 'import os, time; os.setsid(); time.sleep(16)' >/dev/null 2>&1 &",
-        ]
+        if WINDOWS:
+            jobs = ['echo shell-snapshots-fake >nul & start "" /b ' + q(PYTHON) + ' sleeper.py 15']
+        else:
+            jobs = [
+                "true shell-snapshots-fake; nohup " + PYTHON + " sleeper.py 15 >/dev/null 2>&1 &",
+                "true shell-snapshots-fake; nohup /bin/sleep 17 >/dev/null 2>&1 & sleep 3",
+                "true shell-snapshots-fake; " + PYTHON + " -c 'import os, time; os.setsid(); time.sleep(16)' >/dev/null 2>&1 &",
+            ]
         for job in jobs:
-            subprocess.Popen([str(fake), job], cwd=str(w.allowed), env=env)
+            subprocess.Popen(fake + [job], cwd=str(w.allowed), env=env)
 
         def rows():
             path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
@@ -256,6 +292,13 @@ class T12Escapes(Base):
         def find(text):
             return [r for r in rows() if r["event"] == "seen" and any(text in c for c in r.get("commands", []))]
         nohup_py = w.wait(lambda: find("sleeper.py 15"), 25, "nohup python job")
+        if WINDOWS:
+            measured("escapes.detached_python_windows", {k: nohup_py[0][k] for k in ("how", "desk", "age", "session")})
+            self.assertEqual(nohup_py[0]["how"], "left the Claude tree (environment marker)")
+            time.sleep(3)
+            self.assertFalse(find("sleeper.py 14"), "a leased job must not count as unleased")
+            w.stop()
+            return
         nohup_sleep = w.wait(lambda: find("sleep 17"), 25, "nohup /bin/sleep job")
         setsid_py = w.wait(lambda: find("time.sleep(16)"), 25, "setsid python job")
         measured("escapes.nohup_python", {k: nohup_py[0][k] for k in ("how", "desk", "age", "session")})
@@ -438,7 +481,8 @@ class T1TrialKill(Base):
         self.assertEqual(alive, [], "processes survived the trial")
         self.assertGreaterEqual(record["profile"]["cpu"]["peak"], 1.5)
         self.assertGreaterEqual(record["profile"]["ram"]["peak"], 400e6)
-        self.assertGreaterEqual(record["profile"]["disk:disk0"]["peak"], 30e6)
+        disks = {d: v["peak"] for d, v in record["profile"].items() if d.startswith("disk:")}
+        self.assertGreaterEqual(max(disks.values()), 30e6, disks)
         self.assertGreaterEqual(record["profile"]["net:en0"]["peak"], 3e6)
         self.assertEqual(record["profile"]["gpu:0"]["peak"], 70)
         w.stop()
@@ -650,9 +694,17 @@ class T8Safety(Base):
         w = World("safety")
         w.dispatcher("Altiplano")
         w.dispatcher("Mistral")
-        (w.allowed / "link.py").symlink_to(w.outside / "evil.py")
+        # A link from the allowed root to a script outside it must not help. POSIX: a file symlink. Windows: symlinks
+        # need admin rights or Developer Mode, so a directory junction (no privilege needed) tests the same escape.
+        if WINDOWS:
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(w.allowed / "linkdir"), str(w.outside)], check=True, capture_output=True)
+            linked = w.allowed / "linkdir" / "evil.py"
+        else:
+            (w.allowed / "link.py").symlink_to(w.outside / "evil.py")
+            linked = w.allowed / "link.py"
         marker = w.root / "marker-local.txt"
-        shell = ["/bin/sh", "-c", "echo local-ok; echo ran > " + str(marker)]
+        shell = (["cmd", "/c", "echo local-ok& echo ran> " + str(marker)] if WINDOWS
+                 else ["/bin/sh", "-c", "echo local-ok; echo ran > " + str(marker)])
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
         run = w.res("Altiplano", "run", "--lease", lid, "--", *shell)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -663,11 +715,12 @@ class T8Safety(Base):
         measured("R8.local_nonpython_run", w.lease("Altiplano", lid).get("state"))
 
         cases = {
-            "shell": ["/bin/sh", "-c", "echo remote > " + str(w.root / "marker-remote.txt")],
+            "shell": (["cmd", "/c", "echo remote> " + str(w.root / "marker-remote.txt")] if WINDOWS
+                      else ["/bin/sh", "-c", "echo remote > " + str(w.root / "marker-remote.txt")]),
             "outside": [PYTHON, str(w.outside / "evil.py")],
             "inline": [PYTHON, "-c", "print(1)"],
             "module": [PYTHON, "-m", "http.server"],
-            "symlink": [PYTHON, str(w.allowed / "link.py")],
+            "link": [PYTHON, str(linked)],
         }
         remote = {}
         for name, argv in cases.items():
@@ -734,8 +787,15 @@ class T9HistoryAndCompliance(Base):
         w = World("compliance")
         fake = fake_claude(w, self)
         w.dispatcher("Altiplano")
-        claude = subprocess.Popen([str(fake), "/bin/zsh -c 'sleep 12; true' shell-snapshots-fake"], cwd=str(w.allowed))
-        quick = subprocess.Popen([str(fake), "/bin/zsh -c 'sleep 1; true' shell-snapshots-fake"], cwd=str(w.allowed))
+        if WINDOWS:
+            long_cmd = "echo shell-snapshots-fake >nul & " + q(PYTHON) + ' -c "import time; time.sleep(12)"'
+            short_cmd = "echo shell-snapshots-fake >nul & " + q(PYTHON) + ' -c "import time; time.sleep(1)"'
+            expect = "time.sleep(12)"
+        else:
+            long_cmd, short_cmd, expect = ("/bin/zsh -c 'sleep 12; true' shell-snapshots-fake",
+                                           "/bin/zsh -c 'sleep 1; true' shell-snapshots-fake", "sleep 12")
+        claude = subprocess.Popen(fake + [long_cmd], cwd=str(w.allowed))
+        quick = subprocess.Popen(fake + [short_cmd], cwd=str(w.allowed))
 
         def rows():
             path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
@@ -744,7 +804,7 @@ class T9HistoryAndCompliance(Base):
             return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
         seen = w.wait(lambda: [r for r in rows() if r.get("claude_pid") == claude.pid and r["event"] == "seen"], 20, "unleased record")
         self.assertEqual(seen[0]["desk"], "Altiplano:StubDesk")
-        self.assertTrue(any("sleep 12" in c for c in seen[0]["commands"]) or "sleep 12" in seen[0]["shell"])
+        self.assertTrue(any(expect in c for c in seen[0]["commands"]) or expect in seen[0]["shell"], seen[0])
         claude.wait(20)
         ended = w.wait(lambda: [r for r in rows() if r["event"] == "ended" and r["key"] == seen[0]["key"]], 15, "ended record")
         measured("R-compliance.seen", {k: seen[0][k] for k in ("age", "desk", "commands")})
@@ -767,7 +827,7 @@ class T10Keeper(Base):
         try:
             w.wait(lambda: w.logtext("Altiplano").count("dispatcher started") == 1, 20, "first dispatcher")
             t0 = time.monotonic()
-            os.utime(SERVICE / "probes.py")
+            os.utime(CODE / "probes.py")                # the sandbox copy, never the synced file
             w.wait(lambda: w.logtext("Altiplano").count("dispatcher started") == 2, 20, "restarted dispatcher")
             measured("keeper.restart_seconds", round(time.monotonic() - t0, 1))
             self.assertIn("code changed; dispatcher restarting", w.logtext("Altiplano"))

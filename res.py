@@ -379,10 +379,11 @@ def popen_detached(argv, **kwargs):
 
 def claude_ancestor(config: dict):
     names = [n.casefold() for n in config.get("claude_process_names", ["claude", "claude.exe"])]
+    named = os.environ.get("CLAUDE_PID", "").strip()
     try:
         for parent in psutil.Process().parents():
             try:
-                if parent.name().casefold() in names:
+                if parent.name().casefold() in names or (named.isdigit() and parent.pid == int(named)):
                     return parent
             except psutil.Error:
                 continue
@@ -568,7 +569,7 @@ def send_mail(config: dict, machine: str, desk: str, subject: str, body: str) ->
             detail = " ".join((run.stdout + run.stderr).split())[:300]
         except (OSError, subprocess.SubprocessError) as exc:
             detail = str(exc)
-        log(machine, ("mailed " if ok else "WARN mail failed ") + target + ": " + subject + " (" + detail + ")")
+        log(machine, ("mailed " if ok else "WARN mail failed ") + target + ": " + subject + " (ClaudeMail: " + detail + ")")
         if ok:
             break
     if not ok:
@@ -1273,6 +1274,35 @@ def cmd_run(args, config: dict) -> None:
             time.sleep(1.0)
 
 
+def wait_with_peak(child) -> tuple:
+    """Wait for the leased program and return (exit code, its peak resident bytes), so even a job shorter than one
+    dispatcher sample has a RAM peak: POSIX from wait4's rusage (bytes on macOS, KiB on Linux), Windows from the
+    process's peak working set, read while it runs."""
+    if sys.platform != "win32" and hasattr(os, "wait4"):
+        try:
+            _, status, usage = os.wait4(child.pid, 0)
+            child.returncode = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+            scale = 1 if sys.platform == "darwin" else 1024
+            return child.returncode, int(usage.ru_maxrss) * scale
+        except (OSError, ChildProcessError):
+            return child.wait(), None
+    peak = 0
+    try:
+        proc = psutil.Process(child.pid)
+    except psutil.Error:
+        proc = None
+    while True:
+        try:
+            return child.wait(timeout=0.5), peak or None
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            info = proc.memory_info() if proc else None
+            peak = max(peak, int(getattr(info, "peak_wset", 0) or getattr(info, "rss", 0) or 0))
+        except psutil.Error:
+            pass
+
+
 def cmd_runner(args, config: dict) -> None:
     """The detached parent of a leased job: starts it with unbuffered output into the log, records pid and exit code."""
     machine, ident = args.machine, args.ident
@@ -1315,7 +1345,9 @@ def cmd_runner(args, config: dict) -> None:
         child_ctime = None
     run.update({"pid": child.pid, "create_time": child_ctime, "argv": argv, "cwd": cwd})
     write_json(run_path, run)
-    code = child.wait()
+    code, peak_rss = wait_with_peak(child)
+    if peak_rss:
+        run["child_peak_rss"] = peak_rss
     with open(log_path, "ab") as out:
         out.write(("\n[res] " + now_iso() + " ended with exit code " + str(code) + "\n").encode("utf-8"))
     write_json(run_path, dict(run, ended=now_iso(), exit=code))
@@ -1513,7 +1545,10 @@ class Dispatcher:
         return {d: v / len(self.window) for d, v in total.items()}
 
     def sample(self) -> None:
-        leases = [l for l in self.leases() if l.get("state") == "running"]
+        # Meter a lease from the moment its runner exists, not only once watch() has marked it running: a 2-second
+        # job would otherwise end between two samples unseen (no RAM peak on Windows, 2026-09-27).
+        leases = [l for l in self.leases() if l.get("state") in ("granted", "starting", "running")
+                  and side_path(self.machine, l["id"], ".run.json").exists()]
         trees = {}
         for lease in leases:
             run = read_json(side_path(self.machine, lease["id"], ".run.json"))
@@ -1896,6 +1931,8 @@ class Dispatcher:
         lease.update(state=state, ended=end, exit=run.get("exit"), seconds=seconds)
         peaks = lease.setdefault("peak", {})
         peaks.update({d: max(v, peaks.get(d, 0.0)) for d, v in self.peaks.pop(ident, {}).items()})
+        if run.get("child_peak_rss"):
+            peaks["ram"] = max(float(peaks.get("ram", 0.0)), float(run["child_peak_rss"]))
         if not lease.get("run_key"):
             order = read_json(side_path(self.machine, ident, ".order.json"))
             lease["run_key"] = command_key(order.get("argv") or [])
@@ -1991,13 +2028,31 @@ class Dispatcher:
     def per_command_shell(self, cmd_parts: list, name: str) -> bool:
         """A tool shell that runs one command and ends (the Mac's `zsh -c 'source <snapshot>...'`), as opposed to a
         persistent host that runs many (a PowerShell host reading commands, a persistent bash)."""
-        if not self.is_tool_shell(" ".join(cmd_parts), name):
+        if not self.is_tool_host(name, " ".join(cmd_parts)):
             return False
         flags = ["-c", "-command", "-encodedcommand", "-enc", "-ec", "/c"]
         for index, part in enumerate(cmd_parts[1:], start=1):
             if part.casefold() in flags:
                 following = cmd_parts[index + 1] if index + 1 < len(cmd_parts) else ""
                 return following not in ("", "-")
+        return False
+
+    def marked_tree(self, pid: int, info: dict, children: dict) -> bool:
+        """Whether this shell or something below it carries a tool marker (`shell-snapshots` from the Bash tool,
+        `__claudeCodeScript` from the PowerShell tool), which tells a tool call from an MCP server or hook started
+        through `sh -c` / `cmd /c`."""
+        markers = self.config.get("tool_shell_markers", ["shell-snapshots"])
+        stack = [pid]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current in seen or current not in info:
+                continue
+            seen.add(current)
+            cmd = " ".join(info[current][1].get("cmdline") or [])
+            if any(m in cmd for m in markers):
+                return True
+            stack.extend(children.get(current, []))
         return False
 
     def is_tool_host(self, name: str, cmd: str) -> bool:
@@ -2054,15 +2109,35 @@ class Dispatcher:
         def cmd_of(pid):
             return " ".join(info[pid][1].get("cmdline") or []) if pid in info else ""
 
+        def real_parent(pid):
+            """The parent, only if it is really this process's parent: Windows keeps a dead parent's pid in the
+            child and soon reuses it, so a 'parent' younger than the child is someone else."""
+            parent = info[pid][1].get("ppid")
+            if parent not in info or parent == pid:
+                return None
+            if float(info[parent][1].get("create_time") or 0) > float(info[pid][1].get("create_time") or 0) + 1.0:
+                return None
+            return parent
+
         def claude_below(pid):
             seen = set()
             while pid in info and pid not in seen:
                 seen.add(pid)
-                parent = info[pid][1].get("ppid")
+                parent = real_parent(pid)
+                if parent is None:
+                    return None
                 if parent in claudes:
                     return pid
                 pid = parent
             return None
+
+        def session_of(pids):
+            for candidate in pids:
+                if candidate in info:
+                    marks = self.claude_env(info[candidate][0], key_of(candidate), any_marker=True)
+                    if marks.get("session"):
+                        return marks["session"]
+            return ""
 
         found = {}
         for pid, (proc, data) in info.items():
@@ -2080,8 +2155,8 @@ class Dispatcher:
             if top is not None:
                 top_name = str(info[top][1].get("name") or "")
                 top_parts = info[top][1].get("cmdline") or []
-                if top == pid and self.per_command_shell(top_parts, top_name):
-                    how, recorded_under = "tool shell", data.get("ppid")
+                if top == pid and self.per_command_shell(top_parts, top_name) and self.marked_tree(pid, info, children):
+                    how, recorded_under = "tool shell", data.get("ppid")    # e.g. zsh -c, bash -c, cmd /c -> powershell
                 elif top != pid and data.get("ppid") == top and not self.per_command_shell(top_parts, top_name) \
                         and self.is_tool_host(top_name, " ".join(top_parts)) and not self.ignored(" ".join(top_parts)):
                     how, recorded_under = "command of a persistent tool host", info[top][1].get("ppid")
@@ -2096,11 +2171,17 @@ class Dispatcher:
                 commands = [cmd_of(d) for d in descendants]
                 if any(self.ignored(c) for c in commands):
                     continue
+                # What the command really is: the descendants that are not themselves shells running the tool's
+                # wrapper (the PowerShell tool's `powershell -Command $__claudeCodeScript` under `cmd /c`).
+                real = [cmd_of(d) for d in descendants if not self.per_command_shell(info[d][1].get("cmdline") or [],
+                                                                                  str(info[d][1].get("name") or ""))
+                        and str(info[d][1].get("name") or "").casefold() not in ignore_names]
                 if how == "tool shell":
-                    shown = [c[:300] for c in commands[:4]]
+                    shown = [c[:300] for c in real[:4]] or [cmd[-300:]]
                 else:
-                    shown = [cmd[:300]] + [c[:300] for c in commands[:3]]
+                    shown = [cmd[:300]] + [c[:300] for c in real[:3]]
                 found[key] = {"how": how, "pid": pid, "claude_pid": recorded_under, "age": age, "cwd_pid": top,
+                              "session": session_of([pid] + descendants),
                               "shell": cmd[-160:] if how == "tool shell" else " ".join(top_parts)[-160:], "commands": shown}
                 continue
             record = None
@@ -2120,8 +2201,8 @@ class Dispatcher:
                               "session": marks.get("session"), "cwd_pid": pid}
             if record is None:
                 continue
-            parent = data.get("ppid")
-            if parent in info and parent not in claudes and self.escaped_parent(parent, info, now, after):
+            parent = real_parent(pid)
+            if parent is not None and parent not in claudes and self.escaped_parent(parent, info, now, after):
                 continue
             record.update(pid=pid, age=age, commands=[cmd[:300]])
             found[key] = record
@@ -2135,9 +2216,11 @@ class Dispatcher:
                     cwd = psutil.Process(cwd_pid).cwd() if cwd_pid else ""
                 except (psutil.Error, OSError, ValueError):
                     cwd = ""
+            session = rec.get("session") or ""
             record = {"event": "seen", "at": now_iso(), "key": key, "how": rec.get("how"), "shell_pid": rec.get("pid"),
-                      "claude_pid": rec.get("claude_pid"), "session": rec.get("session", ""), "age": round(rec.get("age", 0)),
-                      "cwd": cwd, "desk": self.desk_of(cwd), "shell": rec.get("shell", ""), "commands": rec.get("commands", [])}
+                      "claude_pid": rec.get("claude_pid"), "session": session, "age": round(rec.get("age", 0)),
+                      "cwd": cwd, "desk": self.session_desk(session) or self.desk_of(cwd), "shell": rec.get("shell", ""),
+                      "commands": rec.get("commands", [])}
             self.unleased_seen[key] = dict(record, first=now - rec.get("age", 0))
             self.append_unleased(record)
             log(self.machine, "unleased long command (" + str(record["how"]) + ") in " + record["desk"] + ": "
@@ -2184,6 +2267,14 @@ class Dispatcher:
                 return True
         key = str(pid) + "-" + format(float(data.get("create_time") or 0), ".2f")
         return bool(self.claude_env(proc, key))
+
+    def session_desk(self, session: str) -> str:
+        """The desk ClaudeMail registered for this session (its start folder), which a later `cd` does not change."""
+        if not session:
+            return ""
+        record = read_json(Path.home() / ".claude" / "claudemail" / "sessions" / (session + ".json"))
+        desk = str(record.get("desk") or "").strip()
+        return self.machine + ":" + desk if desk else ""
 
     def desk_of(self, folder: str) -> str:
         if not folder:

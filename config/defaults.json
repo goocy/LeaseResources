@@ -25,7 +25,7 @@
   "unleased_check_seconds": 60,
   "unleased_after_seconds": 120,
   "claude_process_names": ["claude", "claude.exe"],
-  "tool_shell_markers": ["shell-snapshots"],
+  "tool_shell_markers": ["shell-snapshots", "__claudeCodeScript"],
   "tool_shell_names": [],
   "ignore_command_markers": ["mail.py", "res.py", "house.py"],
   "ignore_process_names": ["conhost.exe", "openconsole.exe", "wslhost.exe"],
