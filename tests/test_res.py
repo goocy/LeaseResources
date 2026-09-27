@@ -157,6 +157,107 @@ time.sleep(600)
 '''
 
 
+FAKE_CLAUDE_C = """#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+/* Stands in for a Claude process: runs argv[1] in a child shell that leads its own session, as Claude's Bash tool
+   does, and waits for it. A copied Apple binary would be SIGKILLed by code signing, hence a compiled stub. */
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    pid_t pid = fork();
+    if (pid == 0) { setsid(); execl("/bin/sh", "sh", "-c", argv[1], (char *)0); _exit(127); }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return 0;
+}
+"""
+
+
+def fake_claude(world, case):
+    if shutil.which("cc") is None:
+        case.skipTest("no C compiler for the fake Claude process")
+    source = world.root / "fake_claude.c"
+    source.write_text(FAKE_CLAUDE_C)
+    fake = world.root / "claude"
+    subprocess.run(["cc", "-o", str(fake), str(source)], check=True)
+    return fake
+
+
+class T11Mine(unittest.TestCase):
+    """res mine: the per-process cpu and disk columns show real rates (cpu was always 0.00 before 2026-09-27 10:00)."""
+
+    def test_per_process_columns(self):
+        w = World("mine")
+        fake = fake_claude(w, self)
+        (w.allowed / "busy.py").write_text("import time\nend = time.time() + 5\nwhile time.time() < end: pass\n")
+        (w.allowed / "writer.py").write_text(
+            "import os, time\nchunk = os.urandom(1 << 20)\nend = time.time() + 5\n"
+            "with open(os.path.join(os.path.dirname(__file__), 'w.bin'), 'wb') as fh:\n"
+            "    while time.time() < end:\n        fh.write(chunk)\n        fh.flush()\n        os.fsync(fh.fileno())\n")
+        out = w.root / "mine.txt"
+        env = w.env("Altiplano")
+        cmd = ("python3 busy.py & python3 writer.py & sleep 1.5; '" + PYTHON + "' -B '" + str(RES) + "' mine > '" + str(out) + "'; wait")
+        subprocess.run([str(fake), cmd], cwd=str(w.allowed), env=env, timeout=60)
+        text = out.read_text()
+        rows = {}
+        for line in text.splitlines():
+            words = line.split()
+            if words and words[0].isdigit() and "sh -c" not in line and ("busy.py" in line or "writer.py" in line):
+                rows["busy" if "busy.py" in line else "writer"] = line
+        measured("mine.busy_row", " ".join(rows.get("busy", "").split()[:8]))
+        measured("mine.writer_row", " ".join(rows.get("writer", "").split()[:8]))
+        self.assertIn("Claude session process", text)
+        busy_cpu = float(rows["busy"].split()[3])
+        self.assertGreaterEqual(busy_cpu, 0.5)
+        self.assertTrue("MB/s" in rows["writer"] or "GB/s" in rows["writer"], rows["writer"])
+
+
+class T12Escapes(unittest.TestCase):
+    """Compliance: long jobs that left their tool shell are counted too: nohup/& after the shell exited (session id of
+    the gone shell, works even for Apple binaries whose environment macOS hides) and setsid (CLAUDECODE in the
+    environment); a leased job started from the same session is not counted."""
+
+    def test_backgrounded_jobs_counted(self):
+        w = World("escapes")
+        fake = fake_claude(w, self)
+        (w.allowed / "sleeper.py").write_text("import sys, time\ntime.sleep(float(sys.argv[1]))\n")
+        w.dispatcher("Altiplano")
+        env = w.env("Altiplano", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="fake-session")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        leased = w.res("Altiplano", "run", "--lease", lid, "--", "python3", str(w.allowed / "sleeper.py"), "14", CLAUDECODE="1")
+        self.assertEqual(leased.returncode, 0, leased.stdout + leased.stderr)
+        jobs = [
+            "true shell-snapshots-fake; nohup python3 sleeper.py 15 >/dev/null 2>&1 &",
+            "true shell-snapshots-fake; nohup /bin/sleep 17 >/dev/null 2>&1 & sleep 3",
+            "true shell-snapshots-fake; python3 -c 'import os, time; os.setsid(); time.sleep(16)' >/dev/null 2>&1 &",
+        ]
+        for job in jobs:
+            subprocess.Popen([str(fake), job], cwd=str(w.allowed), env=env)
+
+        def rows():
+            path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
+            if not path.exists():
+                return []
+            return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+        def find(text):
+            return [r for r in rows() if r["event"] == "seen" and any(text in c for c in r.get("commands", []))]
+        nohup_py = w.wait(lambda: find("sleeper.py 15"), 25, "nohup python job")
+        nohup_sleep = w.wait(lambda: find("sleep 17"), 25, "nohup /bin/sleep job")
+        setsid_py = w.wait(lambda: find("time.sleep(16)"), 25, "setsid python job")
+        measured("escapes.nohup_python", {k: nohup_py[0][k] for k in ("how", "desk", "age", "session")})
+        measured("escapes.nohup_apple_sleep", {k: nohup_sleep[0][k] for k in ("how", "desk", "age")})
+        measured("escapes.setsid_python", {k: setsid_py[0][k] for k in ("how", "desk", "age", "session")})
+        self.assertEqual(nohup_sleep[0]["how"], "backgrounded, its tool shell gone")
+        self.assertEqual(setsid_py[0]["how"], "left the Claude tree (environment marker)")
+        self.assertEqual(setsid_py[0]["session"], "fake-session")
+        time.sleep(3)
+        self.assertFalse(find("sleeper.py 14"), "a leased job must not count as unleased")
+        measured("escapes.leased_counted", len(find("sleeper.py 14")))
+        w.wait(lambda: len([r for r in rows() if r["event"] == "ended"]) >= 3, 30, "ended records")
+        w.stop()
+
+
 def measured(key, value):
     RESULTS[key] = value
     print("MEASURED " + key + " = " + json.dumps(value), flush=True)
@@ -585,7 +686,7 @@ class T9HistoryAndCompliance(unittest.TestCase):
         measured("R-history.second_run_output", run.stdout.splitlines()[0])
         self.assertIn("previous runs of this command took", run.stdout)
         self.assertIn("far from that", run.stdout)
-        fin = w.mail_matching("finished")
+        fin = w.wait(lambda: [m for m in w.mail_matching("finished") if lid in m["subject"]], 15, "second run's mail")
         self.assertIn("Earlier runs", fin[-1]["body"])
         short_peak = w.lease("Altiplano", lid).get("peak", {})
         measured("R-history.short_job_peaks", {d: round(v) for d, v in short_peak.items()})
@@ -594,14 +695,7 @@ class T9HistoryAndCompliance(unittest.TestCase):
 
     def test_unleased_detection(self):
         w = World("compliance")
-        fake = w.root / "claude"
-        # A copied Apple binary is SIGKILLed by code signing, so a tiny compiled stand-in plays the Claude process:
-        # it runs its argument through system(), i.e. as a child shell, as Claude's Bash tool does.
-        source = w.root / "fake_claude.c"
-        source.write_text("#include <stdlib.h>\nint main(int c, char **v) { return c > 1 ? system(v[1]) : 0; }\n")
-        if shutil.which("cc") is None:
-            self.skipTest("no C compiler for the fake Claude process")
-        subprocess.run(["cc", "-o", str(fake), str(source)], check=True)
+        fake = fake_claude(w, self)
         w.dispatcher("Altiplano")
         claude = subprocess.Popen([str(fake), "/bin/zsh -c 'sleep 12; true' shell-snapshots-fake"], cwd=str(w.allowed))
         quick = subprocess.Popen([str(fake), "/bin/zsh -c 'sleep 1; true' shell-snapshots-fake"], cwd=str(w.allowed))

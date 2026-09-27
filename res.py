@@ -392,7 +392,10 @@ def claude_ancestor(config: dict):
 
 def short_cmd(proc, limit: int = 90) -> str:
     try:
-        text = " ".join(proc.cmdline()) or proc.name()
+        argv = proc.cmdline()
+        if argv:
+            argv = [Path(argv[0].replace(chr(92), "/")).name] + argv[1:]
+        text = " ".join(argv) or proc.name()
     except psutil.Error:
         return "?"
     return text if len(text) <= limit else text[: limit - 3] + "..."
@@ -704,9 +707,25 @@ def cmd_mine(args, config: dict) -> None:
     me = os.getpid()
     procs = [p for p in tree_of(root) if p.pid != me]
     meter = probes.Meter(config, LOCAL_DIR)
+
+    def counters():
+        """Per process: (monotonic time, cpu seconds, disk bytes). Rates come from two of these a second apart, as in
+        probes.Meter; psutil's cpu_percent() would return its 0.0 baseline on these freshly made Process objects."""
+        found = {}
+        for proc in procs:
+            try:
+                with proc.oneshot():
+                    times = proc.cpu_times()
+                    found[proc.pid] = (time.monotonic(), times.user + times.system, probes.disk_bytes(proc))
+            except (psutil.Error, OSError):
+                continue
+        return found
+
+    before = counters()
     meter.sample({"mine": procs})
     time.sleep(1.0)
     system, per = meter.sample({"mine": procs})
+    after = counters()
     use = per.get("mine", {})
     print("Claude session process " + str(root.pid) + ", " + str(len(procs)) + " processes in its tree:")
     for dim in sorted(use):
@@ -714,14 +733,19 @@ def cmd_mine(args, config: dict) -> None:
             print("  " + dim.ljust(14) + human(use[dim], kind_of(dim)) + "   (machine: " + human(system.get(dim, 0.0), kind_of(dim)) + ")")
     for dim in sorted(meter.system_only()):
         print("  " + dim.ljust(14) + "not measurable per process (machine: " + human(system.get(dim, 0.0), kind_of(dim)) + ")")
-    rows = [["pid", "age", "cpu", "ram", "command"]]
+    rows = [["pid", "age", "cpu (cores)", "ram", "disk", "command"]]
     now = time.time()
     for proc in procs:
+        a, b = before.get(proc.pid), after.get(proc.pid)
+        cpu = disk = "?"
+        if a and b and b[0] > a[0]:
+            cpu = format(max(0.0, (b[1] - a[1]) / (b[0] - a[0])), ".2f")
+            if a[2] is not None and b[2] is not None:
+                disk = human(max(0.0, (b[2] - a[2]) / (b[0] - a[0])), "disk")
         try:
             with proc.oneshot():
-                rows.append([str(proc.pid), human_duration(now - proc.create_time()),
-                             format(proc.cpu_percent(interval=None) / 100.0, ".2f"),
-                             human(proc.memory_info().rss, "ram"), short_cmd(proc)])
+                rows.append([str(proc.pid), human_duration(now - proc.create_time()), cpu,
+                             human(proc.memory_info().rss, "ram"), disk, short_cmd(proc)])
         except psutil.Error:
             continue
     print()
@@ -1327,6 +1351,8 @@ class Dispatcher:
         self.last_written = {}                        # lease id -> monotonic time of the last peak write
         self.peaks = {}                               # lease id -> {dim: peak}, kept between the throttled writes
         self.unleased_seen = {}                       # key -> record
+        self.shell_sids = {}                          # POSIX: tool shell pid (= its session id) -> claude pid, cwd
+        self.env_cache = {}                           # process key -> Claude markers in its environment
         self.learned = read_json(LOCAL_DIR / "learned_peaks.json")
         self.learned_dirty = False
         self.version = code_version()
@@ -1770,62 +1796,189 @@ class Dispatcher:
         self.mail(lease, "Leased job " + ident + " " + state + " on " + self.machine, body)
 
     # -- compliance: long commands of Claude sessions without a lease
-    def check_unleased(self) -> None:
-        names = [n.casefold() for n in self.config.get("claude_process_names", ["claude", "claude.exe"])]
+    def claude_names(self) -> list:
+        return [n.casefold() for n in self.config.get("claude_process_names", ["claude", "claude.exe"])]
+
+    def is_tool_shell(self, cmd: str, name: str) -> bool:
         markers = self.config.get("tool_shell_markers", ["shell-snapshots"])
         shell_names = [n.casefold() for n in self.config.get("tool_shell_names", [])]
-        ignore = self.config.get("ignore_command_markers", [])
+        return any(m in cmd for m in markers) or name.casefold() in shell_names
+
+    def ignored(self, cmd: str) -> bool:
+        return any(m in cmd for m in self.config.get("ignore_command_markers", []))
+
+    def track_shells(self) -> None:
+        """Every sample: remember the session id of each live tool shell (POSIX: Claude starts each tool shell as a
+        session leader), so a job backgrounded with nohup or & keeps pointing at its shell after the shell exits."""
+        if sys.platform == "win32":
+            return
+        names = self.claude_names()
+        claudes = set()
+        procs = []
+        for proc in psutil.process_iter(["pid", "ppid", "name"]):
+            procs.append(proc)
+            if str(proc.info.get("name") or "").casefold() in names:
+                claudes.add(proc.info["pid"])
+        now = time.time()
+        for proc in procs:
+            if proc.info.get("ppid") not in claudes or proc.info["pid"] in self.shell_sids:
+                continue
+            try:
+                cmd = " ".join(proc.cmdline())
+                sid = os.getsid(proc.pid)
+            except (psutil.Error, OSError):
+                continue
+            if sid != proc.pid or not self.is_tool_shell(cmd, str(proc.info.get("name") or "")) or self.ignored(cmd):
+                continue
+            try:
+                cwd = psutil.Process(proc.info["ppid"]).cwd()
+            except (psutil.Error, OSError):
+                cwd = ""
+            self.shell_sids[proc.pid] = {"claude_pid": proc.info["ppid"], "cwd": cwd, "seen": now, "shell": cmd[-160:]}
+        for sid in [s for s, v in self.shell_sids.items() if now - v["seen"] > 86400]:
+            self.shell_sids.pop(sid, None)
+
+    def claude_env(self, proc, key: str) -> dict:
+        """The Claude markers in a process's environment ({} when absent or unreadable). Cached per process: an
+        environment never changes. macOS does not reveal the environment of Apple's own binaries (/bin/sleep, zsh);
+        Homebrew, venv and other programs are readable, and on Windows psutil reads it for the user's processes."""
+        if key in self.env_cache:
+            return self.env_cache[key]
+        try:
+            env = proc.environ()
+        except (psutil.Error, OSError):
+            env = {}
+        found = {}
+        if env.get("CLAUDECODE") == "1" and not env.get("LEASERES_LEASE"):
+            found = {"session": env.get("CLAUDE_CODE_SESSION_ID", ""), "claude_pid": env.get("CLAUDE_PID", "")}
+        self.env_cache[key] = found
+        return found
+
+    def check_unleased(self) -> None:
+        """Long commands that Claude sessions run without a lease, three ways: (a) a tool shell that has lived longer
+        than unleased_after_seconds; (b) POSIX: a process in the session of a tool shell that has gone, i.e. a job
+        backgrounded with nohup or & whose shell exited; (c) a process that left every Claude tree (setsid, double
+        fork, reparented to launchd/init) but carries CLAUDECODE=1 in its environment. Leased jobs (LEASERES_LEASE in
+        their environment, started through res.py) and res.py, mail.py and house.py themselves are excluded. Only the
+        topmost qualifying process of each tree is recorded."""
+        names = self.claude_names()
         after = num(self.config, "unleased_after_seconds", 120)
+        try:
+            user = psutil.Process().username()
+        except psutil.Error:
+            user = None
         children = collections.defaultdict(list)
         info = {}
-        for p in psutil.process_iter(["pid", "ppid", "name", "create_time", "cmdline"]):
+        for p in psutil.process_iter(["pid", "ppid", "name", "create_time", "cmdline", "username"]):
             data = p.info
             info[data["pid"]] = (p, data)
             children[data.get("ppid")].append(data["pid"])
         now = time.time()
-        current = set()
+
+        def cmd_of(pid):
+            return " ".join(info[pid][1].get("cmdline") or []) if pid in info else ""
+
+        def claude_below(pid):
+            """The direct child of a live claude process on pid's chain (pid itself included), else None."""
+            seen = set()
+            while pid in info and pid not in seen:
+                seen.add(pid)
+                parent = info[pid][1].get("ppid")
+                if parent in info and str(info[parent][1].get("name") or "").casefold() in names:
+                    return pid
+                pid = parent
+            return None
+
+        found = {}                                    # key -> record
         for pid, (proc, data) in info.items():
-            if str(data.get("name") or "").casefold() not in names:
+            if str(data.get("name") or "").casefold() in names:
                 continue
-            for child_pid in children.get(pid, []):
-                cproc, cdata = info[child_pid]
-                cmd = " ".join(cdata.get("cmdline") or [])
-                is_shell = any(m in cmd for m in markers) or str(cdata.get("name") or "").casefold() in shell_names
-                if not is_shell or any(m in cmd for m in ignore):
-                    continue
-                age = now - float(cdata.get("create_time") or now)
-                if age < after:
-                    continue
-                descendants = []
-                stack = list(children.get(child_pid, []))
+            age = now - float(data.get("create_time") or now)
+            if age < after or (user and data.get("username") and data.get("username") != user):
+                continue
+            cmd = cmd_of(pid)
+            if self.ignored(cmd):
+                continue
+            key = str(pid) + "-" + format(float(data.get("create_time") or 0), ".2f")
+            top = claude_below(pid)
+            if top is not None:
+                if top != pid or not self.is_tool_shell(cmd, str(data.get("name") or "")):
+                    continue                          # inside a live Claude tree: counted at its tool shell, if any
+                descendants, stack = [], list(children.get(pid, []))
                 while stack:
                     d = stack.pop()
                     if d in info:
-                        descendants.append(info[d][1])
+                        descendants.append(d)
                         stack.extend(children.get(d, []))
-                commands = [" ".join(d.get("cmdline") or []) for d in descendants]
-                if any(any(m in c for m in ignore) for c in commands):
+                commands = [cmd_of(d) for d in descendants]
+                if any(self.ignored(c) for c in commands):
                     continue
-                key = str(child_pid) + "-" + format(float(cdata.get("create_time") or 0), ".2f")
-                current.add(key)
-                if key in self.unleased_seen:
-                    continue
+                found[key] = {"how": "tool shell", "pid": pid, "claude_pid": data.get("ppid"), "age": age,
+                              "cwd_pid": data.get("ppid"), "shell": cmd[-160:], "commands": [c[:160] for c in commands[:4]]}
+                continue
+            record = None
+            if sys.platform != "win32":
                 try:
-                    cwd = proc.cwd()
-                except (psutil.Error, OSError):
+                    sid = os.getsid(pid)
+                except OSError:
+                    sid = None
+                shell = self.shell_sids.get(sid)
+                if shell is not None and sid != pid and process(sid) is None:
+                    record = {"how": "backgrounded, its tool shell gone", "claude_pid": shell["claude_pid"], "cwd": shell["cwd"],
+                              "shell": shell["shell"]}
+            if record is None:
+                marks = self.claude_env(proc, key)
+                if marks:
+                    record = {"how": "left the Claude tree (environment marker)", "claude_pid": marks.get("claude_pid"),
+                              "session": marks.get("session"), "cwd_pid": pid}
+            if record is None:
+                continue
+            parent = data.get("ppid")
+            if parent in info and self.escaped_parent(parent, info, now, after):
+                continue                              # its parent is recorded instead
+            record.update(pid=pid, age=age, commands=[cmd[:300]])
+            found[key] = record
+        for key, rec in found.items():
+            if key in self.unleased_seen:
+                continue
+            cwd = rec.pop("cwd", None)
+            cwd_pid = rec.pop("cwd_pid", None)
+            if cwd is None:
+                try:
+                    cwd = psutil.Process(cwd_pid).cwd() if cwd_pid else ""
+                except (psutil.Error, OSError, ValueError):
                     cwd = ""
-                record = {"event": "seen", "at": now_iso(), "key": key, "shell_pid": child_pid, "claude_pid": pid,
-                          "age": round(age), "cwd": cwd, "desk": self.desk_of(cwd),
-                          "shell": cmd[-160:], "commands": [c[:160] for c in commands[:4]]}
-                self.unleased_seen[key] = dict(record, first=now - age)
-                self.append_unleased(record)
-                log(self.machine, "unleased long command in " + record["desk"] + " (claude pid " + str(pid) + "): "
-                    + (record["commands"][0] if record["commands"] else record["shell"][-80:]))
+            record = {"event": "seen", "at": now_iso(), "key": key, "how": rec.get("how"), "shell_pid": rec.get("pid"),
+                      "claude_pid": rec.get("claude_pid"), "session": rec.get("session", ""), "age": round(rec.get("age", 0)),
+                      "cwd": cwd, "desk": self.desk_of(cwd), "shell": rec.get("shell", ""), "commands": rec.get("commands", [])}
+            self.unleased_seen[key] = dict(record, first=now - rec.get("age", 0))
+            self.append_unleased(record)
+            log(self.machine, "unleased long command (" + str(record["how"]) + ") in " + record["desk"] + ": "
+                + (record["commands"][0] if record["commands"] else record["shell"][-80:]))
         for key in list(self.unleased_seen):
-            if key not in current:
+            if key not in found:
                 seen = self.unleased_seen.pop(key)
                 self.append_unleased({"event": "ended", "at": now_iso(), "key": key, "desk": seen.get("desk"),
-                                      "lifetime": round(now - seen.get("first", now))})
+                                      "how": seen.get("how"), "lifetime": round(now - seen.get("first", now))})
+        live = set(info)
+        self.env_cache = {k: v for k, v in self.env_cache.items() if int(k.partition("-")[0]) in live}
+
+    def escaped_parent(self, pid: int, info: dict, now: float, after: float) -> bool:
+        """Whether pid would itself be recorded as an escaped job (so its children are not recorded separately)."""
+        proc, data = info[pid]
+        if pid <= 1 or now - float(data.get("create_time") or now) < after:
+            return False
+        if self.ignored(" ".join(data.get("cmdline") or [])):
+            return False
+        if sys.platform != "win32":
+            try:
+                sid = os.getsid(pid)
+            except OSError:
+                sid = None
+            if sid in self.shell_sids and sid != pid and process(sid) is None:
+                return True
+        key = str(pid) + "-" + format(float(data.get("create_time") or 0), ".2f")
+        return bool(self.claude_env(proc, key))
 
     def desk_of(self, folder: str) -> str:
         if not folder:
@@ -1944,6 +2097,7 @@ def cmd_dispatch(args, config: dict) -> None:
             now = time.monotonic()
             if now - last_sample >= num(d.config, "sample_seconds", 5):
                 d.sample()
+                d.track_shells()
                 d.watch()
                 d.serve_queue()
                 d.report()
