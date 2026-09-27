@@ -1206,6 +1206,11 @@ def cmd_run(args, config: dict) -> None:
     if not lease:
         raise SystemExit("No lease " + args.lease + " on " + target + " (" + str(path) + ")")
     state = lease.get("state")
+    if state == "requested" and target == here:
+        # Not answered yet (a busy dispatcher): wait for the answer, since a granted lease starts here directly (any
+        # program, D-260927-7) while an unanswered one would become a queued run under the program rule.
+        lease = wait_for_answer(path, (lambda d: d.get("state") != "requested",), num(config, "answer_wait_seconds", 6) * 2)
+        state = lease.get("state")
     if state in ENDED:
         raise SystemExit(args.lease + " is " + state + "; request a new lease.")
     if side_path(target, args.lease, ".order.json").exists():
@@ -1499,6 +1504,29 @@ def record_history(machine: str, lease: dict) -> None:
 
 # ---------------------------------------------------------------- the dispatcher
 
+def tool_command(shell_command: str) -> str:
+    """The command a Claude Bash tool call runs, from its shell's `-c` string: after the snapshot preamble the tool
+    passes it as `eval '<command>'`, with single quotes inside written as '\\''. Returns '' if there is none."""
+    marker = " eval '"
+    shell_command = " " + shell_command
+    start = shell_command.rfind(marker)
+    if start < 0:
+        return ""
+    i = start + len(marker)
+    out = []
+    while i < len(shell_command):
+        ch = shell_command[i]
+        if ch == "'":
+            if shell_command[i:i + 4] == "'" + chr(92) + "''":
+                out.append("'")
+                i += 4
+                continue
+            return "".join(out)
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 class Dispatcher:
     def __init__(self, config: dict):
         self.config = config
@@ -1518,6 +1546,7 @@ class Dispatcher:
         self.env_cache = {}                           # process key -> Claude markers in its environment
         self.unleased_pending = {}                    # key -> candidate younger than the threshold
         self.tool_members = {}                        # key -> the tool shell a process was seen under
+        self.desk_cache = {}                          # working folder -> desk (from mail.py desk-of)
         self.learned = read_json(LOCAL_DIR / "learned_peaks.json")
         self.learned_dirty = False
         self.version = code_version()
@@ -1975,7 +2004,20 @@ class Dispatcher:
         return any(m in cmd for m in markers) or name.casefold() in shell_names
 
     def ignored(self, cmd: str) -> bool:
-        return any(m in cmd for m in self.config.get("ignore_command_markers", []))
+        """A marker with a space is matched as a phrase; a file name such as `res.py` only as the name of a program or
+        script in the command, so `test_res.py` does not count as res.py."""
+        markers = self.config.get("ignore_command_markers", [])
+        names = set()
+        for token in cmd.split():
+            token = token.strip(chr(34) + "'")
+            names.add(token.replace(chr(92), "/").rpartition("/")[2].casefold())
+        for marker in markers:
+            if " " in marker:
+                if marker in cmd:
+                    return True
+            elif marker.casefold() in names:
+                return True
+        return False
 
     def track_shells(self) -> None:
         """Every sample: remember the session id of each live tool shell (POSIX: Claude starts each tool shell as a
@@ -2213,16 +2255,19 @@ class Dispatcher:
                     if any(self.ignored(c) for c in commands):
                         continue
                     real = [cmd_of(d) for d in descendants if not tool_shell(d) and name_of(d).casefold() not in ignore_names]
+                    asked = tool_command(cmd) or next((tool_command(cmd_of(d)) for d in descendants if tool_command(cmd_of(d))), "")
+                    listed = ([asked[:300]] if asked else []) + [c[:300] for c in real[:4] if not asked or asked not in c]
                     record = {"how": "tool shell", "claude_pid": real_parent(pid), "cwd_pid": pid,
                               "session": session_of([pid] + descendants), "shell": cmd[-160:],
-                              "commands": [c[:300] for c in real[:4]] or [cmd[-300:]]}
+                              "commands": listed or [cmd[-300:]]}
                 elif kind == "persistent" and pid != outer and real_parent(pid) == outer:
                     descendants = below(pid)
                     commands = [cmd_of(d) for d in descendants]
                     if any(self.ignored(c) for c in commands):
                         continue
                     real = [c for d, c in zip(descendants, commands) if not tool_shell(d) and name_of(d).casefold() not in ignore_names]
-                    shown = ([cmd[:300]] if not tool_shell(pid) else []) + [c[:300] for c in real[:3]]
+                    asked = tool_command(cmd)
+                    shown = ([asked[:300]] if asked else ([cmd[:300]] if not tool_shell(pid) else [])) + [c[:300] for c in real[:3]]
                     record = {"how": "command of a persistent tool shell", "claude_pid": real_parent(outer), "cwd_pid": outer,
                               "session": session_of([pid] + descendants + [outer]), "shell": cmd_of(outer)[-160:],
                               "commands": shown or [cmd[:300]]}
@@ -2295,6 +2340,8 @@ class Dispatcher:
             except (psutil.Error, OSError, ValueError):
                 cwd = ""
         session = rec.get("session") or ""
+        if not session:
+            session = self.session_of_claude(rec.get("claude_pid"))
         record = {"event": "seen", "at": now_iso(), "key": key, "how": rec.get("how"), "shell_pid": rec.get("pid"),
                   "claude_pid": rec.get("claude_pid"), "session": session, "age": round(rec.get("age", 0)),
                   "cwd": cwd, "desk": self.session_desk(session) or self.desk_of(cwd), "shell": rec.get("shell", ""),
@@ -2350,6 +2397,24 @@ class Dispatcher:
         key = str(pid) + "-" + format(float(data.get("create_time") or 0), ".2f")
         return bool(self.claude_env(proc, key))
 
+    def session_of_claude(self, claude_pid) -> str:
+        """The session ClaudeMail registered for a Claude process (its hooks record claude_pid), for records whose
+        processes do not show their environment (Apple's own binaries on the Mac)."""
+        text = str(claude_pid or "")
+        if not text.isdigit():
+            return ""
+        best, best_active = "", ""
+        folder = Path.home() / ".claude" / "claudemail" / "sessions"
+        try:
+            paths = list(folder.glob("*.json"))
+        except OSError:
+            return ""
+        for path in paths:
+            record = read_json(path)
+            if str(record.get("claude_pid")) == text and str(record.get("last_active") or "") >= best_active:
+                best, best_active = str(record.get("session") or ""), str(record.get("last_active") or "")
+        return best
+
     def session_desk(self, session: str) -> str:
         """The desk ClaudeMail registered for this session (its start folder), which a later `cd` does not change."""
         if not session:
@@ -2358,9 +2423,31 @@ class Dispatcher:
         desk = str(record.get("desk") or "").strip()
         return self.machine + ":" + desk if desk else ""
 
+    def compliance_loop(self) -> None:
+        while True:
+            started = time.monotonic()
+            try:
+                self.track_shells()
+                self.check_unleased()
+            except Exception as exc:
+                log(self.machine, "WARN compliance scan: " + type(exc).__name__ + ": " + str(exc))
+            spent = time.monotonic() - started
+            if spent > 5:
+                log(self.machine, "compliance scan took " + format(spent, ".1f") + " s")
+            time.sleep(max(0.5, num(self.config, "unleased_check_seconds", 5) - spent))
+
     def desk_of(self, folder: str) -> str:
         if not folder:
             return self.machine + ":?"
+        cached = self.desk_cache.get(folder)
+        if cached:
+            return cached
+        desk = self.desk_of_uncached(folder)
+        if not desk.endswith(":?"):
+            self.desk_cache[folder] = desk
+        return desk
+
+    def desk_of_uncached(self, folder: str) -> str:
         try:
             out = subprocess.run([sys.executable, "-B", mail_script(self.config), "desk-of", folder], capture_output=True,
                                  text=True, timeout=20, creationflags=probes.no_window(), env=mail_env()).stdout
@@ -2459,6 +2546,9 @@ def cmd_dispatch(args, config: dict) -> None:
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", code " + d.version + ", dimensions "
         + ", ".join(d.meter.dimensions()) + ")")
     d.restore_unleased()
+    # The compliance scan runs in its own thread: its first pass on a machine with many long-lived tool shells (each new
+    # record asks ClaudeMail for a desk) must never delay answers to lease requests (Moosfels, round 3).
+    threading.Thread(target=d.compliance_loop, name="compliance", daemon=True).start()
     time.sleep(1.0)
     d.sample()
     last_sample = last_unleased = last_beat = last_house = time.monotonic()
@@ -2476,14 +2566,10 @@ def cmd_dispatch(args, config: dict) -> None:
             now = time.monotonic()
             if now - last_sample >= num(d.config, "sample_seconds", 5):
                 d.sample()
-                d.track_shells()
                 d.watch()
                 d.serve_queue()
                 d.report()
                 last_sample = now
-            if now - last_unleased >= num(d.config, "unleased_check_seconds", 60):
-                d.check_unleased()
-                last_unleased = now
             if now - last_beat >= 3600:
                 log(machine, "heartbeat: " + str(len([l for l in d.leases() if l.get("state") in ACTIVE])) + " active leases")
                 last_beat = now

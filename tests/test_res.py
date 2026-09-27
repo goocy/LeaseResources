@@ -60,6 +60,7 @@ if args and args[0] == "whoami":
     print("desk    " + os.environ.get("STUB_DESK", "Altiplano:TestDesk") + "  (stub)")
     sys.exit(0)
 if args and args[0] == "desk-of":
+    time.sleep(float(os.environ.get("STUB_DESK_SLEEP", "0")))
     for folder in args[1:]:
         print(os.environ.get("STUB_DESK_OF", "StubDesk") + "\\t" + folder)
     sys.exit(0)
@@ -360,11 +361,11 @@ class World:
                              cwd=str(cwd or self.allowed), env=self.env(machine, **env))
         return run
 
-    def dispatcher(self, machine: str) -> subprocess.Popen:
+    def dispatcher(self, machine: str, **env) -> subprocess.Popen:
         out = open(self.root / ("dispatcher-" + machine + ".out"), "ab")
         self.files = getattr(self, "files", []) + [out]
         proc = subprocess.Popen([PYTHON, "-B", str(RES), "dispatch"], stdout=out, stderr=subprocess.STDOUT,
-                                env=self.env(machine), cwd=str(SERVICE))
+                                env=self.env(machine, **env), cwd=str(SERVICE))
         self.procs.append(proc)
         self.wait(lambda: (self.data / "leases" / machine / "dispatcher.json").exists(), 20, "dispatcher report")
         return proc
@@ -483,7 +484,8 @@ class T1TrialKill(Base):
         self.assertGreaterEqual(record["profile"]["ram"]["peak"], 400e6)
         disks = {d: v["peak"] for d, v in record["profile"].items() if d.startswith("disk:")}
         self.assertGreaterEqual(max(disks.values()), 30e6, disks)
-        self.assertGreaterEqual(record["profile"]["net:en0"]["peak"], 3e6)
+        nets = {d: v["peak"] for d, v in record["profile"].items() if d.startswith("net:")}
+        self.assertGreaterEqual(max(nets.values()), 3e6, nets)
         self.assertEqual(record["profile"]["gpu:0"]["peak"], 70)
         w.stop()
 
@@ -794,8 +796,10 @@ class T9HistoryAndCompliance(Base):
         else:
             long_cmd, short_cmd, expect = ("/bin/zsh -c 'sleep 12; true' shell-snapshots-fake",
                                            "/bin/zsh -c 'sleep 1; true' shell-snapshots-fake", "sleep 12")
-        claude = subprocess.Popen(fake + [long_cmd], cwd=str(w.allowed))
-        quick = subprocess.Popen(fake + [short_cmd], cwd=str(w.allowed))
+        # w.env drops CLAUDE_CODE_SESSION_ID: a session id inherited from the Claude session running the suite made the
+        # detector take that session's real desk (Moosfels, round 3)
+        claude = subprocess.Popen(fake + [long_cmd], cwd=str(w.allowed), env=w.env("Altiplano"))
+        quick = subprocess.Popen(fake + [short_cmd], cwd=str(w.allowed), env=w.env("Altiplano"))
 
         def rows():
             path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
@@ -1008,6 +1012,13 @@ class T14Units(Base):
             # a background Bash command: its per-command shell still alive in this scan, gone in the next
             Fake(base + 600, base + 1, "bash.exe", ["bash.exe", "-c", "source shell-snapshots/snap.sh; sleep 150 &"], 250, mark),
             Fake(base + 601, base + 600, "sleep.exe", ["/usr/bin/sleep", "150"], 200, {}),
+            # Git Bash as seen on Moosfels (round 3): the tool's bash under claude.exe with the command in eval '...',
+            # the MSYS bash below it, and sleep.exe orphaned by the fork/exec with only MSYSTEM in its environment
+            Fake(base + 801, base + 1, "bash.exe", ["C:/Program Files/Git/bin/bash.exe", "-c",
+                 "source /c/Users/goocy/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && eval 'date +%T; sleep 150; date +%T' < /dev/null && pwd -P >| /c/x-cwd"], 200, mark),
+            Fake(base + 802, base + 801, "bash.exe", ["C:/Program Files/Git/usr/bin/bash.exe", "-c",
+                 "source /c/Users/goocy/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && eval 'date +%T; sleep 150; date +%T' < /dev/null && pwd -P >| /c/x-cwd"], 200, mark),
+            Fake(base + 803, 12345, "sleep.exe", ["C:/Program Files/Git/usr/bin/sleep.exe", "150"], 199, {"MSYSTEM": "MINGW64"}),
             # just under the threshold now, gone at the next scan after having lived past it
             Fake(base + 701, 999, "python.exe", ["python.exe", "short.py"], 119, mark),
         ]
@@ -1032,12 +1043,13 @@ class T14Units(Base):
         rows = [json.loads(l) for l in (w.data / "leases" / "Altiplano" / "unleased.jsonl").read_text().splitlines() if l.strip()]
         seen = {int(r["key"].partition("-")[0]) - base: r for r in rows if r["event"] == "seen"}
         measured("units.detector_recorded", {str(k): r["how"] + " | " + (r["commands"][0][:40] if r["commands"] else "") for k, r in sorted(seen.items())})
-        self.assertEqual(sorted(seen), [102, 105, 107, 202, 203, 301, 311, 402, 502, 600, 601, 701])
+        self.assertEqual(sorted(seen), [102, 105, 107, 202, 203, 301, 311, 402, 502, 600, 601, 701, 801])
         self.assertIn("time.sleep(150)", seen[301]["commands"][0])
         self.assertEqual(seen[301]["session"], "sess-1")
         self.assertIn("sleep 150", " ".join(seen[402]["commands"]))
         self.assertEqual(seen[402]["how"], "command of a persistent tool shell")
         self.assertEqual(seen[601]["how"], "backgrounded, its tool shell gone")
+        self.assertEqual(seen[801]["commands"][0], "date +%T; sleep 150; date +%T")
         self.assertIn("ended between two scans", seen[701].get("note", ""))
         ended = [r for r in rows if r["event"] == "ended"]
         self.assertTrue(ended and all(r.get("session") is not None for r in ended))
@@ -1046,7 +1058,33 @@ class T14Units(Base):
         d2.restore_unleased()                         # the fake processes do not exist: all end, lifetime unknown
         comp = w.res("Altiplano", "compliance", "--days", "1")
         self.assertEqual(comp.returncode, 0, comp.stderr)
-        self.assertIn("without a lease: 12", comp.stdout)
+        self.assertIn("without a lease: 13", comp.stdout)
+
+
+class T15ScanDoesNotBlock(Base):
+    """A slow compliance scan (every desk lookup taking 3 s, and long tool shells on the machine to record: at least the
+    one running this suite) must not delay lease answers (Moosfels round 3: grant mails timed out, and a local run
+    found its lease still unanswered and was refused as a queued run)."""
+
+    def test_request_answered_while_scan_is_slow(self):
+        w = World("noblock", {"unleased_after_seconds": 1})
+        fake = fake_claude(w, self)
+        long_cmd = ("echo shell-snapshots-fake >nul & " + q(PYTHON) + ' -c "import time; time.sleep(40)"' if WINDOWS
+                    else "/bin/zsh -c 'sleep 40; true' shell-snapshots-fake")
+        subprocess.Popen(fake + [long_cmd], cwd=str(w.allowed), env=w.env("Altiplano"))   # no session: a desk lookup
+        time.sleep(2)
+        w.dispatcher("Altiplano", STUB_DESK_SLEEP="6")
+        time.sleep(2)                                   # the scan is now busy with desk lookups
+        t0 = time.monotonic()
+        req = w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner")
+        answer = time.monotonic() - t0
+        measured("noblock.answer_seconds", round(answer, 2))
+        self.assertIn("granted", req.stdout, req.stdout + req.stderr)
+        self.assertLess(answer, 3)
+        lid = lease_id(req.stdout)
+        shell = ["cmd", "/c", "echo ok"] if WINDOWS else ["/bin/sh", "-c", "echo ok"]
+        run = w.res("Altiplano", "run", "--lease", lid, "--", *shell)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
 def main():
