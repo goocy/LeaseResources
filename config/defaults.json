@@ -22,7 +22,7 @@
   "log_tail_lines": 30,
   "keep_days": 30,
 
-  "unleased_check_seconds": 60,
+  "unleased_check_seconds": 5,
   "unleased_after_seconds": 120,
   "claude_process_names": ["claude", "claude.exe"],
   "tool_shell_markers": ["shell-snapshots", "__claudeCodeScript"],

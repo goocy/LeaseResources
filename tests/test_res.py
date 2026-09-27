@@ -159,8 +159,8 @@ with open(out + ".bin", "wb") as fh:
     chunk = os.urandom(1 << 20)
     for i in range(300):
         fh.write(chunk)
-    fh.flush()
-    os.fsync(fh.fileno())
+        fh.flush()
+        os.fsync(fh.fileno())      # every block: Windows' write cache otherwise keeps it off the disk counters
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 payload = b"x" * 1400
 sent = 0
@@ -802,14 +802,17 @@ class T9HistoryAndCompliance(Base):
             if not path.exists():
                 return []
             return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
-        seen = w.wait(lambda: [r for r in rows() if r.get("claude_pid") == claude.pid and r["event"] == "seen"], 20, "unleased record")
+        def mentions(r, text):
+            return any(text in c for c in r.get("commands", [])) or text in r.get("shell", "")
+        seen = w.wait(lambda: [r for r in rows() if r["event"] == "seen" and mentions(r, expect)], 25, "unleased record")
         self.assertEqual(seen[0]["desk"], "Altiplano:StubDesk")
         self.assertTrue(any(expect in c for c in seen[0]["commands"]) or expect in seen[0]["shell"], seen[0])
         claude.wait(20)
         ended = w.wait(lambda: [r for r in rows() if r["event"] == "ended" and r["key"] == seen[0]["key"]], 15, "ended record")
         measured("R-compliance.seen", {k: seen[0][k] for k in ("age", "desk", "commands")})
         measured("R-compliance.lifetime", ended[0]["lifetime"])
-        self.assertFalse([r for r in rows() if r.get("claude_pid") == quick.pid], "a 1 s command is not a long command")
+        short_text = "time.sleep(1)" if WINDOWS else "sleep 1;"
+        self.assertFalse([r for r in rows() if mentions(r, short_text)], "a 1 s command is not a long command")
         comp = w.res("Altiplano", "compliance", "--days", "1")
         self.assertIn("without a lease: ", comp.stdout)
         measured("R-compliance.report", comp.stdout.strip().splitlines())
@@ -960,43 +963,90 @@ class T14Units(Base):
 
             def cwd(self):
                 return str(w.allowed)
-        mark = {"CLAUDECODE": "1", "CLAUDE_PID": str(base + 1)}
+        mark = {"CLAUDECODE": "1", "CLAUDE_PID": str(base + 1), "CLAUDE_CODE_SESSION_ID": "sess-1"}
         mark2 = {"CLAUDECODE": "1", "CLAUDE_PID": str(base + 200)}
-        fakes = [
+        ps_wrapper = ["C:/WINDOWS/system32/cmd.exe", "/d", "/s", "/c",
+                      "chcp 65001 >nul & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $__claudeCodeScript"]
+        ps_host = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "$__claudeCodeScript = ..."]
+        git_bash = ["C:/Program Files/Git/usr/bin/bash.exe", "--login", "-i", "C:/Users/goocy/.claude/shell-snapshots/snapshot-bash-1.sh"]
+        first = [
             Fake(base + 1, 4, "claude.exe", ["claude.exe"], 3000),
+            # a persistent PowerShell host reading from stdin (hypothetical shape), with CLAUDECODE
             Fake(base + 101, base + 1, "powershell.exe", ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "-"], 3000, mark),
             Fake(base + 102, base + 101, "python.exe", ["python.exe", "long.py"], 300, mark),
             Fake(base + 103, base + 101, "conhost.exe", ["conhost.exe", "0x4"], 3000, mark),
+            Fake(base + 109, base + 101, "python.exe", ["python.exe", "quick.py"], 10, mark),
+            Fake(base + 203, base + 101, "powershell.exe", ["powershell.exe", "-File", "x.ps1"], 400, mark),
             Fake(base + 104, base + 1, "bash.exe", ["bash.exe", "--login", "-i", "shell-snapshots/snap.sh"], 3000, mark),
             Fake(base + 105, 999, "python.exe", ["python.exe", "-m", "pymobiledevice3", "usbmux", "forward"], 900, mark),
             Fake(base + 106, 999, "python.exe", ["python.exe", "job.py"], 900, dict(mark, LEASERES_LEASE="L1")),
             Fake(base + 107, base + 1, "bash.exe", ["bash.exe", "-c", "source shell-snapshots/snap.sh; sleep 200"], 300, mark),
             Fake(base + 108, base + 107, "sleep.exe", ["sleep.exe", "200"], 300, mark),
-            Fake(base + 109, base + 101, "python.exe", ["python.exe", "quick.py"], 10, mark),
             Fake(base + 110, base + 1, "node.exe", ["node.exe", "mcp-server.js"], 3000, mark),
             Fake(base + 111, base + 110, "python.exe", ["python.exe", "helper.py"], 3000, mark),
+            Fake(base + 112, base + 1, "cmd.exe", ["cmd.exe", "/c", "npx", "some-mcp-server"], 3000, mark),
             Fake(base + 200, 4, "node.exe", ["node.exe", "cli.js"], 3000),
             Fake(base + 201, base + 200, "pwsh.exe", ["pwsh.exe", "-NoLogo"], 3000, mark2),
             Fake(base + 202, base + 201, "python.exe", ["python.exe", "train.py"], 400, mark2),
-            Fake(base + 203, base + 101, "powershell.exe", ["powershell.exe", "-File", "x.ps1"], 400, mark),
+            # the PowerShell tool as seen on Moosfels: cmd /c -> powershell $__claudeCodeScript -> python
+            Fake(base + 301, base + 1, "cmd.exe", ps_wrapper, 300, mark),
+            Fake(base + 302, base + 301, "powershell.exe", ps_host, 300, mark),
+            Fake(base + 303, base + 302, "python.exe", ["python.exe", "-c", "import time; time.sleep(150)"], 290, mark),
+            Fake(base + 304, base + 302, "conhost.exe", ["conhost.exe", "0x4"], 300, mark),
+            # a long Start-Sleep: the pair alone
+            Fake(base + 311, base + 1, "cmd.exe", ps_wrapper, 300, mark),
+            Fake(base + 312, base + 311, "powershell.exe", ps_host, 300, mark),
+            # Git Bash kept by the Bash tool, its parent chain not reaching claude.exe; an MSYS fork of bash, then
+            # sleep.exe whose environment cannot be read
+            Fake(base + 401, 77, "bash.exe", git_bash, 3000, mark),
+            Fake(base + 402, base + 401, "bash.exe", git_bash, 200, mark),
+            Fake(base + 403, base + 402, "sleep.exe", ["/usr/bin/sleep", "150"], 200, {}),
+            # the same without a marker in the command line, known by CLAUDECODE
+            Fake(base + 501, 78, "bash.exe", ["bash.exe", "--login", "-i"], 3000, mark),
+            Fake(base + 502, base + 501, "bash.exe", ["bash.exe", "--login", "-i"], 200, mark),
+            Fake(base + 503, base + 502, "sleep.exe", ["/usr/bin/sleep", "150"], 200, {}),
+            # a background Bash command: its per-command shell still alive in this scan, gone in the next
+            Fake(base + 600, base + 1, "bash.exe", ["bash.exe", "-c", "source shell-snapshots/snap.sh; sleep 150 &"], 250, mark),
+            Fake(base + 601, base + 600, "sleep.exe", ["/usr/bin/sleep", "150"], 200, {}),
+            # just under the threshold now, gone at the next scan after having lived past it
+            Fake(base + 701, 999, "python.exe", ["python.exe", "short.py"], 119, mark),
         ]
+        second = [f for f in first if f.pid not in (base + 600, base + 701)]
+        for f in second:
+            if f.pid == base + 601:
+                f.info["ppid"] = base + 600            # the dead parent's pid stays, as on Windows
         saved = res.psutil.process_iter
-        res.psutil.process_iter = lambda attrs=None: list(fakes)
         try:
             d = res.Dispatcher(res.load_config())
             d.config = dict(d.config, unleased_after_seconds=120)
+            shift = time.time() - now                 # rebase the fake ages to this moment
+            for f in first:
+                f.info["create_time"] += shift
+            res.psutil.process_iter = lambda attrs=None: list(first)
+            d.check_unleased()
+            time.sleep(1.5)
+            res.psutil.process_iter = lambda attrs=None: list(second)
             d.check_unleased()
         finally:
             res.psutil.process_iter = saved
         rows = [json.loads(l) for l in (w.data / "leases" / "Altiplano" / "unleased.jsonl").read_text().splitlines() if l.strip()]
-        got = sorted(int(r["key"].partition("-")[0]) - base for r in rows if r["event"] == "seen")
-        measured("units.detector_recorded", {str(int(r["key"].partition("-")[0]) - base): r["how"] for r in rows})
-        self.assertEqual(got, [102, 105, 107, 202, 203])
+        seen = {int(r["key"].partition("-")[0]) - base: r for r in rows if r["event"] == "seen"}
+        measured("units.detector_recorded", {str(k): r["how"] + " | " + (r["commands"][0][:40] if r["commands"] else "") for k, r in sorted(seen.items())})
+        self.assertEqual(sorted(seen), [102, 105, 107, 202, 203, 301, 311, 402, 502, 600, 601, 701])
+        self.assertIn("time.sleep(150)", seen[301]["commands"][0])
+        self.assertEqual(seen[301]["session"], "sess-1")
+        self.assertIn("sleep 150", " ".join(seen[402]["commands"]))
+        self.assertEqual(seen[402]["how"], "command of a persistent tool shell")
+        self.assertEqual(seen[601]["how"], "backgrounded, its tool shell gone")
+        self.assertIn("ended between two scans", seen[701].get("note", ""))
+        ended = [r for r in rows if r["event"] == "ended"]
+        self.assertTrue(ended and all(r.get("session") is not None for r in ended))
+        self.assertEqual([r["session"] for r in ended if r["key"] == seen[701]["key"]], ["sess-1"])
         d2 = res.Dispatcher(res.load_config())
         d2.restore_unleased()                         # the fake processes do not exist: all end, lifetime unknown
         comp = w.res("Altiplano", "compliance", "--days", "1")
         self.assertEqual(comp.returncode, 0, comp.stderr)
-        self.assertIn("without a lease: 5", comp.stdout)
+        self.assertIn("without a lease: 12", comp.stdout)
 
 
 def main():

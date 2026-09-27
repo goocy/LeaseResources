@@ -1516,6 +1516,8 @@ class Dispatcher:
         self.unleased_seen = {}                       # key -> record
         self.shell_sids = {}                          # POSIX: tool shell pid (= its session id) -> claude pid, cwd
         self.env_cache = {}                           # process key -> Claude markers in its environment
+        self.unleased_pending = {}                    # key -> candidate younger than the threshold
+        self.tool_members = {}                        # key -> the tool shell a process was seen under
         self.learned = read_json(LOCAL_DIR / "learned_peaks.json")
         self.learned_dirty = False
         self.version = code_version()
@@ -2060,22 +2062,28 @@ class Dispatcher:
         return name.casefold() in hosts or self.is_tool_shell(cmd, name)
 
     def check_unleased(self) -> None:
-        """Long commands that Claude sessions run without a lease:
-        (a) a per-command tool shell (e.g. `zsh -c ...`, carrying `shell-snapshots`) older than unleased_after_seconds;
-        (a') under a persistent tool host (a shell that is a direct child of a Claude process but runs many commands,
-             e.g. the PowerShell tool's host), each direct child of the host older than the threshold;
-        (b) POSIX: a process in the session of a tool shell that has gone (nohup / & after the shell exited);
-        (c) a process outside every live Claude tree that carries CLAUDECODE=1 in its environment (setsid, double fork,
-            reparented to launchd/init, Start-Process on Windows).
-        Claude processes are those named in claude_process_names and those whose pid a process names in its
-        CLAUDE_PID variable. Excluded: leased jobs (LEASERES_LEASE), res.py/mail.py/house.py and what runs under them,
-        console helpers (ignore_process_names, e.g. conhost.exe), other users' processes, and anything inside a Claude
-        tree that did not come from a tool shell or host (MCP servers, hooks). Only the topmost qualifying process of
-        a tree is recorded. A PowerShell cmdlet such as Start-Sleep that runs inside a persistent host starts no
-        process and cannot be seen."""
+        """Long commands that Claude sessions run without a lease. Every process of this user is placed by the nearest
+        tool shell on its parent chain (parents followed only while older than the child, since Windows reuses a dead
+        parent's pid). A tool shell is a shell from tool_host_names that carries a tool marker (`shell-snapshots` from
+        the Bash tool, `__claudeCodeScript` from the PowerShell tool) itself, or, when it runs one command
+        (`-c`, `/c`, `-Command`), in a descendant; it counts whether or not a live Claude process is found above it,
+        because on Windows the Git Bash (MSYS) shells' parent chain need not reach claude.exe.
+          (a) a per-command tool shell older than unleased_after_seconds is recorded at the outermost such shell,
+              listing the real commands below it (the PowerShell tool's `cmd /c` + `powershell` pair is one);
+          (a') under a persistent tool shell (one that runs many commands: Git Bash on Windows, a PowerShell host), each
+              direct child older than the threshold (an MSYS fork of bash, with `sleep` below it, is such a child);
+          (b) POSIX, no tool shell on the chain: a process in the session of a tool shell that has gone (nohup / &);
+          (c) no tool shell on the chain and no live Claude above: CLAUDECODE=1 in its environment (setsid, double
+              fork, Start-Process, a background command whose shell exited).
+        Claude processes are those named in claude_process_names and those a process names in CLAUDE_PID. Excluded:
+        leased jobs (LEASERES_LEASE), res.py/mail.py/house.py and what runs under them, ignore_process_names (conhost),
+        other users' processes, and what sits under a Claude process without a tool shell (MCP servers, hooks). A
+        candidate that ends before a scan sees it past the threshold is recorded when it ends if it lived long enough,
+        so the scan interval cannot hide a command that ran, say, 150 s."""
         names = self.claude_names()
         ignore_names = [n.casefold() for n in self.config.get("ignore_process_names", [])]
         after = num(self.config, "unleased_after_seconds", 120)
+        younger = min(after, 30.0)
         try:
             user = psutil.Process().username()
         except psutil.Error:
@@ -2095,23 +2103,27 @@ class Dispatcher:
             owner = info[pid][1].get("username")
             return not user or not owner or owner == user
 
-        claudes = {pid for pid, (proc, data) in info.items() if str(data.get("name") or "").casefold() in names}
+        def name_of(pid):
+            return str(info[pid][1].get("name") or "")
+
+        def parts_of(pid):
+            return info[pid][1].get("cmdline") or []
+
+        def cmd_of(pid):
+            return " ".join(parts_of(pid)) if pid in info else ""
+
+        def age_of_pid(pid):
+            return now - float(info[pid][1].get("create_time") or now)
+
+        claudes = {pid for pid in info if name_of(pid).casefold() in names}
         for pid, (proc, data) in info.items():
-            if pid in claudes or not mine(pid) or str(data.get("name") or "").casefold() in ignore_names:
+            if pid in claudes or not mine(pid) or name_of(pid).casefold() in ignore_names or age_of_pid(pid) < min(younger, 3.0):
                 continue
-            if now - float(data.get("create_time") or now) < min(after, 30):
-                continue
-            marks = self.claude_env(proc, key_of(pid), any_marker=True)
-            named = str(marks.get("claude_pid") or "")
+            named = str(self.claude_env(proc, key_of(pid), any_marker=True).get("claude_pid") or "")
             if named.isdigit() and int(named) in info:
                 claudes.add(int(named))
 
-        def cmd_of(pid):
-            return " ".join(info[pid][1].get("cmdline") or []) if pid in info else ""
-
         def real_parent(pid):
-            """The parent, only if it is really this process's parent: Windows keeps a dead parent's pid in the
-            child and soon reuses it, so a 'parent' younger than the child is someone else."""
             parent = info[pid][1].get("ppid")
             if parent not in info or parent == pid:
                 return None
@@ -2119,17 +2131,40 @@ class Dispatcher:
                 return None
             return parent
 
-        def claude_below(pid):
-            seen = set()
-            while pid in info and pid not in seen:
-                seen.add(pid)
-                parent = real_parent(pid)
-                if parent is None:
-                    return None
+        shell_cache = {}
+
+        def tool_shell(pid):
+            """None, 'per-command' or 'persistent'."""
+            if pid in shell_cache:
+                return shell_cache[pid]
+            kind = None
+            parts, name = parts_of(pid), name_of(pid)
+            if self.is_tool_host(name, " ".join(parts)) and not self.ignored(" ".join(parts)):
+                per = self.per_command_shell(parts, name)
+                own_marker = self.is_tool_shell(" ".join(parts), name)
+                if per and (own_marker or self.marked_tree(pid, info, children)):
+                    kind = "per-command"
+                elif not per and (own_marker or self.claude_env(info[pid][0], key_of(pid), any_marker=True)):
+                    kind = "persistent"               # e.g. a Git Bash kept by the Bash tool, marked or with CLAUDECODE
+            shell_cache[pid] = kind
+            return kind
+
+        def placement(pid):
+            """(outermost tool shell on the chain or None, its kind, whether a live Claude is above, chain)."""
+            chain, seen, current, claude_above = [], set(), pid, False
+            while current is not None and current not in seen:
+                seen.add(current)
+                chain.append(current)
+                parent = real_parent(current)
                 if parent in claudes:
-                    return pid
-                pid = parent
-            return None
+                    claude_above = True
+                    break
+                current = parent
+            outer = None
+            for member in chain:
+                if tool_shell(member):
+                    outer = member
+            return outer, (tool_shell(outer) if outer else None), claude_above, chain
 
         def session_of(pids):
             for candidate in pids:
@@ -2139,99 +2174,145 @@ class Dispatcher:
                         return marks["session"]
             return ""
 
+        def below(pid):
+            out, stack = [], list(children.get(pid, []))
+            while stack:
+                d = stack.pop()
+                if d in info:
+                    out.append(d)
+                    stack.extend(children.get(d, []))
+            return out
+
         found = {}
         for pid, (proc, data) in info.items():
-            name = str(data.get("name") or "")
+            name = name_of(pid)
             if pid in claudes or name.casefold() in ignore_names or not mine(pid):
-                continue
-            age = now - float(data.get("create_time") or now)
-            if age < after:
                 continue
             cmd = cmd_of(pid)
             if self.ignored(cmd):
                 continue
             key = key_of(pid)
-            top = claude_below(pid)
-            if top is not None:
-                top_name = str(info[top][1].get("name") or "")
-                top_parts = info[top][1].get("cmdline") or []
-                if top == pid and self.per_command_shell(top_parts, top_name) and self.marked_tree(pid, info, children):
-                    how, recorded_under = "tool shell", data.get("ppid")    # e.g. zsh -c, bash -c, cmd /c -> powershell
-                elif top != pid and data.get("ppid") == top and not self.per_command_shell(top_parts, top_name) \
-                        and self.is_tool_host(top_name, " ".join(top_parts)) and not self.ignored(" ".join(top_parts)):
-                    how, recorded_under = "command of a persistent tool host", info[top][1].get("ppid")
-                else:
-                    continue                          # a host itself, an MCP server, a hook, or deeper in a counted tree
-                descendants, stack = [], list(children.get(pid, []))
-                while stack:
-                    d = stack.pop()
-                    if d in info:
-                        descendants.append(d)
-                        stack.extend(children.get(d, []))
-                commands = [cmd_of(d) for d in descendants]
-                if any(self.ignored(c) for c in commands):
-                    continue
-                # What the command really is: the descendants that are not themselves shells running the tool's
-                # wrapper (the PowerShell tool's `powershell -Command $__claudeCodeScript` under `cmd /c`).
-                real = [cmd_of(d) for d in descendants if not self.per_command_shell(info[d][1].get("cmdline") or [],
-                                                                                  str(info[d][1].get("name") or ""))
-                        and str(info[d][1].get("name") or "").casefold() not in ignore_names]
-                if how == "tool shell":
-                    shown = [c[:300] for c in real[:4]] or [cmd[-300:]]
-                else:
-                    shown = [cmd[:300]] + [c[:300] for c in real[:3]]
-                found[key] = {"how": how, "pid": pid, "claude_pid": recorded_under, "age": age, "cwd_pid": top,
-                              "session": session_of([pid] + descendants),
-                              "shell": cmd[-160:] if how == "tool shell" else " ".join(top_parts)[-160:], "commands": shown}
+            outer, kind, claude_above, chain = placement(pid)
+            if outer is not None and key not in self.tool_members:
+                # Remember everything seen inside a tool shell: if its shell exits (a background Bash command), the
+                # orphan is still known to be a tool command even where its environment cannot be read (MSYS?).
+                self.tool_members[key] = {"shell": cmd_of(outer)[-160:], "claude_pid": real_parent(outer),
+                                          "session": session_of(chain), "cwd_pid": outer}
+                try:
+                    self.tool_members[key]["cwd"] = psutil.Process(outer).cwd()
+                except (psutil.Error, OSError):
+                    self.tool_members[key]["cwd"] = ""
+            age = age_of_pid(pid)
+            if age < younger:
                 continue
             record = None
-            if sys.platform != "win32":
-                try:
-                    sid = os.getsid(pid)
-                except OSError:
-                    sid = None
-                shell = self.shell_sids.get(sid)
-                if shell is not None and sid != pid and process(sid) is None:
-                    record = {"how": "backgrounded, its tool shell gone", "claude_pid": shell["claude_pid"], "cwd": shell["cwd"],
-                              "shell": shell["shell"]}
-            if record is None:
-                marks = self.claude_env(proc, key)
-                if marks:
-                    record = {"how": "left the Claude tree (environment marker)", "claude_pid": marks.get("claude_pid"),
-                              "session": marks.get("session"), "cwd_pid": pid}
-            if record is None:
-                continue
-            parent = real_parent(pid)
-            if parent is not None and parent not in claudes and self.escaped_parent(parent, info, now, after):
-                continue
-            record.update(pid=pid, age=age, commands=[cmd[:300]])
-            found[key] = record
+            if outer is not None:
+                if kind == "per-command" and pid == outer:
+                    descendants = below(pid)
+                    commands = [cmd_of(d) for d in descendants]
+                    if any(self.ignored(c) for c in commands):
+                        continue
+                    real = [cmd_of(d) for d in descendants if not tool_shell(d) and name_of(d).casefold() not in ignore_names]
+                    record = {"how": "tool shell", "claude_pid": real_parent(pid), "cwd_pid": pid,
+                              "session": session_of([pid] + descendants), "shell": cmd[-160:],
+                              "commands": [c[:300] for c in real[:4]] or [cmd[-300:]]}
+                elif kind == "persistent" and pid != outer and real_parent(pid) == outer:
+                    descendants = below(pid)
+                    commands = [cmd_of(d) for d in descendants]
+                    if any(self.ignored(c) for c in commands):
+                        continue
+                    real = [c for d, c in zip(descendants, commands) if not tool_shell(d) and name_of(d).casefold() not in ignore_names]
+                    shown = ([cmd[:300]] if not tool_shell(pid) else []) + [c[:300] for c in real[:3]]
+                    record = {"how": "command of a persistent tool shell", "claude_pid": real_parent(outer), "cwd_pid": outer,
+                              "session": session_of([pid] + descendants + [outer]), "shell": cmd_of(outer)[-160:],
+                              "commands": shown or [cmd[:300]]}
+                else:
+                    continue                          # a shell itself, or deeper inside a tree counted at its top
+            elif claude_above:
+                continue                              # MCP servers, hooks and their children
+            else:
+                if sys.platform != "win32":
+                    try:
+                        sid = os.getsid(pid)
+                    except OSError:
+                        sid = None
+                    shell = self.shell_sids.get(sid)
+                    if shell is not None and sid != pid and process(sid) is None:
+                        record = {"how": "backgrounded, its tool shell gone", "claude_pid": shell["claude_pid"],
+                                  "cwd": shell["cwd"], "shell": shell["shell"], "commands": [cmd[:300]]}
+                member = self.tool_members.get(key)
+                if record is None and member is not None:
+                    record = {"how": "backgrounded, its tool shell gone", "claude_pid": member.get("claude_pid"),
+                              "cwd": member.get("cwd", ""), "session": member.get("session", ""),
+                              "shell": member.get("shell", ""), "commands": [cmd[:300]]}
+                if record is None:
+                    marks = self.claude_env(proc, key)
+                    if marks:
+                        record = {"how": "left the Claude tree (environment marker)", "claude_pid": marks.get("claude_pid"),
+                                  "session": marks.get("session"), "cwd_pid": pid, "commands": [cmd[:300]]}
+                if record is None:
+                    continue
+                parent = real_parent(pid)
+                if parent is not None and parent not in claudes and placement(parent)[0] is None \
+                        and (self.escaped_parent(parent, info, now, younger) or key_of(parent) in self.tool_members):
+                    self.unleased_pending.pop(key, None)
+                    continue                          # its parent is recorded instead
+            record.update(pid=pid, age=age, first=now - age)
+            if age >= after:
+                found[key] = record
+            else:
+                self.unleased_pending[key] = record   # not long enough yet; recorded later, or when it ends
         for key, rec in found.items():
-            if key in self.unleased_seen:
+            self.unleased_pending.pop(key, None)
+            if key not in self.unleased_seen:
+                self.write_seen(key, rec, now)
+        for key in list(self.unleased_pending):
+            if key in found:
                 continue
-            cwd = rec.pop("cwd", None)
-            cwd_pid = rec.pop("cwd_pid", None)
-            if cwd is None:
-                try:
-                    cwd = psutil.Process(cwd_pid).cwd() if cwd_pid else ""
-                except (psutil.Error, OSError, ValueError):
-                    cwd = ""
-            session = rec.get("session") or ""
-            record = {"event": "seen", "at": now_iso(), "key": key, "how": rec.get("how"), "shell_pid": rec.get("pid"),
-                      "claude_pid": rec.get("claude_pid"), "session": session, "age": round(rec.get("age", 0)),
-                      "cwd": cwd, "desk": self.session_desk(session) or self.desk_of(cwd), "shell": rec.get("shell", ""),
-                      "commands": rec.get("commands", [])}
-            self.unleased_seen[key] = dict(record, first=now - rec.get("age", 0))
-            self.append_unleased(record)
-            log(self.machine, "unleased long command (" + str(record["how"]) + ") in " + record["desk"] + ": "
-                + (record["commands"][0] if record["commands"] else record["shell"][-80:]))
+            pid_text = key.partition("-")[0]
+            alive_now = int(pid_text) in info and key_of(int(pid_text)) == key
+            if alive_now:
+                continue
+            rec = self.unleased_pending.pop(key)
+            lifetime = now - rec.get("first", now)
+            if lifetime >= after:                     # ended between two scans after running long enough
+                self.write_seen(key, dict(rec, age=lifetime), now, note="recorded at its end; it ended between two scans")
+                self.end_record(key, now)
         for key in list(self.unleased_seen):
             if key not in found:
-                seen = self.unleased_seen.pop(key)
-                self.append_unleased({"event": "ended", "at": now_iso(), "key": key, "desk": seen.get("desk"),
-                                      "how": seen.get("how"), "lifetime": round(now - seen.get("first", now))})
-        live = set(info)
-        self.env_cache = {k: v for k, v in self.env_cache.items() if int(k.partition("-")[0]) in live}
+                self.end_record(key, now)
+        live_keys = {key_of(pid) for pid in info}
+        self.env_cache = {k: v for k, v in self.env_cache.items() if k in live_keys}
+        self.tool_members = {k: v for k, v in self.tool_members.items() if k in live_keys}
+
+    def write_seen(self, key: str, rec: dict, now: float, note: str = "") -> None:
+        rec = dict(rec)
+        cwd = rec.pop("cwd", None)
+        cwd_pid = rec.pop("cwd_pid", None)
+        if cwd is None:
+            try:
+                cwd = psutil.Process(cwd_pid).cwd() if cwd_pid else ""
+            except (psutil.Error, OSError, ValueError):
+                cwd = ""
+        session = rec.get("session") or ""
+        record = {"event": "seen", "at": now_iso(), "key": key, "how": rec.get("how"), "shell_pid": rec.get("pid"),
+                  "claude_pid": rec.get("claude_pid"), "session": session, "age": round(rec.get("age", 0)),
+                  "cwd": cwd, "desk": self.session_desk(session) or self.desk_of(cwd), "shell": rec.get("shell", ""),
+                  "commands": rec.get("commands", [])}
+        if note:
+            record["note"] = note
+        self.unleased_seen[key] = dict(record, first=rec.get("first", now - rec.get("age", 0)))
+        self.append_unleased(record)
+        log(self.machine, "unleased long command (" + str(record["how"]) + ") in " + record["desk"] + ": "
+            + (record["commands"][0] if record["commands"] else record["shell"][-80:]))
+
+    def end_record(self, key: str, now: float) -> None:
+        seen = self.unleased_seen.pop(key, None)
+        if seen is None:
+            return
+        self.append_unleased({"event": "ended", "at": now_iso(), "key": key, "desk": seen.get("desk"),
+                              "session": seen.get("session", ""), "how": seen.get("how"),
+                              "lifetime": round(now - seen.get("first", now))})
 
     def restore_unleased(self) -> None:
         """After a restart: take back the records that were seen and not ended, so a process is recorded once."""
@@ -2247,7 +2328,8 @@ class Dispatcher:
             proc = process(pid_text, ctime) if pid_text.isdigit() else None
             if proc is None:
                 self.append_unleased({"event": "ended", "at": now_iso(), "key": key, "desk": row.get("desk"),
-                                      "how": row.get("how"), "lifetime": None, "note": "ended while the dispatcher was down"})
+                                      "session": row.get("session", ""), "how": row.get("how"), "lifetime": None,
+                                      "note": "ended while the dispatcher was down"})
                 continue
             self.unleased_seen[key] = dict(row, first=float(ctime or now), restored=True)
 
