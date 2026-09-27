@@ -28,6 +28,8 @@
   "tool_shell_markers": ["shell-snapshots"],
   "tool_shell_names": [],
   "ignore_command_markers": ["mail.py", "res.py", "house.py"],
+  "ignore_process_names": ["conhost.exe", "openconsole.exe", "wslhost.exe"],
+  "tool_host_names": ["bash", "bash.exe", "zsh", "sh", "sh.exe", "powershell.exe", "pwsh", "pwsh.exe", "cmd.exe"],
 
   "allowed_programs": ["python", "pythonw", "py", "powershell", "pwsh"],
   "allowed_roots": ["~/ResilioSync/Services", "~/ResilioSync/Projects", "~/ResilioSync/Tools"],
@@ -38,7 +40,8 @@
   "disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/", "/Volumes/Recovery"],
   "net_default_bytes_per_s": 125000000,
   "net_capacity": {},
-  "net_skip": [],
+  "net_skip": ["vethernet", "vmware", "virtualbox", "hyper-v", "tailscale", "zerotier", "npcap", "bluetooth", "loopback", "isatap", "teredo"],
+  "net_bogus_speeds_mbit": [4294, 4295],
   "file_dimensions": {},
 
   "mail_script": "",

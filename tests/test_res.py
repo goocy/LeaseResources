@@ -29,6 +29,19 @@ RESULTS = {}
 
 import psutil  # noqa: E402
 
+
+WORLDS = []
+POSIX_ONLY = unittest.skipIf(sys.platform == "win32", "POSIX process groups / sessions; see Running-on.md for the Windows re-test")
+
+
+class Base(unittest.TestCase):
+    """Every test stops everything its sandboxes started, pass or fail (22 dispatchers were left behind on Moosfels)."""
+
+    def tearDown(self):
+        while WORLDS:
+            WORLDS.pop().stop()
+
+
 STUB_MAIL = '''
 import json, os, sys, time
 from pathlib import Path
@@ -174,7 +187,7 @@ int main(int argc, char **argv) {
 
 
 def fake_claude(world, case):
-    if shutil.which("cc") is None:
+    if sys.platform == "win32" or shutil.which("cc") is None:
         case.skipTest("no C compiler for the fake Claude process")
     source = world.root / "fake_claude.c"
     source.write_text(FAKE_CLAUDE_C)
@@ -183,7 +196,7 @@ def fake_claude(world, case):
     return fake
 
 
-class T11Mine(unittest.TestCase):
+class T11Mine(Base):
     """res mine: the per-process cpu and disk columns show real rates (cpu was always 0.00 before 2026-09-27 10:00)."""
 
     def test_per_process_columns(self):
@@ -196,7 +209,7 @@ class T11Mine(unittest.TestCase):
             "    while time.time() < end:\n        fh.write(chunk)\n        fh.flush()\n        os.fsync(fh.fileno())\n")
         out = w.root / "mine.txt"
         env = w.env("Altiplano")
-        cmd = ("python3 busy.py & python3 writer.py & sleep 1.5; '" + PYTHON + "' -B '" + str(RES) + "' mine > '" + str(out) + "'; wait")
+        cmd = ("'" + PYTHON + "' busy.py & '" + PYTHON + "' writer.py & sleep 1.5; '" + PYTHON + "' -B '" + str(RES) + "' mine > '" + str(out) + "'; wait")
         subprocess.run([str(fake), cmd], cwd=str(w.allowed), env=env, timeout=60)
         text = out.read_text()
         rows = {}
@@ -212,7 +225,7 @@ class T11Mine(unittest.TestCase):
         self.assertTrue("MB/s" in rows["writer"] or "GB/s" in rows["writer"], rows["writer"])
 
 
-class T12Escapes(unittest.TestCase):
+class T12Escapes(Base):
     """Compliance: long jobs that left their tool shell are counted too: nohup/& after the shell exited (session id of
     the gone shell, works even for Apple binaries whose environment macOS hides) and setsid (CLAUDECODE in the
     environment); a leased job started from the same session is not counted."""
@@ -224,12 +237,12 @@ class T12Escapes(unittest.TestCase):
         w.dispatcher("Altiplano")
         env = w.env("Altiplano", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="fake-session")
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
-        leased = w.res("Altiplano", "run", "--lease", lid, "--", "python3", str(w.allowed / "sleeper.py"), "14", CLAUDECODE="1")
+        leased = w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleeper.py"), "14", CLAUDECODE="1")
         self.assertEqual(leased.returncode, 0, leased.stdout + leased.stderr)
         jobs = [
-            "true shell-snapshots-fake; nohup python3 sleeper.py 15 >/dev/null 2>&1 &",
+            "true shell-snapshots-fake; nohup " + PYTHON + " sleeper.py 15 >/dev/null 2>&1 &",
             "true shell-snapshots-fake; nohup /bin/sleep 17 >/dev/null 2>&1 & sleep 3",
-            "true shell-snapshots-fake; python3 -c 'import os, time; os.setsid(); time.sleep(16)' >/dev/null 2>&1 &",
+            "true shell-snapshots-fake; " + PYTHON + " -c 'import os, time; os.setsid(); time.sleep(16)' >/dev/null 2>&1 &",
         ]
         for job in jobs:
             subprocess.Popen([str(fake), job], cwd=str(w.allowed), env=env)
@@ -289,6 +302,7 @@ class World:
         config.update(extra or {})
         (self.config / "defaults.json").write_text(json.dumps(config, indent=1), encoding="utf-8")
         self.procs = []
+        WORLDS.append(self)
 
     def env(self, machine: str, **extra) -> dict:
         env = dict(os.environ)
@@ -313,13 +327,35 @@ class World:
         return proc
 
     def stop(self):
+        """Kill every process this sandbox started: the dispatchers and keepers it launched with their trees, and
+        anything whose command line names the sandbox folder (detached runners, their jobs, stand-in Claude processes)."""
+        victims = {}
         for proc in self.procs:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            try:
+                root = psutil.Process(proc.pid)
+                for p in [root] + root.children(recursive=True):
+                    victims[p.pid] = p
+            except psutil.Error:
+                pass
+        marker = str(self.root)
+        me = os.getpid()
+        for p in psutil.process_iter(["cmdline"]):
+            try:
+                if p.pid != me and marker in " ".join(p.info.get("cmdline") or []):
+                    victims[p.pid] = p
+            except psutil.Error:
+                continue
+        for p in victims.values():
+            try:
+                p.kill()
+            except psutil.Error:
+                pass
+        psutil.wait_procs(list(victims.values()), timeout=5)
+        for proc in self.procs:
+            try:
+                proc.wait(1)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         for fh in getattr(self, "files", []):
             fh.close()
 
@@ -367,7 +403,7 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
-class T1TrialKill(unittest.TestCase):
+class T1TrialKill(Base):
     """R1 and the process-tree kill: a runaway command with children, a grandchild, a setsid child and an orphaned
     new-session grandchild is killed at 10 s, and the profile shows its peaks on cpu, ram, disk, net and a simulated GPU."""
 
@@ -417,7 +453,7 @@ class T1TrialKill(unittest.TestCase):
         measured("R1.quick_trial_line", first)
 
 
-class T3Queue(unittest.TestCase):
+class T3Queue(Base):
     """R3: two GPU-heavy leases (GPU simulated as a file dimension): the second queues on gpu:0 and its owner gets mail
     when it is granted; FIFO; a queued run order starts on grant; refusal names the dimension."""
 
@@ -434,7 +470,7 @@ class T3Queue(unittest.TestCase):
         self.assertIn("granted", a.stdout, a.stdout + a.stderr)
         la = lease_id(a.stdout)
         measured("R3.first_answer_seconds", round(answer_a, 2))
-        run_a = w.res("Altiplano", "run", "--lease", la, "--", "python3", str(w.allowed / "gpuuser.py"), str(gpu), "60", "8")
+        run_a = w.res("Altiplano", "run", "--lease", la, "--", PYTHON, str(w.allowed / "gpuuser.py"), str(gpu), "60", "8")
         self.assertEqual(run_a.returncode, 0, run_a.stdout + run_a.stderr)
         b = w.res("Altiplano", "request", "--need", "gpu=60", "--for", "2m", "--desk", "Altiplano:DeskB")
         self.assertIn("queued", b.stdout, b.stdout + b.stderr)
@@ -443,7 +479,7 @@ class T3Queue(unittest.TestCase):
         c = w.res("Altiplano", "request", "--need", "gpu:0=50", "--for", "2m", "--desk", "Altiplano:DeskC")
         self.assertIn("queued", c.stdout)
         lc = lease_id(c.stdout)
-        run_c = w.res("Altiplano", "run", "--lease", lc, "--", "python3", str(w.allowed / "sleepy.py"), "2")
+        run_c = w.res("Altiplano", "run", "--lease", lc, "--", PYTHON, str(w.allowed / "sleepy.py"), "2")
         self.assertIn("Run order written", run_c.stdout, run_c.stdout + run_c.stderr)
         measured("R3.second_answer", b.stdout.splitlines()[0])
         w.wait(lambda: w.lease("Altiplano", lb).get("state") == "granted", 40, "B granted after A ends")
@@ -472,7 +508,7 @@ class T3Queue(unittest.TestCase):
         w.stop()
 
 
-class T4Overrun(unittest.TestCase):
+class T4Overrun(Base):
     """R4: a lease that exceeds its declared RAM produces mail to its owner and is not killed; completion mail carries
     the log tail. Also stall and past-duration mail."""
 
@@ -481,7 +517,7 @@ class T4Overrun(unittest.TestCase):
         w.dispatcher("Altiplano")
         req = w.res("Altiplano", "request", "--need", "ram=100M,cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner")
         lid = lease_id(req.stdout)
-        run = w.res("Altiplano", "run", "--lease", lid, "--", "python3", str(w.allowed / "ramhog.py"), "600", "15")
+        run = w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "ramhog.py"), "600", "15")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         t0 = time.monotonic()
         mail = w.wait(lambda: w.mail_matching("uses more ram"), 30, "overrun mail")
@@ -508,7 +544,7 @@ class T4Overrun(unittest.TestCase):
         w = World("stall", {"stall_minutes": 0.1})
         w.dispatcher("Altiplano")
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "3s", "--desk", "Altiplano:Owner").stdout)
-        w.res("Altiplano", "run", "--lease", lid, "--", "python3", str(w.allowed / "silent.py"), "20")
+        w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "silent.py"), "20")
         t0 = time.monotonic()
         dur = w.wait(lambda: w.mail_matching("ran past its duration"), 20, "duration mail")
         t_dur = time.monotonic() - t0
@@ -521,7 +557,8 @@ class T4Overrun(unittest.TestCase):
         w.stop()
 
 
-class T5Survive(unittest.TestCase):
+@POSIX_ONLY
+class T5Survive(Base):
     """R5 as far as possible here: a leased job survives the kill of the shell and process group that started it (what an
     interrupted turn does), and a dispatcher restart; a killed runner is reported as lost; failures are reported."""
 
@@ -530,7 +567,7 @@ class T5Survive(unittest.TestCase):
         disp = w.dispatcher("Altiplano")
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
         env = w.env("Altiplano")
-        shell = subprocess.Popen(["/bin/bash", "-c", '"$0" -B "$1" run --lease "$2" -- python3 "$3" 12; sleep 60',
+        shell = subprocess.Popen(["/bin/bash", "-c", '"$0" -B "$1" run --lease "$2" -- "$0" "$3" 12; sleep 60',
                                   PYTHON, str(RES), lid, str(w.allowed / "sleepy.py")], env=env, cwd=str(w.allowed),
                                  start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         w.wait(lambda: w.lease("Altiplano", lid).get("state") == "running", 20, "job running")
@@ -559,7 +596,7 @@ class T5Survive(unittest.TestCase):
         w = World("lost")
         w.dispatcher("Altiplano")
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
-        w.res("Altiplano", "run", "--lease", lid, "--", "python3", str(w.allowed / "sleepy.py"), "60")
+        w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleepy.py"), "60")
         w.wait(lambda: w.lease("Altiplano", lid).get("state") == "running", 20, "running")
         run = json.loads((w.data / "leases" / "Altiplano" / (lid + ".run.json")).read_text())
         os.kill(run["runner_pid"], signal.SIGKILL)
@@ -567,7 +604,7 @@ class T5Survive(unittest.TestCase):
         lost = w.wait(lambda: w.mail_matching(" lost "), 20, "lost mail")
         measured("R5.lost_subject", lost[0]["subject"])
         lid2 = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
-        w.res("Altiplano", "run", "--lease", lid2, "--", "python3", str(w.allowed / "fail.py"))
+        w.res("Altiplano", "run", "--lease", lid2, "--", PYTHON, str(w.allowed / "fail.py"))
         failed = w.wait(lambda: w.mail_matching("failed"), 20, "failed mail")
         self.assertIn("exit code 3", failed[0]["body"])
         self.assertIn("about to fail", failed[0]["body"])
@@ -575,7 +612,7 @@ class T5Survive(unittest.TestCase):
         w.stop()
 
 
-class T6CrossMachine(unittest.TestCase):
+class T6CrossMachine(Base):
     """R6 with two machine folders: a request made as Altiplano with --on Mistral is granted by Mistral's dispatcher, the
     answer mail goes to the Altiplano desk, and a run ordered from Altiplano starts on Mistral and reports back."""
 
@@ -592,7 +629,7 @@ class T6CrossMachine(unittest.TestCase):
         self.assertEqual(answer[0]["machine"], "Mistral", "the answer must come from Mistral's dispatcher")
         self.assertTrue(w.lease("Mistral", lid))
         self.assertFalse((w.data / "leases" / "Altiplano" / (lid + ".json")).exists())
-        run = w.res("Altiplano", "run", "--lease", lid, "--on", "Mistral", "--", "python3", str(w.allowed / "sleepy.py"), "3")
+        run = w.res("Altiplano", "run", "--lease", lid, "--on", "Mistral", "--", PYTHON, str(w.allowed / "sleepy.py"), "3")
         self.assertIn("Run order written", run.stdout, run.stdout + run.stderr)
         fin = w.wait(lambda: [m for m in w.mail_matching("finished") if m["to"] == "Altiplano:Asker"], 30, "finished mail")
         self.assertEqual(fin[0]["machine"], "Mistral")
@@ -604,7 +641,7 @@ class T6CrossMachine(unittest.TestCase):
         w.stop()
 
 
-class T8Safety(unittest.TestCase):
+class T8Safety(Base):
     """R8 after D-260927-7: a session's direct local run may use any program; anything that arrives through the synced
     folder (orders from another machine, and files planted there claiming to be local) keeps the program rule in full,
     is refused and logged, and never runs."""
@@ -627,10 +664,10 @@ class T8Safety(unittest.TestCase):
 
         cases = {
             "shell": ["/bin/sh", "-c", "echo remote > " + str(w.root / "marker-remote.txt")],
-            "outside": ["python3", str(w.outside / "evil.py")],
-            "inline": ["python3", "-c", "print(1)"],
-            "module": ["python3", "-m", "http.server"],
-            "symlink": ["python3", str(w.allowed / "link.py")],
+            "outside": [PYTHON, str(w.outside / "evil.py")],
+            "inline": [PYTHON, "-c", "print(1)"],
+            "module": [PYTHON, "-m", "http.server"],
+            "symlink": [PYTHON, str(w.allowed / "link.py")],
         }
         remote = {}
         for name, argv in cases.items():
@@ -672,7 +709,7 @@ class T8Safety(unittest.TestCase):
         w.stop()
 
 
-class T9HistoryAndCompliance(unittest.TestCase):
+class T9HistoryAndCompliance(Base):
     """Duration history per command, and the compliance record: a long command of a (fake) Claude session without a
     lease is recorded with its desk and lifetime; leased runs and res itself are not."""
 
@@ -681,7 +718,7 @@ class T9HistoryAndCompliance(unittest.TestCase):
         w.dispatcher("Altiplano")
         for i in range(2):
             lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1h", "--desk", "Altiplano:Owner").stdout)
-            run = w.res("Altiplano", "run", "--lease", lid, "--", "python3", str(w.allowed / "sleepy.py"), "2")
+            run = w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleepy.py"), "2")
             w.wait(lambda: w.lease("Altiplano", lid).get("state") == "finished", 20, "finished")
         measured("R-history.second_run_output", run.stdout.splitlines()[0])
         self.assertIn("previous runs of this command took", run.stdout)
@@ -719,7 +756,7 @@ class T9HistoryAndCompliance(unittest.TestCase):
         w.stop()
 
 
-class T10Keeper(unittest.TestCase):
+class T10Keeper(Base):
     """The keeper (res.py watch) restarts the dispatcher onto new code when res.py or probes.py change."""
 
     def test_restart_on_code_change(self):
@@ -740,6 +777,166 @@ class T10Keeper(unittest.TestCase):
             keeper.terminate()
             keeper.wait(5)
             out.close()
+
+
+class T13TrialWatchdog(Base):
+    """The 10-second kill does not depend on the sampling loop: with one sample every 30 s (standing in for a probe
+    call that hangs, as psutil's open_files did on Windows) a 60-second tree still dies at 10 s and res returns."""
+
+    def test_watchdog_kills_when_sampling_stalls(self):
+        w = World("watchdog", {"trial_sample_seconds": 30})
+        script = w.outside / "tree2.py"
+        script.write_text("import subprocess, sys, time\n"
+                          "kids = [subprocess.Popen([sys.executable, '-c', 'import subprocess, sys, time; "
+                          "subprocess.Popen([sys.executable, \\'-c\\', \\'import time; time.sleep(60)\\']); time.sleep(60)']) "
+                          "for i in range(2)]\n"
+                          "open(sys.argv[1], 'w').write(' '.join(str(k.pid) for k in kids))\ntime.sleep(60)\n")
+        pids_file = w.root / "pids2.txt"
+        t0 = time.monotonic()
+        run = w.res("Altiplano", "trial", "--json", "--", PYTHON, str(script), str(pids_file), cwd=w.root, timeout=40)
+        wall = time.monotonic() - t0
+        self.assertEqual(run.returncode, 0, run.stderr)
+        record = json.loads(run.stdout)
+        time.sleep(0.5)
+        survivors = [p for p in psutil.process_iter(["cmdline"]) if "time.sleep(60)" in " ".join(p.info.get("cmdline") or [])
+                     and str(w.root) in " ".join(p.info.get("cmdline") or []) + str(script)]
+        kids = [int(x) for x in pids_file.read_text().split()] if pids_file.exists() else []
+        alive = [k for k in kids if pid_alive(k)]
+        measured("watchdog.trial_seconds", record["seconds"])
+        measured("watchdog.wall_seconds", round(wall, 1))
+        measured("watchdog.killed", len(record["killed"]))
+        self.assertFalse(record["finished"])
+        self.assertLess(wall, 16)
+        self.assertEqual(alive, [])
+
+
+class T14Units(Base):
+    """In-process checks of the pieces written for Windows, runnable on any platform: retried replace and read, the
+    disk attribution cap, the virtual-interface filter, and the unleased detector on a Windows-shaped process table."""
+
+    def load(self, w):
+        for key, value in w.env("Altiplano").items():
+            if key.startswith("LEASERES_"):
+                os.environ[key] = value
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("res_under_test", RES)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_replace_and_read_retry(self):
+        import probes
+        w = World("units-io")
+        target = w.root / "x.json"
+        real = os.replace
+        calls = {"n": 0}
+
+        def flaky(a, b):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise PermissionError(5, "Access is denied")
+            return real(a, b)
+        probes.os.replace = flaky
+        try:
+            probes.write_json(target, {"a": 1})
+        finally:
+            probes.os.replace = real
+        self.assertEqual(probes.read_json(target), {"a": 1})
+        measured("units.replace_attempts", calls["n"])
+        (w.root / "half.json").write_text('{"a": ')
+        self.assertEqual(probes.read_json(w.root / "half.json"), {})
+        self.assertEqual(probes.read_json(w.root / "missing.json"), {})
+
+    def test_disk_cap(self):
+        import probes
+        probe = probes.DiskProbe.__new__(probes.DiskProbe)
+        probe.dims = {"disk:PhysicalDrive0": {"capacity": 150e6}, "disk:PhysicalDrive1": {"capacity": 150e6}}
+        probe.mounts = {"disk:PhysicalDrive0": ["C:"], "disk:PhysicalDrive1": ["F:"]}
+        r = probes.Reading(1)
+        r.disk_rate = 355e6
+        use = probe.tree([r], 1.0, {"disk:PhysicalDrive0": 1.6e6, "disk:PhysicalDrive1": 0.0})
+        measured("units.disk_cap", {d: round(v) for d, v in use.items()})
+        self.assertLessEqual(sum(use.values()), 1.6e6 + 1)
+
+    def test_virtual_interfaces(self):
+        import probes
+        from collections import namedtuple
+        Stat = namedtuple("Stat", "isup speed")
+        Addr = namedtuple("Addr", "family address")
+        Io = namedtuple("Io", "bytes_sent bytes_recv")
+        stats = {"Ethernet": Stat(True, 1000), "vEthernet (WSL)": Stat(True, 4294), "Tailscale": Stat(True, 4294),
+                 "VMware Network Adapter VMnet8": Stat(True, 100), "Wi-Fi": Stat(True, 4294)}
+        addrs = {name: [Addr(socket.AF_INET, "192.0.2." + str(i + 10))] for i, name in enumerate(stats)}
+        saved = (probes.psutil.net_if_stats, probes.psutil.net_if_addrs, probes.psutil.net_io_counters)
+        probes.psutil.net_if_stats = lambda: stats
+        probes.psutil.net_if_addrs = lambda: addrs
+        probes.psutil.net_io_counters = lambda pernic=False: {n: Io(0, 0) for n in stats}
+        try:
+            with open(SERVICE / "config" / "defaults.json") as fh:
+                config = json.load(fh)
+            probe = probes.NetProbe(config, Path(tempfile.mkdtemp()))
+        finally:
+            probes.psutil.net_if_stats, probes.psutil.net_if_addrs, probes.psutil.net_io_counters = saved
+        caps = {d: probe.dims[d]["capacity"] for d in probe.dims}
+        measured("units.net_dimensions", caps)
+        self.assertEqual(sorted(caps), ["net:Ethernet", "net:Wi-Fi"])
+        self.assertEqual(caps["net:Ethernet"], 125e6)
+        self.assertEqual(caps["net:Wi-Fi"], 125e6, "a 4294 Mbit/s link speed is ignored")
+
+    def test_detector_windows_shape(self):
+        w = World("units-detector")
+        res = self.load(w)
+        now = time.time()
+        base = 9000000
+
+        class Fake:
+            def __init__(self, pid, ppid, name, cmd, age, env=None):
+                self.pid = pid
+                self.info = {"pid": pid, "ppid": ppid, "name": name, "create_time": now - age, "cmdline": cmd, "username": None}
+                self.env = env or {}
+
+            def environ(self):
+                return self.env
+
+            def cwd(self):
+                return str(w.allowed)
+        mark = {"CLAUDECODE": "1", "CLAUDE_PID": str(base + 1)}
+        mark2 = {"CLAUDECODE": "1", "CLAUDE_PID": str(base + 200)}
+        fakes = [
+            Fake(base + 1, 4, "claude.exe", ["claude.exe"], 3000),
+            Fake(base + 101, base + 1, "powershell.exe", ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "-"], 3000, mark),
+            Fake(base + 102, base + 101, "python.exe", ["python.exe", "long.py"], 300, mark),
+            Fake(base + 103, base + 101, "conhost.exe", ["conhost.exe", "0x4"], 3000, mark),
+            Fake(base + 104, base + 1, "bash.exe", ["bash.exe", "--login", "-i", "shell-snapshots/snap.sh"], 3000, mark),
+            Fake(base + 105, 999, "python.exe", ["python.exe", "-m", "pymobiledevice3", "usbmux", "forward"], 900, mark),
+            Fake(base + 106, 999, "python.exe", ["python.exe", "job.py"], 900, dict(mark, LEASERES_LEASE="L1")),
+            Fake(base + 107, base + 1, "bash.exe", ["bash.exe", "-c", "source shell-snapshots/snap.sh; sleep 200"], 300, mark),
+            Fake(base + 108, base + 107, "sleep.exe", ["sleep.exe", "200"], 300, mark),
+            Fake(base + 109, base + 101, "python.exe", ["python.exe", "quick.py"], 10, mark),
+            Fake(base + 110, base + 1, "node.exe", ["node.exe", "mcp-server.js"], 3000, mark),
+            Fake(base + 111, base + 110, "python.exe", ["python.exe", "helper.py"], 3000, mark),
+            Fake(base + 200, 4, "node.exe", ["node.exe", "cli.js"], 3000),
+            Fake(base + 201, base + 200, "pwsh.exe", ["pwsh.exe", "-NoLogo"], 3000, mark2),
+            Fake(base + 202, base + 201, "python.exe", ["python.exe", "train.py"], 400, mark2),
+            Fake(base + 203, base + 101, "powershell.exe", ["powershell.exe", "-File", "x.ps1"], 400, mark),
+        ]
+        saved = res.psutil.process_iter
+        res.psutil.process_iter = lambda attrs=None: list(fakes)
+        try:
+            d = res.Dispatcher(res.load_config())
+            d.config = dict(d.config, unleased_after_seconds=120)
+            d.check_unleased()
+        finally:
+            res.psutil.process_iter = saved
+        rows = [json.loads(l) for l in (w.data / "leases" / "Altiplano" / "unleased.jsonl").read_text().splitlines() if l.strip()]
+        got = sorted(int(r["key"].partition("-")[0]) - base for r in rows if r["event"] == "seen")
+        measured("units.detector_recorded", {str(int(r["key"].partition("-")[0]) - base): r["how"] for r in rows})
+        self.assertEqual(got, [102, 105, 107, 202, 203])
+        d2 = res.Dispatcher(res.load_config())
+        d2.restore_unleased()                         # the fake processes do not exist: all end, lifetime unknown
+        comp = w.res("Altiplano", "compliance", "--days", "1")
+        self.assertEqual(comp.returncode, 0, comp.stderr)
+        self.assertIn("without a lease: 5", comp.stdout)
 
 
 def main():

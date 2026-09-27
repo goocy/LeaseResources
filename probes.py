@@ -45,12 +45,37 @@ def kind_of(dim: str) -> str:
 
 
 def read_json(path: Path) -> dict:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    """A JSON object from a file, {} when it is missing. On Windows a file being replaced, or held by Resilio, briefly
+    refuses to open (PermissionError) or reads short; both are retried for up to about a second before giving up."""
+    delay = 0.02
+    for attempt in range(8):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (PermissionError, ValueError, OSError):
+            if attempt == 7 or not Path(path).exists():
+                return {}
+            time.sleep(delay)
+            delay = min(delay * 2, 0.3)
+    return {}
+
+
+def replace_retrying(source, target) -> None:
+    """os.replace, retried with backoff for about 3 s: on Windows it fails with WinError 5 while any reader or Resilio
+    has the target open (seen on Moosfels, 2026-09-27)."""
+    delay = 0.02
+    for attempt in range(12):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 11:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -58,7 +83,14 @@ def write_json(path: Path, data: dict) -> None:
     tmp = path.with_name(path.name + ".tmp" + str(os.getpid()))
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=1, sort_keys=True)
-    os.replace(tmp, path)
+    try:
+        replace_retrying(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def no_window() -> int:
@@ -111,6 +143,11 @@ def process_paths(proc: psutil.Process) -> list:
         paths.append(proc.cwd())
     except (psutil.Error, OSError):
         pass
+    if sys.platform == "win32":
+        # psutil's open_files() on Windows queries every handle and can stall for a long time on pipe handles; on
+        # Moosfels a trial sample took so long that the 10-second kill never came (2026-09-27). The working folder
+        # is all Windows gets.
+        return paths
     try:
         paths.extend(f.path for f in proc.open_files())
     except (psutil.Error, OSError):
@@ -323,8 +360,11 @@ class DiskProbe(Probe):
         candidates = sorted(devices) if devices else sorted(self.dims)
         weights = {d: system.get(d, 0.0) for d in candidates}
         wsum = sum(weights.values())
+        # A tree cannot move more physical bytes than the disks did: Windows' per-process counters include reads
+        # served from the page cache (355 MB/s per process against 1.6 MB/s on the disk, Moosfels 2026-09-27).
+        total = min(total, wsum)
         for d in candidates:
-            result[d] = total * (weights[d] / wsum if wsum > 0 else 1.0 / len(candidates))
+            result[d] = total * (weights[d] / wsum) if wsum > 0 else 0.0
         return result
 
 
@@ -355,12 +395,13 @@ class NetProbe(Probe):
         for name, st in stats.items():
             if not st.isup or not _usable_interface(addrs.get(name, [])):
                 continue
-            if any(name.casefold().startswith(s) for s in skip):
+            if any(s in name.casefold() for s in skip):
                 continue
             dim = "net:" + name
+            bogus = [int(b) for b in config.get("net_bogus_speeds_mbit", [4294, 4295])]
             if name in configured:
                 capacity = float(configured[name])
-            elif st.speed and st.speed > 0:
+            elif st.speed and st.speed > 0 and st.speed not in bogus:
                 capacity = st.speed * 125000.0
             else:
                 capacity = max(default, float(learned.get(dim, 0)))

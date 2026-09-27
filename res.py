@@ -89,6 +89,7 @@ import socket            # noqa: E402
 import statistics        # noqa: E402
 import subprocess        # noqa: E402
 import time              # noqa: E402
+import threading         # noqa: E402
 import base64            # noqa: E402
 
 import psutil            # noqa: E402
@@ -772,6 +773,94 @@ def session_tree_pids(proc) -> list:
     return found
 
 
+WIN_CREATE_SUSPENDED = 0x4
+
+
+def trial_exit() -> None:
+    """End a trial now. On Windows a probe's native thread that hangs (psutil did) must not keep res alive after the
+    answer is printed, so the process exits hard once its output is flushed."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if sys.platform == "win32":
+        os._exit(0)
+
+
+def _win_kernel():
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = ctypes.c_void_p
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    return ctypes, k32
+
+
+def job_limit_structure(ctypes):
+    """JOBOBJECT_EXTENDED_LIMIT_INFORMATION (144 bytes on 64-bit Windows)."""
+    class Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", ctypes.c_uint32), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint32),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint32), ("SchedulingClass", ctypes.c_uint32)]
+
+    class Io(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in ["ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                                                         "ReadTransferCount", "WriteTransferCount", "OtherTransferCount"]]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", Io), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+    return Extended
+
+
+def win_job_for(child):
+    """Windows: put a child that was started suspended into a new Job Object with KILL_ON_JOB_CLOSE, then resume it.
+    Every process it starts inherits the job (breaking away is not allowed), so TerminateJobObject, or res dying,
+    ends the whole tree. Returns the job handle, or None if any step failed (the child is resumed regardless and
+    the psutil tree kill remains)."""
+    job = None
+    try:
+        ctypes, k32 = _win_kernel()
+        job = k32.CreateJobObjectW(None, None)
+        if job:
+            info = job_limit_structure(ctypes)()
+            info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+            ok = ok and k32.AssignProcessToJobObject(job, ctypes.c_void_p(int(child._handle)))
+            if not ok:
+                k32.CloseHandle(job)
+                job = None
+    except Exception:
+        job = None
+    try:
+        import ctypes as _ct
+        ntdll = _ct.WinDLL("ntdll")
+        ntdll.NtResumeProcess.argtypes = [_ct.c_void_p]
+        ntdll.NtResumeProcess(_ct.c_void_p(int(child._handle)))
+    except Exception:
+        pass
+    return job
+
+
+def win_job_kill(job) -> None:
+    try:
+        ctypes, k32 = _win_kernel()
+        k32.TerminateJobObject(job, 1)
+    except Exception:
+        pass
+
+
+def win_close(job) -> None:
+    try:
+        ctypes, k32 = _win_kernel()
+        k32.CloseHandle(job)
+    except Exception:
+        pass
+
+
 def cmd_trial(args, config: dict) -> None:
     argv = list(args.command or [])
     if argv and argv[0] == "--":
@@ -790,17 +879,20 @@ def cmd_trial(args, config: dict) -> None:
     time.sleep(0.3)
     baseline, _ = meter.sample({})
     started_wall = now_iso()
+    job = None
     with open(out_path, "wb") as out:
         kwargs = {"stdout": out, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "cwd": os.getcwd(),
                   "env": dict(os.environ, PYTHONUNBUFFERED="1")}
         if sys.platform == "win32":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200) | WIN_CREATE_SUSPENDED
         else:
             kwargs["start_new_session"] = True
         try:
             child = subprocess.Popen(argv, **kwargs)
         except OSError as exc:
             raise SystemExit("Cannot start " + argv[0] + ": " + str(exc))
+        if sys.platform == "win32":
+            job = win_job_for(child)                  # assigned while suspended, so no child escapes it; then resumed
     t0 = time.monotonic()
     root = process(child.pid)
     seen = {}
@@ -809,8 +901,36 @@ def cmd_trial(args, config: dict) -> None:
     samples = 0
     last_session_scan = 0.0
     exit_code = None
+    exit_seen = None
+    deadline = threading.Event()
+    killed_pids = set()
+
+    def kill_everything() -> list:
+        """The one kill path, for the watchdog and the normal end alike: the Windows job, the POSIX process group,
+        every process ever seen in the tree."""
+        targets = [p for p in list(seen.values()) if alive(p)]
+        killed_pids.update(p.pid for p in targets)
+        if job is not None:
+            win_job_kill(job)
+        return kill_tree(targets, group_leader=child.pid)
+
+    def watchdog():
+        deadline.set()
+        kill_everything()
+
+    # The 10-second guarantee does not depend on the sampling loop: a timer thread kills at the limit even if a
+    # probe call hangs (psutil on Windows did, 2026-09-27).
+    timer = threading.Timer(limit, watchdog)
+    timer.daemon = True
+    timer.start()
     while True:
         elapsed = time.monotonic() - t0
+        if exit_code is None:
+            exit_code = child.poll()
+            if exit_code is not None and not deadline.is_set():
+                exit_seen = time.monotonic() - t0
+        if deadline.is_set() or elapsed >= limit:
+            break
         if root is not None:
             for p in tree_of(root):
                 try:
@@ -825,7 +945,7 @@ def cmd_trial(args, config: dict) -> None:
                     pass
             last_session_scan = time.monotonic()
         live = [p for p in seen.values() if alive(p)]
-        system, per = meter.sample({"trial": live})
+        system, per = meter.sample({"trial": live}, want_paths=sys.platform != "win32")
         use = per.get("trial", {})
         for dim in system_only:
             use[dim] = max(0.0, system.get(dim, 0.0) - baseline.get(dim, 0.0))
@@ -833,20 +953,18 @@ def cmd_trial(args, config: dict) -> None:
             peaks[dim] = max(peaks[dim], value)
             sums[dim] += value
         samples += 1
-        if exit_code is None:
-            exit_code = child.poll()
         if exit_code is not None:
             leftovers = [p for p in seen.values() if p.pid != child.pid and alive(p)]
             if not leftovers:
                 break
-        if elapsed >= limit:
-            break
-        time.sleep(step)
-    elapsed = time.monotonic() - t0
-    finished = exit_code is not None
-    survivors = [p for p in seen.values() if alive(p)]
-    killed = [p.pid for p in survivors]
-    still = kill_tree(survivors, group_leader=child.pid) if survivors else []
+        deadline.wait(step)                             # wakes at once when the watchdog fires
+    timer.cancel()
+    elapsed = min(time.monotonic() - t0, limit + 0.5) if deadline.is_set() else time.monotonic() - t0
+    finished = exit_seen is not None
+    still = kill_everything()
+    killed = sorted(killed_pids)
+    if job is not None:
+        win_close(job)
     if exit_code is None:
         try:
             exit_code = child.wait(timeout=3)
@@ -861,6 +979,7 @@ def cmd_trial(args, config: dict) -> None:
     write_json(folder / (ident + ".json"), record)
     if args.json:
         print(json.dumps(record, indent=1))
+        trial_exit()
         return
     if finished:
         print("Finished in " + format(elapsed, ".1f") + " s with exit code " + str(exit_code) + ": no lease needed."
@@ -881,6 +1000,7 @@ def cmd_trial(args, config: dict) -> None:
         print("  " + dim.ljust(14) + human(profile[dim]["peak"], kind_of(dim)) + " / " + human(profile[dim]["mean"], kind_of(dim)) + mark)
     if not finished:
         print("For the full run: " + res_command() + " request --profile " + ident + " --for <duration> --why \"...\"")
+    trial_exit()
 
 
 # ---------------------------------------------------------------- request, extend, release
@@ -924,8 +1044,8 @@ def wait_for_answer(path: Path, keys: tuple, seconds: float) -> dict:
     deadline = time.monotonic() + seconds
     data = read_json(path)
     while time.monotonic() < deadline:
-        data = read_json(path)
-        if keys[0](data):
+        data = read_json(path) or data                  # a transient empty read (Windows replace) keeps the last one
+        if data and keys[0](data):
             return data
         time.sleep(0.2)
     return data
@@ -1291,12 +1411,23 @@ def print_compliance(machine: str, config: dict, days: float) -> None:
     by_state = collections.Counter(l.get("state") for l in leases)
     print("  lease requests: " + str(len(leases)) + (" (" + ", ".join(k + " " + str(v) for k, v in sorted(by_state.items())) + ")" if leases else ""))
     print("  leased runs: " + str(len(runs)))
-    lifetimes = [float(ends[r.get("key")].get("lifetime", 0)) for r in starts if r.get("key") in ends]
+    lifetimes = [float(ends[r.get("key")]["lifetime"]) for r in starts
+                 if r.get("key") in ends and isinstance(ends[r.get("key")].get("lifetime"), (int, float))]
     print("  long commands of Claude sessions without a lease: " + str(len(starts))
           + (" (median lifetime of the ended ones " + human_duration(statistics.median(lifetimes)) + ")" if lifetimes else ""))
     desks = collections.Counter(r.get("desk", "?") for r in starts)
     for desk, count in desks.most_common(8):
         print("    " + desk + ": " + str(count))
+
+
+def cmd_notify_test(args, config: dict) -> None:
+    """Show one desktop notification the way the dispatcher would (osascript on the Mac, a toast on Windows)."""
+    machine = this_machine(config)
+    if not config.get("notify", True):
+        print("Note: notify is false in this machine's config; sending anyway for the test.")
+    notify(dict(config, notify=True), machine, args.title, args.body)
+    print("Sent a notification titled '" + args.title + "'. If none appeared, see the log for 'notification failed':\n  "
+          + str(LOG_DIR / ("leaseresources." + machine.casefold() + "." + datetime.datetime.now().strftime("%y%m%d") + ".log")))
 
 
 def cmd_compliance(args, config: dict) -> None:
@@ -1838,30 +1969,57 @@ class Dispatcher:
         for sid in [s for s, v in self.shell_sids.items() if now - v["seen"] > 86400]:
             self.shell_sids.pop(sid, None)
 
-    def claude_env(self, proc, key: str) -> dict:
+    def claude_env(self, proc, key: str, any_marker: bool = False) -> dict:
         """The Claude markers in a process's environment ({} when absent or unreadable). Cached per process: an
         environment never changes. macOS does not reveal the environment of Apple's own binaries (/bin/sleep, zsh);
         Homebrew, venv and other programs are readable, and on Windows psutil reads it for the user's processes."""
-        if key in self.env_cache:
-            return self.env_cache[key]
-        try:
-            env = proc.environ()
-        except (psutil.Error, OSError):
-            env = {}
-        found = {}
-        if env.get("CLAUDECODE") == "1" and not env.get("LEASERES_LEASE"):
-            found = {"session": env.get("CLAUDE_CODE_SESSION_ID", ""), "claude_pid": env.get("CLAUDE_PID", "")}
-        self.env_cache[key] = found
-        return found
+        if key not in self.env_cache:
+            try:
+                env = proc.environ()
+            except (psutil.Error, OSError):
+                env = {}
+            found = {}
+            if env.get("CLAUDECODE") == "1":
+                found = {"session": env.get("CLAUDE_CODE_SESSION_ID", ""), "claude_pid": env.get("CLAUDE_PID", ""),
+                         "leased": bool(env.get("LEASERES_LEASE"))}
+            self.env_cache[key] = found
+        found = self.env_cache[key]
+        if any_marker or not found or not found.get("leased"):
+            return found
+        return {}
+
+    def per_command_shell(self, cmd_parts: list, name: str) -> bool:
+        """A tool shell that runs one command and ends (the Mac's `zsh -c 'source <snapshot>...'`), as opposed to a
+        persistent host that runs many (a PowerShell host reading commands, a persistent bash)."""
+        if not self.is_tool_shell(" ".join(cmd_parts), name):
+            return False
+        flags = ["-c", "-command", "-encodedcommand", "-enc", "-ec", "/c"]
+        for index, part in enumerate(cmd_parts[1:], start=1):
+            if part.casefold() in flags:
+                following = cmd_parts[index + 1] if index + 1 < len(cmd_parts) else ""
+                return following not in ("", "-")
+        return False
+
+    def is_tool_host(self, name: str, cmd: str) -> bool:
+        hosts = [n.casefold() for n in self.config.get("tool_host_names", [])]
+        return name.casefold() in hosts or self.is_tool_shell(cmd, name)
 
     def check_unleased(self) -> None:
-        """Long commands that Claude sessions run without a lease, three ways: (a) a tool shell that has lived longer
-        than unleased_after_seconds; (b) POSIX: a process in the session of a tool shell that has gone, i.e. a job
-        backgrounded with nohup or & whose shell exited; (c) a process that left every Claude tree (setsid, double
-        fork, reparented to launchd/init) but carries CLAUDECODE=1 in its environment. Leased jobs (LEASERES_LEASE in
-        their environment, started through res.py) and res.py, mail.py and house.py themselves are excluded. Only the
-        topmost qualifying process of each tree is recorded."""
+        """Long commands that Claude sessions run without a lease:
+        (a) a per-command tool shell (e.g. `zsh -c ...`, carrying `shell-snapshots`) older than unleased_after_seconds;
+        (a') under a persistent tool host (a shell that is a direct child of a Claude process but runs many commands,
+             e.g. the PowerShell tool's host), each direct child of the host older than the threshold;
+        (b) POSIX: a process in the session of a tool shell that has gone (nohup / & after the shell exited);
+        (c) a process outside every live Claude tree that carries CLAUDECODE=1 in its environment (setsid, double fork,
+            reparented to launchd/init, Start-Process on Windows).
+        Claude processes are those named in claude_process_names and those whose pid a process names in its
+        CLAUDE_PID variable. Excluded: leased jobs (LEASERES_LEASE), res.py/mail.py/house.py and what runs under them,
+        console helpers (ignore_process_names, e.g. conhost.exe), other users' processes, and anything inside a Claude
+        tree that did not come from a tool shell or host (MCP servers, hooks). Only the topmost qualifying process of
+        a tree is recorded. A PowerShell cmdlet such as Start-Sleep that runs inside a persistent host starts no
+        process and cannot be seen."""
         names = self.claude_names()
+        ignore_names = [n.casefold() for n in self.config.get("ignore_process_names", [])]
         after = num(self.config, "unleased_after_seconds", 120)
         try:
             user = psutil.Process().username()
@@ -1875,35 +2033,60 @@ class Dispatcher:
             children[data.get("ppid")].append(data["pid"])
         now = time.time()
 
+        def key_of(pid):
+            return str(pid) + "-" + format(float(info[pid][1].get("create_time") or 0), ".2f")
+
+        def mine(pid):
+            owner = info[pid][1].get("username")
+            return not user or not owner or owner == user
+
+        claudes = {pid for pid, (proc, data) in info.items() if str(data.get("name") or "").casefold() in names}
+        for pid, (proc, data) in info.items():
+            if pid in claudes or not mine(pid) or str(data.get("name") or "").casefold() in ignore_names:
+                continue
+            if now - float(data.get("create_time") or now) < min(after, 30):
+                continue
+            marks = self.claude_env(proc, key_of(pid), any_marker=True)
+            named = str(marks.get("claude_pid") or "")
+            if named.isdigit() and int(named) in info:
+                claudes.add(int(named))
+
         def cmd_of(pid):
             return " ".join(info[pid][1].get("cmdline") or []) if pid in info else ""
 
         def claude_below(pid):
-            """The direct child of a live claude process on pid's chain (pid itself included), else None."""
             seen = set()
             while pid in info and pid not in seen:
                 seen.add(pid)
                 parent = info[pid][1].get("ppid")
-                if parent in info and str(info[parent][1].get("name") or "").casefold() in names:
+                if parent in claudes:
                     return pid
                 pid = parent
             return None
 
-        found = {}                                    # key -> record
+        found = {}
         for pid, (proc, data) in info.items():
-            if str(data.get("name") or "").casefold() in names:
+            name = str(data.get("name") or "")
+            if pid in claudes or name.casefold() in ignore_names or not mine(pid):
                 continue
             age = now - float(data.get("create_time") or now)
-            if age < after or (user and data.get("username") and data.get("username") != user):
+            if age < after:
                 continue
             cmd = cmd_of(pid)
             if self.ignored(cmd):
                 continue
-            key = str(pid) + "-" + format(float(data.get("create_time") or 0), ".2f")
+            key = key_of(pid)
             top = claude_below(pid)
             if top is not None:
-                if top != pid or not self.is_tool_shell(cmd, str(data.get("name") or "")):
-                    continue                          # inside a live Claude tree: counted at its tool shell, if any
+                top_name = str(info[top][1].get("name") or "")
+                top_parts = info[top][1].get("cmdline") or []
+                if top == pid and self.per_command_shell(top_parts, top_name):
+                    how, recorded_under = "tool shell", data.get("ppid")
+                elif top != pid and data.get("ppid") == top and not self.per_command_shell(top_parts, top_name) \
+                        and self.is_tool_host(top_name, " ".join(top_parts)) and not self.ignored(" ".join(top_parts)):
+                    how, recorded_under = "command of a persistent tool host", info[top][1].get("ppid")
+                else:
+                    continue                          # a host itself, an MCP server, a hook, or deeper in a counted tree
                 descendants, stack = [], list(children.get(pid, []))
                 while stack:
                     d = stack.pop()
@@ -1913,8 +2096,12 @@ class Dispatcher:
                 commands = [cmd_of(d) for d in descendants]
                 if any(self.ignored(c) for c in commands):
                     continue
-                found[key] = {"how": "tool shell", "pid": pid, "claude_pid": data.get("ppid"), "age": age,
-                              "cwd_pid": data.get("ppid"), "shell": cmd[-160:], "commands": [c[:160] for c in commands[:4]]}
+                if how == "tool shell":
+                    shown = [c[:300] for c in commands[:4]]
+                else:
+                    shown = [cmd[:300]] + [c[:300] for c in commands[:3]]
+                found[key] = {"how": how, "pid": pid, "claude_pid": recorded_under, "age": age, "cwd_pid": top,
+                              "shell": cmd[-160:] if how == "tool shell" else " ".join(top_parts)[-160:], "commands": shown}
                 continue
             record = None
             if sys.platform != "win32":
@@ -1934,8 +2121,8 @@ class Dispatcher:
             if record is None:
                 continue
             parent = data.get("ppid")
-            if parent in info and self.escaped_parent(parent, info, now, after):
-                continue                              # its parent is recorded instead
+            if parent in info and parent not in claudes and self.escaped_parent(parent, info, now, after):
+                continue
             record.update(pid=pid, age=age, commands=[cmd[:300]])
             found[key] = record
         for key, rec in found.items():
@@ -1962,6 +2149,24 @@ class Dispatcher:
                                       "how": seen.get("how"), "lifetime": round(now - seen.get("first", now))})
         live = set(info)
         self.env_cache = {k: v for k, v in self.env_cache.items() if int(k.partition("-")[0]) in live}
+
+    def restore_unleased(self) -> None:
+        """After a restart: take back the records that were seen and not ended, so a process is recorded once."""
+        open_records = {}
+        for row in iter_unleased(self.machine):
+            if row.get("event") == "seen":
+                open_records[row.get("key")] = row
+            elif row.get("event") == "ended":
+                open_records.pop(row.get("key"), None)
+        now = time.time()
+        for key, row in open_records.items():
+            pid_text, _, ctime = str(key).partition("-")
+            proc = process(pid_text, ctime) if pid_text.isdigit() else None
+            if proc is None:
+                self.append_unleased({"event": "ended", "at": now_iso(), "key": key, "desk": row.get("desk"),
+                                      "how": row.get("how"), "lifetime": None, "note": "ended while the dispatcher was down"})
+                continue
+            self.unleased_seen[key] = dict(row, first=float(ctime or now), restored=True)
 
     def escaped_parent(self, pid: int, info: dict, now: float, after: float) -> bool:
         """Whether pid would itself be recorded as an escaped job (so its children are not recorded separately)."""
@@ -2021,7 +2226,7 @@ class Dispatcher:
                 for path in [lease_path(self.machine, lease["id"])] + [side_path(self.machine, lease["id"], s) for s in SUFFIXES + [".log"]]:
                     if path.exists():
                         try:
-                            os.replace(path, done / path.name)
+                            probes.replace_retrying(path, done / path.name)
                         except OSError:
                             pass
         for folder in [done, trial_dir(self.machine)]:
@@ -2080,6 +2285,7 @@ def cmd_dispatch(args, config: dict) -> None:
     d = Dispatcher(config)
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", code " + d.version + ", dimensions "
         + ", ".join(d.meter.dimensions()) + ")")
+    d.restore_unleased()
     time.sleep(1.0)
     d.sample()
     last_sample = last_unleased = last_beat = last_house = time.monotonic()
@@ -2187,6 +2393,9 @@ def main() -> None:
     p.add_argument("--days", default="7")
     p.add_argument("--on")
     p.add_argument("--list", help="also print the last N unleased records")
+    p = sub.add_parser("notify-test", help="show one desktop notification, to check they reach the screen")
+    p.add_argument("--title", default="LeaseResources: test notification")
+    p.add_argument("--body", default="If you can read this, the dispatcher's notifications reach you.")
     sub.add_parser("dispatch")
     sub.add_parser("watch")
     p = sub.add_parser("_runner")
@@ -2197,7 +2406,7 @@ def main() -> None:
     config = load_config()
     handlers = {"now": cmd_now, "mine": cmd_mine, "trial": cmd_trial, "request": cmd_request, "extend": cmd_extend,
                 "release": cmd_release, "run": cmd_run, "leases": cmd_leases, "status": cmd_status,
-                "compliance": cmd_compliance, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner}
+                "compliance": cmd_compliance, "notify-test": cmd_notify_test, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner}
     handlers[args.cmd](args, config)
 
 
