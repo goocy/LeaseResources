@@ -208,6 +208,11 @@ def log(machine: str, message: str) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         now = datetime.datetime.now()
         path = LOG_DIR / ("leaseresources." + machine.casefold() + "." + now.strftime("%y%m%d") + ".log")
+        try:
+            if path.stat().st_size > 20e6:              # a runaway loop must not fill the disk; one day's log is capped
+                return
+        except OSError:
+            pass
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(now.strftime("%Y-%m-%d %H:%M:%S") + " " + message + "\n")
     except OSError:
@@ -396,7 +401,11 @@ def short_cmd(proc, limit: int = 90) -> str:
     try:
         argv = proc.cmdline()
         if argv:
-            argv = [Path(argv[0].replace(chr(92), "/")).name] + argv[1:]
+            shown = []
+            for arg in argv[1:]:
+                path_like = "/" in arg or chr(92) in arg
+                shown.append(".../" + arg.replace(chr(92), "/").rpartition("/")[2] if path_like and len(arg) > 40 else arg)
+            argv = [Path(argv[0].replace(chr(92), "/")).name] + shown
         text = " ".join(argv) or proc.name()
     except psutil.Error:
         return "?"
@@ -888,8 +897,9 @@ def cmd_trial(args, config: dict) -> None:
     baseline, _ = meter.sample({})
     started_wall = now_iso()
     job = None
-    with open(out_path, "wb") as out:
-        kwargs = {"stdout": out, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "cwd": os.getcwd(),
+    out_path.write_bytes(b"")
+    if True:
+        kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "cwd": os.getcwd(),
                   "env": dict(os.environ, PYTHONUNBUFFERED="1")}
         if sys.platform == "win32":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200) | WIN_CREATE_SUSPENDED
@@ -901,6 +911,8 @@ def cmd_trial(args, config: dict) -> None:
             raise SystemExit("Cannot start " + argv[0] + ": " + str(exc))
         if sys.platform == "win32":
             job = win_job_for(child)                  # assigned while suspended, so no child escapes it; then resumed
+    threading.Thread(target=pump_output, args=(child.stdout, out_path, int(num(config, "trial_output_max_bytes", 10e6)), False),
+                     daemon=True).start()
     t0 = time.monotonic()
     root = process(child.pid)
     seen = {}
@@ -1274,6 +1286,8 @@ def cmd_run(args, config: dict) -> None:
             run = read_json(run_path)
             try:
                 size = log_path.stat().st_size
+                if size < shown:
+                    shown = 0                           # the log rotated
                 if size > shown:
                     with open(log_path, "rb") as fh:
                         fh.seek(shown)
@@ -1286,6 +1300,49 @@ def cmd_run(args, config: dict) -> None:
                 print("\nEnded with exit code " + str(run.get("exit")))
                 sys.exit(run.get("exit") if isinstance(run.get("exit"), int) else 1)
             time.sleep(1.0)
+
+
+def pump_output(stream, path: Path, cap: int, rotate: bool) -> None:
+    """Copy a child's output into path with a size cap, so no job or trial can fill a disk (or the synced folder).
+    rotate=True (leased jobs): when the file reaches cap it becomes <path>.1, replacing an older one, and writing starts
+    again, so at most about 2 x cap is kept, the newest output always included. rotate=False (trials): after cap bytes
+    the rest is read and discarded, with a note. Reading never stops, so the child never blocks on a full pipe."""
+    written = 0
+    truncated = False
+    out = open(path, "ab")
+    try:
+        written = out.tell()
+        while True:
+            chunk = stream.read1(65536) if hasattr(stream, "read1") else stream.read(65536)
+            if not chunk:
+                break
+            if written + len(chunk) > cap:
+                if rotate:
+                    out.close()
+                    try:
+                        probes.replace_retrying(path, path.with_name(path.name + ".1"))
+                    except OSError:
+                        pass
+                    out = open(path, "ab")
+                    out.write(("[res] " + now_iso() + " log reached " + str(cap // 1000000) + " MB; the earlier part is in "
+                               + path.name + ".1\n").encode("utf-8"))
+                    written = out.tell()
+                else:
+                    if not truncated:
+                        out.write(("\n[res] output cut at " + str(cap // 1000000) + " MB; the rest was discarded\n").encode("utf-8"))
+                        out.flush()
+                        truncated = True
+                    continue
+            out.write(chunk)
+            out.flush()
+            written += len(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            out.close()
+        except OSError:
+            pass
 
 
 def wait_with_peak(child) -> tuple:
@@ -1346,13 +1403,16 @@ def cmd_runner(args, config: dict) -> None:
         with open(log_path, "ab") as out:
             out.write(("[res] " + now_iso() + " starting on " + machine + ": " + " ".join(argv) + "  (cwd " + cwd + ")\n").encode("utf-8"))
             out.flush()
-            kwargs = {"stdout": out, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "cwd": cwd, "env": env}
-            if sys.platform == "win32":
-                kwargs["creationflags"] = probes.no_window()
-            child = subprocess.Popen(argv, **kwargs)
+        kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "cwd": cwd, "env": env}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = probes.no_window()
+        child = subprocess.Popen(argv, **kwargs)
     except OSError as exc:
         write_json(run_path, dict(run, error=str(exc), ended=now_iso(), exit=None))
         return
+    pumper = threading.Thread(target=pump_output, args=(child.stdout, log_path, int(num(config, "lease_log_max_bytes", 50e6)), True),
+                              daemon=True)
+    pumper.start()
     try:
         child_ctime = psutil.Process(child.pid).create_time()
     except psutil.Error:
@@ -1362,6 +1422,7 @@ def cmd_runner(args, config: dict) -> None:
     code, peak_rss = wait_with_peak(child)
     if peak_rss:
         run["child_peak_rss"] = peak_rss
+    pumper.join(5)                                  # a grandchild may keep the pipe open; the log still gets the end line
     with open(log_path, "ab") as out:
         out.write(("\n[res] " + now_iso() + " ended with exit code " + str(code) + "\n").encode("utf-8"))
     write_json(run_path, dict(run, ended=now_iso(), exit=code))
@@ -1426,19 +1487,20 @@ def cmd_status(args, config: dict) -> None:
 
 
 def iter_unleased(machine: str) -> list:
-    path = machine_dir(machine) / "unleased.jsonl"
+    """The compliance record: the rotated older file first, then the current one."""
     rows = []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        continue
-    except OSError:
-        pass
+    for name in ["unleased.1.jsonl", "unleased.jsonl"]:
+        try:
+            with open(machine_dir(machine) / name, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except ValueError:
+                            continue
+        except OSError:
+            pass
     return rows
 
 
@@ -1508,6 +1570,9 @@ def record_history(machine: str, lease: dict) -> None:
     runs.append({"lease": lease["id"], "seconds": lease.get("seconds"), "exit": lease.get("exit"), "ended": lease.get("ended"),
                  "peak": lease.get("peak", {}), "state": lease.get("state")})
     history[key] = runs[-20:]
+    if len(history) > 500:                          # at most 500 commands, the most recently run ones
+        ranked = sorted(history, key=lambda k: str((history[k] or [{}])[-1].get("ended") or ""), reverse=True)
+        history = {k: history[k] for k in ranked[:500]}
     write_json(path, history)
 
 
@@ -2474,7 +2539,13 @@ class Dispatcher:
         return self.machine + ":?"
 
     def append_unleased(self, record: dict) -> None:
-        with open(self.folder / "unleased.jsonl", "a", encoding="utf-8") as fh:
+        path = self.folder / "unleased.jsonl"
+        try:
+            if path.stat().st_size > num(self.config, "compliance_log_max_bytes", 5e6):
+                probes.replace_retrying(path, self.folder / "unleased.1.jsonl")     # keeps at most two files
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
 
     # -- report, housekeeping
@@ -2512,6 +2583,20 @@ class Dispatcher:
                             path.unlink()
                     except OSError:
                         pass
+        # this machine's daily logs and diagnostic snapshots after keep_days; the LaunchAgent's bootstrap log is cut
+        # back when it passes 10 MB (it only holds tracebacks, but a crash loop would grow it)
+        prefixes = ["leaseresources." + self.machine.casefold() + ".", "snapshot-" + self.machine]
+        if LOG_DIR.is_dir():
+            for path in LOG_DIR.iterdir():
+                try:
+                    if any(path.name.casefold().startswith(pre.casefold()) for pre in prefixes) \
+                            and time.time() - path.stat().st_mtime > keep:
+                        path.unlink()
+                    elif path.name == "launchd.log" and sys.platform == "darwin" and path.stat().st_size > 10e6:
+                        with open(path, "r+b") as fh:
+                            fh.truncate(0)
+                except OSError:
+                    pass
 
 
 def code_version() -> str:

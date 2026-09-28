@@ -21,6 +21,9 @@
   "stall_minutes": 30,
   "log_tail_lines": 30,
   "keep_days": 30,
+  "lease_log_max_bytes": 50000000,
+  "trial_output_max_bytes": 10000000,
+  "compliance_log_max_bytes": 5000000,
 
   "unleased_check_seconds": 5,
   "unleased_after_seconds": 120,

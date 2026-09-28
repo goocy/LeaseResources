@@ -1,7 +1,9 @@
 """Sandbox tests for LeaseResources: scratch folders, real res.py subprocesses, real dispatchers, a stub for ClaudeMail.
 
 Run with the venv's python:  ~/venvs/LeaseResources/bin/python -B tests/test_res.py [-v] [TestName ...]
-Scratch goes under LEASERES_TEST_SCRATCH (default: the system temp folder). Measured numbers are printed as
+Scratch goes under LEASERES_TEST_SCRATCH (default: %LOCALAPPDATA%\\LeaseResources\\tests on Windows,
+~/Library/Caches/LeaseResources/tests on the Mac; never the temp folder, which is a small RAM disk on the Windows
+machines, and never the synced tree), needs 4 GB free, and is deleted at the end, pass or fail. Measured numbers are printed as
 'MEASURED ...' lines and collected in <scratch>/results.json. POSIX only for now (process-group kills, a copied bash
 standing in for a Claude process); the Windows paths of res.py are untested.
 """
@@ -24,7 +26,49 @@ HERE = Path(__file__).resolve().parent
 SERVICE = HERE.parent
 WINDOWS = sys.platform == "win32"
 PYTHON = sys.executable
-SCRATCH = Path(os.environ.get("LEASERES_TEST_SCRATCH") or tempfile.gettempdir()) / ("leaseres-tests-" + time.strftime("%H%M%S"))
+MIN_FREE_BYTES = 4 * 1000 ** 3
+MIN_VOLUME_BYTES = 16 * 1000 ** 3
+
+
+def scratch_base() -> Path:
+    """Where the suite's scratch folder goes: LEASERES_TEST_SCRATCH, else a folder on the system disk that is neither
+    the temp folder (on the Windows machines %TEMP% is R:, a small RAM disk that Claude itself writes its tool output to;
+    the suite filled it on every Windows machine, 2026-09-27) nor the synced tree."""
+    given = os.environ.get("LEASERES_TEST_SCRATCH", "").strip()
+    if given:
+        return Path(given)
+    if WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "LeaseResources" / "tests"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "LeaseResources" / "tests"
+    return Path.home() / ".cache" / "LeaseResources" / "tests"
+
+
+def check_scratch(base: Path) -> None:
+    """Refuse to start where the suite could fill a disk others depend on."""
+    resolved = base.resolve()
+    sync_root = SERVICE.parent.parent.resolve()
+    parts = [x.casefold() for x in resolved.parts]
+    if parts[:len(sync_root.parts)] == [x.casefold() for x in sync_root.parts]:
+        raise SystemExit("Refusing to run: the scratch folder " + str(resolved) + " is inside the synced tree " + str(sync_root)
+                         + ". Set LEASERES_TEST_SCRATCH to a folder on a local disk.")
+    base.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(str(base))
+    small_ok = os.environ.get("LEASERES_TEST_ALLOW_SMALL_SCRATCH", "") == "1"
+    if usage.free < MIN_FREE_BYTES:
+        raise SystemExit("Refusing to run: the scratch volume of " + str(base) + " has " + format(usage.free / 1e9, ".1f")
+                         + " GB free, the suite wants at least 4 GB. Set LEASERES_TEST_SCRATCH to a folder on a disk with room.")
+    if usage.total < MIN_VOLUME_BYTES and not small_ok:
+        raise SystemExit("Refusing to run: the scratch volume of " + str(base) + " is only " + format(usage.total / 1e9, ".1f")
+                         + " GB (a RAM disk?). Set LEASERES_TEST_SCRATCH to a folder on a real disk, or set"
+                         + " LEASERES_TEST_ALLOW_SMALL_SCRATCH=1 if you are sure.")
+
+
+SCRATCH_BASE = scratch_base()
+check_scratch(SCRATCH_BASE)
+for _old in SCRATCH_BASE.glob("leaseres-tests-*"):        # left behind by a run that was killed
+    shutil.rmtree(_old, ignore_errors=True)
+SCRATCH = SCRATCH_BASE / ("leaseres-tests-" + time.strftime("%H%M%S"))
 RESULTS = {}
 # The suite runs its own copy of the code, never the synced service files: touching those (the keeper test did) restarts
 # the production dispatcher on every machine (found on Moosfels, 2026-09-27).
@@ -158,7 +202,7 @@ for i in range(0, len(block), 4096):
     block[i] = 1
 with open(out + ".bin", "wb") as fh:
     chunk = os.urandom(1 << 20)
-    for i in range(300):
+    for i in range(200):                   # 200 MB, bounded
         fh.write(chunk)
         fh.flush()
         os.fsync(fh.fileno())      # every block: Windows' write cache otherwise keeps it off the disk counters
@@ -232,17 +276,22 @@ class T11Mine(Base):
         w = World("mine")
         fake = fake_claude(w, self)
         (w.allowed / "busy.py").write_text("import time\nend = time.time() + 5\nwhile time.time() < end: pass\n")
+        # Bounded by size as well as time: it rewrites one 64 MB file in place (on a RAM disk 5 s of writing reached
+        # several GB, Stahlwerk 2026-09-27).
         (w.allowed / "writer.py").write_text(
             "import os, time\nchunk = os.urandom(1 << 20)\nend = time.time() + 5\n"
-            "with open(os.path.join(os.path.dirname(__file__), 'w.bin'), 'wb') as fh:\n"
-            "    while time.time() < end:\n        fh.write(chunk)\n        fh.flush()\n        os.fsync(fh.fileno())\n")
+            "with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'w.bin'), 'wb') as fh:\n"
+            "    while time.time() < end:\n        if fh.tell() >= 64 << 20:\n            fh.seek(0)\n"
+            "        fh.write(chunk)\n        fh.flush()\n        os.fsync(fh.fileno())\n")
         out = w.root / "mine.txt"
         env = w.env("Altiplano")
         if WINDOWS:
-            cmd = ('start "" /b ' + q(PYTHON) + ' busy.py & start "" /b ' + q(PYTHON) + ' writer.py & ' + q(PYTHON)
+            cmd = ('start "" /b ' + q(PYTHON) + " " + q(w.allowed / "busy.py") + ' & start "" /b ' + q(PYTHON) + " "
+                   + q(w.allowed / "writer.py") + ' & ' + q(PYTHON)
                    + ' -c "import time; time.sleep(1.5)" & ' + q(PYTHON) + ' -B ' + q(RES) + ' mine > ' + q(out))
         else:
-            cmd = (q(PYTHON) + " busy.py & " + q(PYTHON) + " writer.py & sleep 1.5; " + q(PYTHON) + " -B " + q(RES)
+            cmd = (q(PYTHON) + " " + q(w.allowed / "busy.py") + " & " + q(PYTHON) + " " + q(w.allowed / "writer.py")
+                   + " & sleep 1.5; " + q(PYTHON) + " -B " + q(RES)
                    + " mine > " + q(out) + "; wait")
         subprocess.run(fake + [cmd], cwd=str(w.allowed), env=env, timeout=60)
         text = out.read_text()
@@ -381,14 +430,7 @@ class World:
                     victims[p.pid] = p
             except psutil.Error:
                 pass
-        marker = str(self.root)
-        me = os.getpid()
-        for p in psutil.process_iter(["cmdline"]):
-            try:
-                if p.pid != me and marker in " ".join(p.info.get("cmdline") or []):
-                    victims[p.pid] = p
-            except psutil.Error:
-                continue
+        victims.update(processes_in(self.root))
         for p in victims.values():
             try:
                 p.kill()
@@ -1155,17 +1197,107 @@ class T17Teppich(Base):
         self.assertEqual(meter.dimensions()[disks[0]]["capacity"], 322e6)
 
 
+class T18OutputCaps(Base):
+    """No output can grow without bound: a trial keeps at most trial_output_max_bytes, a leased job's log rotates at
+    lease_log_max_bytes (keeping the newest output), the compliance record rotates at compliance_log_max_bytes."""
+
+    def test_caps(self):
+        w = World("caps", {"trial_output_max_bytes": 500000, "lease_log_max_bytes": 1000000, "compliance_log_max_bytes": 20000})
+        spew = w.allowed / "spew.py"
+        spew.write_text("import sys\nline = 'x' * 999 + '\\n'\nfor i in range(int(sys.argv[1])):\n    sys.stdout.write(line)\n"
+                        "sys.stdout.flush()\nprint('done spewing')\n")
+        trial = w.res("Altiplano", "trial", "--json", "--", PYTHON, str(spew), "30000", cwd=w.root)   # 30 MB of output
+        self.assertEqual(trial.returncode, 0, trial.stderr)
+        out = Path(json.loads(trial.stdout)["output"])
+        trial_size = out.stat().st_size
+        w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(spew), "5000")               # 5 MB of output
+        w.wait(lambda: w.lease("Altiplano", lid).get("state") == "finished", 30, "spewing job finished")
+        log = w.data / "leases" / "Altiplano" / (lid + ".log")
+        older = log.with_name(log.name + ".1")
+        sizes = {"trial_output": trial_size, "lease_log": log.stat().st_size, "lease_log_1": older.stat().st_size if older.exists() else 0}
+        fin = w.wait(lambda: w.mail_matching("finished"), 15, "completion mail")
+        measured("caps.sizes", sizes)
+        self.assertLess(trial_size, 600000)
+        self.assertIn("output cut at", out.read_text())
+        self.assertLess(sizes["lease_log"], 1100000)
+        self.assertLess(sizes["lease_log_1"], 1100000)
+        self.assertIn("done spewing", fin[0]["body"], "the newest output survives rotation")
+        import importlib.util
+        for key, value in w.env("Altiplano").items():
+            if key.startswith("LEASERES_"):
+                os.environ[key] = value
+        spec = importlib.util.spec_from_file_location("res_caps", RES)
+        res = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(res)
+        d = res.Dispatcher(res.load_config())
+        for i in range(400):
+            d.append_unleased({"event": "seen", "at": "x", "key": str(i), "pad": "y" * 100})
+        folder = w.data / "leases" / "Altiplano"
+        current, rotated = folder / "unleased.jsonl", folder / "unleased.1.jsonl"
+        measured("caps.compliance_files", {"current": current.stat().st_size, "rotated": rotated.stat().st_size})
+        self.assertLess(current.stat().st_size, 21000)
+        self.assertLess(rotated.stat().st_size, 21000)
+        self.assertEqual(len(res.iter_unleased("Altiplano")) > 100, True)
+
+
+def processes_in(folder: Path) -> dict:
+    """Every process (but this one) whose command line names the folder or whose working folder lies inside it."""
+    marker = str(folder)
+    me = os.getpid()
+    found = {}
+    for p in psutil.process_iter(["cmdline"]):
+        if p.pid == me:
+            continue
+        try:
+            inside = marker in " ".join(p.info.get("cmdline") or [])
+            if not inside:
+                try:
+                    inside = p.cwd().startswith(marker)
+                except (psutil.Error, OSError):
+                    inside = False
+            if inside:
+                found[p.pid] = p
+        except psutil.Error:
+            continue
+    return found
+
+
+def remove_scratch() -> str:
+    """Kill whatever still runs from the scratch tree, then delete it (retrying: Windows holds files of dying processes)."""
+    for p in processes_in(SCRATCH).values():
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+    for attempt in range(5):
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+        if not SCRATCH.exists():
+            return "removed"
+        time.sleep(1)
+    return "NOT fully removed: " + str(SCRATCH)
+
+
 def main():
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    print("scratch: " + str(SCRATCH), flush=True)
+    print("scratch: " + str(SCRATCH) + " (" + format(shutil.disk_usage(str(SCRATCH)).free / 1e9, ".0f") + " GB free)", flush=True)
     try:
         socket.create_connection(("192.0.2.2", 445), timeout=2).close()
     except OSError:
         print("note: 192.0.2.2 not reachable; the network peak in R1 may be missing", flush=True)
-    program = unittest.main(exit=False, verbosity=2)
-    (SCRATCH / "results.json").write_text(json.dumps(RESULTS, indent=1))
-    print("results: " + str(SCRATCH / "results.json"))
-    sys.exit(0 if program.result.wasSuccessful() else 1)
+    ok = False
+    try:
+        program = unittest.main(exit=False, verbosity=2)
+        ok = program.result.wasSuccessful()
+    finally:
+        while WORLDS:
+            WORLDS.pop().stop()
+        results = SCRATCH_BASE / "last-results.json"
+        results.write_text(json.dumps(RESULTS, indent=1))
+        print("results: " + str(results))
+        print("scratch " + remove_scratch())
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
