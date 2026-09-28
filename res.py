@@ -102,11 +102,32 @@ SERVICE_DIR = Path(__file__).resolve().parent
 SCRIPT = SERVICE_DIR / "res.py"
 CODE_FILES = [SERVICE_DIR / "res.py", SERVICE_DIR / "probes.py"]
 SYNC_ROOT = SERVICE_DIR.parent.parent
+
+
+def default_local_dir(kind: str) -> Path:
+    """Machine-local folders (house rule of 2026-09-28: nothing a program keeps rewriting lives in ResilioSync).
+    kind 'state': ~/Library/Application Support/LeaseResources, %LOCALAPPDATA%\\LeaseResources\\state,
+    $XDG_STATE_HOME/LeaseResources; kind 'logs': ~/Library/Logs/LeaseResources, %LOCALAPPDATA%\\LeaseResources\\logs,
+    $XDG_STATE_HOME/LeaseResources/logs."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "LeaseResources"
+        return base / kind
+    if sys.platform == "darwin":
+        if kind == "logs":
+            return Path.home() / "Library" / "Logs" / "LeaseResources"
+        return Path.home() / "Library" / "Application Support" / "LeaseResources"
+    base = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "LeaseResources"
+    return base / "logs" if kind == "logs" else base
+
+
 DATA_DIR = Path(os.environ.get("LEASERES_DATA") or SERVICE_DIR)
-LEASES_ROOT = DATA_DIR / "leases"
-LOG_DIR = DATA_DIR / "logs"
+LEASES_ROOT = DATA_DIR / "leases"                        # synced: only write-once cross-machine files (see README)
+LOG_DIR = Path(os.environ.get("LEASERES_LOGS") or ((DATA_DIR / "logs") if os.environ.get("LEASERES_DATA")
+                                                   else default_local_dir("logs")))
 CONFIG_DIR = Path(os.environ.get("LEASERES_CONFIG") or (SERVICE_DIR / "config"))
-LOCAL_DIR = Path(os.environ.get("LEASERES_LOCAL") or (Path.home() / ".claude" / "leaseresources"))
+LOCAL_DIR = Path(os.environ.get("LEASERES_LOCAL") or default_local_dir("state"))
+OLD_LOCAL_DIR = Path.home() / ".claude" / "leaseresources"          # until 2026-09-28
+THIS_MACHINE = ""                                                    # set by load_config()
 MAIL_PY = SYNC_ROOT / "Services" / "ClaudeMail" / "mail.py"
 TASK_NAME = "LeaseResources Dispatcher"
 LAUNCHD_LABEL = "com.goocy.leaseresources"
@@ -124,7 +145,9 @@ def load_config() -> dict:
     """config/defaults.json overlaid with config/<machine>.json (lower case); each machine edits only its own file."""
     with open(CONFIG_DIR / "defaults.json", encoding="utf-8") as fh:
         config = json.load(fh)
-    own = CONFIG_DIR / (this_machine(config).casefold() + ".json")
+    global THIS_MACHINE
+    THIS_MACHINE = this_machine(config)
+    own = CONFIG_DIR / (THIS_MACHINE.casefold() + ".json")
     if own.is_file():
         with open(own, encoding="utf-8") as fh:
             config.update(json.load(fh))
@@ -173,7 +196,58 @@ def age_of(value) -> float:
 
 
 def machine_dir(machine: str) -> Path:
+    """This machine's lease records: local state, never synced. Another machine's are not readable here; its report
+    (read_report) summarises them. The legacy synced folder is returned for other machines only for old files."""
+    if machine == THIS_MACHINE:
+        return LOCAL_DIR / "leases"
     return LEASES_ROOT / machine
+
+
+def synced_dir(machine: str) -> Path:
+    return LEASES_ROOT / machine
+
+
+def inbox(machine: str, kind: str) -> Path:
+    """Write-once files for another machine's dispatcher: requests/<id>.json, asks/<id>.<kind>.<stamp>.json. Each is
+    written by the requesting machine only and deleted by the target once taken."""
+    return synced_dir(machine) / kind
+
+
+def file_stamp() -> str:
+    now = datetime.datetime.now()
+    return now.strftime("%y%m%d-%H%M%S-") + "%03d" % (now.microsecond // 1000)
+
+
+def report_names(machine: str) -> list:
+    folder = synced_dir(machine) / "reports"
+    if not folder.is_dir():
+        return []
+    return sorted((p for p in folder.iterdir() if p.name.endswith(".json") and not p.name.startswith(".")),
+                  key=lambda p: p.name, reverse=True)
+
+
+def read_report(machine: str) -> dict:
+    """The newest dispatcher report that parses; Resilio may still be delivering the very newest one."""
+    for path in report_names(machine):
+        report = read_json(path)
+        if report:
+            return report
+    return {}
+
+
+def write_report(machine: str, report: dict) -> None:
+    """A new file per report (never rewritten in place: Resilio conflicts), then all but it and the one before it go."""
+    path = synced_dir(machine) / "reports" / (file_stamp() + ".json")
+    write_json(path, report)
+    for old in report_names(machine)[2:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def report_lease(machine: str, ident: str) -> dict:
+    return (read_report(machine).get("leases") or {}).get(ident) or {}
 
 
 def lease_path(machine: str, ident: str) -> Path:
@@ -181,7 +255,60 @@ def lease_path(machine: str, ident: str) -> Path:
 
 
 def side_path(machine: str, ident: str, suffix: str) -> Path:
+    if suffix.startswith(".log"):
+        return LOG_DIR / "leases" / (ident + suffix)
     return machine_dir(machine) / (ident + suffix)
+
+
+def seed_local_state(machine: str) -> None:
+    """Once per machine: copy the state the pre-2026-09-28 code kept in the synced folder (lease records, runner and
+    order files, trials, history, compliance record, job logs) and in ~/.claude/leaseresources (learned capacities,
+    disk map) into the local folders. The synced copies are left alone; the user deletes them once every machine runs
+    this code."""
+    marker = LOCAL_DIR / "seeded.json"
+    if marker.exists():
+        return
+    counts = collections.Counter()
+    old = LEASES_ROOT / machine
+    new = LOCAL_DIR / "leases"
+    try:
+        new.mkdir(parents=True, exist_ok=True)
+        if old.is_dir():
+            for path in old.iterdir():
+                if not path.is_file() or path.name == "dispatcher.json" or path.name.startswith("."):
+                    continue
+                if path.name.endswith(".log") or path.name.endswith(".log.1"):
+                    target = LOG_DIR / "leases" / path.name
+                else:
+                    target = new / path.name
+                if not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, target)
+                    counts["files"] += 1
+            for sub, target_dir in [("trials", LOCAL_DIR / "trials"), ("done", new / "done")]:
+                if (old / sub).is_dir():
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    for path in (old / sub).iterdir():
+                        if path.is_file() and not (target_dir / path.name).exists():
+                            shutil.copy2(path, target_dir / path.name)
+                            counts[sub] += 1
+        if OLD_LOCAL_DIR != LOCAL_DIR:
+            if (OLD_LOCAL_DIR / "disks.json").is_file() and not (LOCAL_DIR / "disks.json").exists():
+                shutil.copy2(OLD_LOCAL_DIR / "disks.json", LOCAL_DIR / "disks.json")
+                counts["local"] += 1
+            old_learned = read_json(OLD_LOCAL_DIR / "learned_peaks.json")
+            if old_learned:                       # merged, highest per dimension: new code may already have learned some
+                learned = read_json(LOCAL_DIR / "learned_peaks.json")
+                for dim, value in old_learned.items():
+                    learned[dim] = max(float(value), float(learned.get(dim, 0)))
+                write_json(LOCAL_DIR / "learned_peaks.json", learned)
+                counts["learned"] += len(old_learned)
+    except OSError as exc:
+        log(machine, "WARN seeding local state: " + str(exc))
+        return
+    write_json(marker, {"at": now_iso(), "from": str(old), "counts": dict(counts)})
+    if counts:
+        log(machine, "seeded local state from the synced copy: " + json.dumps(dict(counts)))
 
 
 def is_lease_file(path: Path) -> bool:
@@ -653,7 +780,7 @@ def headroom(config: dict, dim: str) -> float:
 
 
 def dispatcher_state(machine: str, config: dict) -> tuple:
-    report = read_json(machine_dir(machine) / "dispatcher.json")
+    report = read_report(machine)
     fresh = age_of(report.get("updated")) < 180
     return fresh, report
 
@@ -770,7 +897,7 @@ def cmd_mine(args, config: dict) -> None:
 # ---------------------------------------------------------------- trial
 
 def trial_dir(machine: str) -> Path:
-    return machine_dir(machine) / "trials"
+    return LOCAL_DIR / "trials"
 
 
 def session_tree_pids(proc) -> list:
@@ -1058,7 +1185,7 @@ def parse_need(text: str) -> dict:
 
 
 def find_trial(ident: str):
-    for folder in sorted(LEASES_ROOT.glob("*/trials")):
+    for folder in [LOCAL_DIR / "trials"] + sorted(LEASES_ROOT.glob("*/trials")):
         path = folder / (ident + ".json")
         if path.is_file():
             return read_json(path)
@@ -1099,15 +1226,15 @@ def cmd_request(args, config: dict) -> None:
         need.update(parse_need(args.need))
     if not need:
         raise SystemExit("Give --profile TRIAL_ID or --need DIM=AMOUNT,...")
-    folder = machine_dir(target)
+    folder = machine_dir(target) if target == here else inbox(target, "requests")
     folder.mkdir(parents=True, exist_ok=True)
     ident = new_id("L", here, folder)
     lease = {"id": ident, "machine": target, "from_machine": here, "desk": owner_desk(config, args.desk),
              "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "why": args.why or "", "need": need,
              "duration": duration, "state": "requested", "requested": now_iso(), "trial": args.profile or "",
              "command": command, "command_key": command_key(command) if command else "", "margin": margin}
-    path = lease_path(target, ident)
-    write_json(path, lease)
+    path = lease_path(target, ident) if target == here else folder / (ident + ".json")
+    write_json(path, lease)                       # to another machine: a write-once file its dispatcher takes and deletes
     fresh, report = dispatcher_state(target, config)
     if target != here:
         print("Sent request " + ident + " to " + target + " (" + describe_need(need) + " for " + human_duration(duration)
@@ -1149,8 +1276,8 @@ def cmd_extend(args, config: dict) -> None:
     here = this_machine(config)
     target = canonical_machine(args.on, config) if args.on else here
     path = lease_path(target, args.id)
-    lease = read_json(path)
-    if not lease:
+    lease = read_json(path) if target == here else report_lease(target, args.id)
+    if not lease and target == here:
         raise SystemExit("No lease " + args.id + " on " + target)
     ask = {"asked": now_iso(), "from_machine": here}
     if args.duration:
@@ -1168,7 +1295,10 @@ def cmd_extend(args, config: dict) -> None:
         ask["need"] = need
     if len(ask) == 2:
         raise SystemExit("Give --for DURATION and/or --need / --profile.")
-    write_json(side_path(target, args.id, ".extend.json"), ask)
+    if target != here:
+        write_json(inbox(target, "asks") / (args.id + ".extend." + file_stamp() + ".json"), ask)
+    else:
+        write_json(side_path(target, args.id, ".extend.json"), ask)
     if target != here:
         print("Extension of " + args.id + " sent to " + target + "; the answer comes by mail to " + lease.get("desk", ""))
         return
@@ -1185,15 +1315,19 @@ def cmd_release(args, config: dict) -> None:
     here = this_machine(config)
     target = canonical_machine(args.on, config) if args.on else here
     path = lease_path(target, args.id)
-    lease = read_json(path)
-    if not lease:
+    lease = read_json(path) if target == here else report_lease(target, args.id)
+    if not lease and target == here:
         raise SystemExit("No lease " + args.id + " on " + target)
     if lease.get("state") in ENDED:
         print(args.id + " is already " + lease.get("state"))
         return
     if lease.get("state") in ("running", "starting") and not args.kill:
         raise SystemExit(args.id + " is running; the job keeps its lease until it ends. Add --kill to stop its whole process tree.")
-    write_json(side_path(target, args.id, ".release.json"), {"asked": now_iso(), "kill": bool(args.kill), "from_machine": here})
+    ask = {"asked": now_iso(), "kill": bool(args.kill), "from_machine": here}
+    if target != here:
+        write_json(inbox(target, "asks") / (args.id + ".release." + file_stamp() + ".json"), ask)
+    else:
+        write_json(side_path(target, args.id, ".release.json"), ask)
     if target != here:
         print("Release of " + args.id + " sent to " + target)
         return
@@ -1244,9 +1378,12 @@ def cmd_run(args, config: dict) -> None:
     here = this_machine(config)
     target = canonical_machine(args.on, config) if args.on else here
     path = lease_path(target, args.lease)
-    lease = read_json(path)
-    if not lease:
-        raise SystemExit("No lease " + args.lease + " on " + target + " (" + str(path) + ")")
+    if target == here:
+        lease = read_json(path)
+        if not lease:
+            raise SystemExit("No lease " + args.lease + " on " + target + " (" + str(path) + ")")
+    else:
+        lease = report_lease(target, args.lease) or {"state": "requested", "desk": ""}   # the report may lag the request
     state = lease.get("state")
     if state == "requested" and target == here:
         # Not answered yet (a busy dispatcher): wait for the answer, since a granted lease starts here directly (any
@@ -1255,7 +1392,7 @@ def cmd_run(args, config: dict) -> None:
         state = lease.get("state")
     if state in ENDED:
         raise SystemExit(args.lease + " is " + state + "; request a new lease.")
-    if side_path(target, args.lease, ".order.json").exists():
+    if target == here and side_path(target, args.lease, ".order.json").exists():
         raise SystemExit(args.lease + " already has a run order; one lease, one run.")
     cwd = os.path.abspath(args.cwd or os.getcwd())
     local_start = target == here and state == "granted"
@@ -1272,9 +1409,12 @@ def cmd_run(args, config: dict) -> None:
     order = {"lease": args.lease, "argv": resolve_interpreter(argv) if target == here else argv, "cwd": cwd,
              "from_machine": here, "ordered": now_iso(), "start": "res" if local_start else "dispatcher",
              "desk": lease.get("desk", "")}
-    write_json(side_path(target, args.lease, ".order.json"), order)
+    if target == here:
+        write_json(side_path(target, args.lease, ".order.json"), order)
+    else:
+        write_json(inbox(target, "asks") / (args.lease + ".order." + file_stamp() + ".json"), order)
     log(here, "run order " + args.lease + " on " + target + " (" + order["start"] + "): " + " ".join(argv))
-    history = read_json(machine_dir(target) / "history.json").get(command_key(argv)) or []
+    history = (read_json(machine_dir(target) / "history.json").get(command_key(argv)) or []) if target == here else []
     if history:
         print("History: " + history_note(history, float(lease.get("duration", 0))))
     if not local_start:
@@ -1422,6 +1562,7 @@ def cmd_runner(args, config: dict) -> None:
         env["PATH"] = os.pathsep.join([env.get("PATH", ""), "/opt/homebrew/bin", "/usr/local/bin"])
     log_path = side_path(machine, ident, ".log")
     try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "ab") as out:
             out.write(("[res] " + now_iso() + " starting on " + machine + ": " + " ".join(argv) + "  (cwd " + cwd + ")\n").encode("utf-8"))
             out.flush()
@@ -1452,6 +1593,14 @@ def cmd_runner(args, config: dict) -> None:
 
 # ---------------------------------------------------------------- leases, status, compliance
 
+def read_run(machine: str, ident: str) -> dict:
+    """The runner's record; a runner started by the pre-2026-09-28 code still writes it into the synced folder."""
+    record = read_json(side_path(machine, ident, ".run.json"))
+    if not record:
+        record = read_json(synced_dir(machine) / (ident + ".run.json"))
+    return record
+
+
 def summary_line(lease: dict) -> list:
     state = lease.get("state", "?")
     when = lease.get("started") or lease.get("granted") or lease.get("requested")
@@ -1462,8 +1611,9 @@ def summary_line(lease: dict) -> list:
 
 def cmd_leases(args, config: dict) -> None:
     machines = config["machines"] if args.all else [canonical_machine(args.on, config) if args.on else this_machine(config)]
+    here = this_machine(config)
     for machine in machines:
-        leases = all_leases(machine)
+        leases = all_leases(machine) if machine == here else list((read_report(machine).get("leases") or {}).values())
         if not args.ended:
             leases = [l for l in leases if l.get("state") in OPEN or age_of(l.get("ended") or l.get("answered")) < 86400]
         if not leases and args.all:
@@ -1484,9 +1634,12 @@ def cmd_status(args, config: dict) -> None:
               + (", pid " + str(report.get("pid")) if report.get("pid") else ""))
         if report.get("queue"):
             print("  queue: " + ", ".join(report["queue"]))
-        print_compliance(machine, config, 7)
+        if machine == here:
+            print_compliance(machine, config, 7)
+        else:
+            print("\n".join(report.get("compliance") or ["(no compliance summary in its report)"]))
         return
-    lease = read_json(lease_path(machine, args.id))
+    lease = read_json(lease_path(machine, args.id)) if machine == here else report_lease(machine, args.id)
     if not lease:
         raise SystemExit("No lease " + args.id + " on " + machine)
     for key in ["id", "state", "answer", "desk", "why", "need", "duration", "requested", "granted", "started", "ended",
@@ -1527,6 +1680,11 @@ def iter_unleased(machine: str) -> list:
 
 
 def print_compliance(machine: str, config: dict, days: float) -> None:
+    print("\n".join(compliance_lines(machine, days)))
+
+
+def compliance_lines(machine: str, days: float) -> list:
+    lines = []
     since = time.time() - days * 86400
     trials = [read_json(p) for p in trial_dir(machine).glob("T*.json")] if trial_dir(machine).is_dir() else []
     trials = [t for t in trials if (parse_iso(t.get("started")) or 0) >= since]
@@ -1535,19 +1693,20 @@ def print_compliance(machine: str, config: dict, days: float) -> None:
     rows = [r for r in iter_unleased(machine) if (parse_iso(r.get("at")) or 0) >= since]
     starts = [r for r in rows if r.get("event") == "seen"]
     ends = {r.get("key"): r for r in rows if r.get("event") == "ended"}
-    print("Compliance on " + machine + ", last " + format(days, "g") + " days (guidance only, D-260927-4 option b):")
-    print("  trials: " + str(len(trials)) + " (" + str(len([t for t in trials if t.get("finished")])) + " finished inside the limit, "
-          + str(len([t for t in trials if not t.get("finished")])) + " cut off)")
+    lines.append("Compliance on " + machine + ", last " + format(days, "g") + " days (guidance only, D-260927-4 option b):")
+    lines.append("  trials: " + str(len(trials)) + " (" + str(len([t for t in trials if t.get("finished")])) + " finished inside the limit, "
+                 + str(len([t for t in trials if not t.get("finished")])) + " cut off)")
     by_state = collections.Counter(l.get("state") for l in leases)
-    print("  lease requests: " + str(len(leases)) + (" (" + ", ".join(k + " " + str(v) for k, v in sorted(by_state.items())) + ")" if leases else ""))
-    print("  leased runs: " + str(len(runs)))
+    lines.append("  lease requests: " + str(len(leases)) + (" (" + ", ".join(k + " " + str(v) for k, v in sorted(by_state.items())) + ")" if leases else ""))
+    lines.append("  leased runs: " + str(len(runs)))
     lifetimes = [float(ends[r.get("key")]["lifetime"]) for r in starts
                  if r.get("key") in ends and isinstance(ends[r.get("key")].get("lifetime"), (int, float))]
-    print("  long commands of Claude sessions without a lease: " + str(len(starts))
-          + (" (median lifetime of the ended ones " + human_duration(statistics.median(lifetimes)) + ")" if lifetimes else ""))
+    lines.append("  long commands of Claude sessions without a lease: " + str(len(starts))
+                 + (" (median lifetime of the ended ones " + human_duration(statistics.median(lifetimes)) + ")" if lifetimes else ""))
     desks = collections.Counter(r.get("desk", "?") for r in starts)
     for desk, count in desks.most_common(8):
-        print("    " + desk + ": " + str(count))
+        lines.append("    " + desk + ": " + str(count))
+    return lines
 
 
 def cmd_notify_test(args, config: dict) -> None:
@@ -1562,6 +1721,10 @@ def cmd_notify_test(args, config: dict) -> None:
 
 def cmd_compliance(args, config: dict) -> None:
     machine = canonical_machine(args.on, config) if args.on else this_machine(config)
+    if machine != this_machine(config):
+        print("\n".join(read_report(machine).get("compliance") or ["No compliance summary from " + machine + " yet."]))
+        print("(the last 7 days, from " + machine + "'s dispatcher report; the full record stays on that machine)")
+        return
     print_compliance(machine, config, float(args.days))
     if args.list:
         for row in iter_unleased(machine)[-int(args.list):]:
@@ -1643,6 +1806,10 @@ class Dispatcher:
         self.unleased_pending = {}                    # key -> candidate younger than the threshold
         self.tool_members = {}                        # key -> the tool shell a process was seen under
         self.desk_cache = {}                          # working folder -> desk (from mail.py desk-of)
+        self.last_report = None
+        self.last_report_at = 0.0
+        self.compliance_cache = []
+        self.compliance_at = -1e9
         self.learned = read_json(LOCAL_DIR / "learned_peaks.json")
         self.learned_dirty = False
         self.version = code_version()
@@ -1678,7 +1845,7 @@ class Dispatcher:
                   and side_path(self.machine, l["id"], ".run.json").exists()]
         trees = {}
         for lease in leases:
-            run = read_json(side_path(self.machine, lease["id"], ".run.json"))
+            run = read_run(self.machine, lease["id"])
             proc = process(run.get("runner_pid"), run.get("runner_create_time"))
             if proc is not None:
                 trees[lease["id"]] = tree_of(proc)
@@ -1912,7 +2079,7 @@ class Dispatcher:
             if lease.get("state") in ("running", "starting"):
                 if not ask.get("kill"):
                     continue
-                run = read_json(side_path(self.machine, ident, ".run.json"))
+                run = read_run(self.machine, ident)
                 proc = process(run.get("runner_pid"), run.get("runner_create_time"))
                 still = kill_tree(tree_of(proc)) if proc else []
                 lease.update(state="killed", answer="killed on request of its owner" + (", survivors " + str(still) if still else ""),
@@ -1921,6 +2088,66 @@ class Dispatcher:
                 lease.update(state="released", answer="released by its owner", ended=now_iso())
             self.save(lease)
             log(self.machine, "release " + ident + ": " + lease["state"])
+
+    def ingest_synced(self) -> None:
+        """Take requests and asks other machines wrote for this one into local state, then delete them. They come from
+        the synced folder, so a run order among them is always started by this dispatcher under the program rule,
+        whatever it claims about its origin. Also takes requests written in the old layout (leases/<Machine>/<id>.json)
+        by machines still on the pre-2026-09-28 code, without deleting those."""
+        for path in sorted(inbox(self.machine, "requests").glob("*.json")) if inbox(self.machine, "requests").is_dir() else []:
+            data = read_json(path)
+            if not data.get("id"):
+                if time.time() - path.stat().st_mtime > 120:
+                    self.drop(path)                   # never completed by Resilio
+                continue
+            local = lease_path(self.machine, data["id"])
+            if not local.exists():
+                data.update(state="requested", machine=self.machine, via="synced request")
+                write_json(local, data)
+                log(self.machine, "took request " + data["id"] + " from " + str(data.get("from_machine")))
+            self.drop(path)
+        asks = inbox(self.machine, "asks")
+        for path in sorted(asks.glob("*.json")) if asks.is_dir() else []:
+            name = path.name
+            kind = next((k for k in ["order", "extend", "release"] if "." + k + "." in name), None)
+            data = read_json(path)
+            if kind is None or not data:
+                if kind is None or time.time() - path.stat().st_mtime > 120:
+                    self.drop(path)
+                continue
+            ident = name.partition("." + kind + ".")[0]
+            if kind == "order":
+                data["start"] = "dispatcher"          # from the synced folder: never a direct local start
+                data["via"] = "synced ask"
+            target = side_path(self.machine, ident, "." + kind + ".json")
+            if not (kind == "order" and target.exists()):
+                write_json(target, data)
+                log(self.machine, "took " + kind + " for " + ident + " from " + str(data.get("from_machine")))
+            self.drop(path)
+        legacy = synced_dir(self.machine)
+        if legacy.is_dir():
+            for path in legacy.glob("L*.json"):
+                if any(path.name.endswith(s) for s in SUFFIXES):
+                    continue
+                data = read_json(path)
+                ident = data.get("id")
+                if not ident or data.get("state") != "requested" or data.get("from_machine") == self.machine:
+                    continue
+                local = lease_path(self.machine, ident)
+                if not local.exists():
+                    write_json(local, dict(data, via="legacy synced request"))
+                    log(self.machine, "took legacy request " + ident + " from " + str(data.get("from_machine")))
+                order = legacy / (ident + ".order.json")
+                if order.exists() and not side_path(self.machine, ident, ".order.json").exists():
+                    write_json(side_path(self.machine, ident, ".order.json"), dict(read_json(order), start="dispatcher",
+                                                                                    via="legacy synced order"))
+
+    @staticmethod
+    def drop(path: Path) -> None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
     def handle_new(self) -> None:
         for lease in self.leases():
@@ -1945,7 +2172,7 @@ class Dispatcher:
                 continue
             if state not in ("granted", "starting", "running"):
                 continue
-            run = read_json(side_path(self.machine, ident, ".run.json"))
+            run = read_run(self.machine, ident)
             if run.get("error"):
                 lease.update(state="failed", answer="could not start: " + run["error"], ended=now_iso())
                 self.save(lease)
@@ -2572,15 +2799,30 @@ class Dispatcher:
 
     # -- report, housekeeping
     def report(self) -> None:
+        """Publish what other machines need (`--on`): a new report file when the content changed, or at least every
+        60 s as a heartbeat; never a rewrite in place. Measurements that change every sample do not count as a change."""
         dims = self.meter.dimensions()
         limits = self.limits()
         leases = self.leases()
-        write_json(self.folder / "dispatcher.json", {
-            "machine": self.machine, "pid": os.getpid(), "version": self.version, "updated": now_iso(),
-            "capacity": {d: {"capacity": i["capacity"], "limit": limits[d], "label": i.get("label", "")} for d, i in dims.items()},
-            "unleased": self.unleased_now(), "planned": self.planned(), "system": self.last_system,
-            "queue": [l["id"] for l in leases if l.get("state") == "queued"],
-            "active": [l["id"] for l in leases if l.get("state") in ACTIVE]})
+        keep = ["id", "state", "answer", "desk", "why", "need", "duration", "requested", "granted", "started", "ended",
+                "exit", "seconds", "from_machine", "run_argv", "history_note"]
+        summary = {}
+        for lease in leases:
+            if lease.get("state") in OPEN or age_of(lease.get("ended") or lease.get("answered")) < 86400:
+                summary[lease["id"]] = dict({k: lease[k] for k in keep if k in lease},
+                                            log=str(side_path(self.machine, lease["id"], ".log")))
+        if time.monotonic() - self.compliance_at > 600:
+            self.compliance_cache = compliance_lines(self.machine, 7)
+            self.compliance_at = time.monotonic()
+        stable = {"machine": self.machine, "pid": os.getpid(), "version": self.version,
+                  "capacity": {d: {"capacity": i["capacity"], "limit": limits[d], "label": i.get("label", "")} for d, i in dims.items()},
+                  "planned": self.planned(), "queue": [l["id"] for l in leases if l.get("state") == "queued"],
+                  "active": [l["id"] for l in leases if l.get("state") in ACTIVE], "leases": summary,
+                  "compliance": self.compliance_cache}
+        if stable != self.last_report or time.monotonic() - self.last_report_at > 60:
+            write_report(self.machine, dict(stable, updated=now_iso(), unleased=self.unleased_now(), system=self.last_system))
+            self.last_report = stable
+            self.last_report_at = time.monotonic()
         if self.learned_dirty:
             write_json(LOCAL_DIR / "learned_peaks.json", self.learned)
             self.learned_dirty = False
@@ -2591,7 +2833,7 @@ class Dispatcher:
         for lease in self.leases():
             if lease.get("state") in ENDED and age_of(lease.get("ended") or lease.get("answered")) > 7 * 86400:
                 done.mkdir(exist_ok=True)
-                for path in [lease_path(self.machine, lease["id"])] + [side_path(self.machine, lease["id"], s) for s in SUFFIXES + [".log"]]:
+                for path in [lease_path(self.machine, lease["id"])] + [side_path(self.machine, lease["id"], s) for s in SUFFIXES]:
                     if path.exists():
                         try:
                             probes.replace_retrying(path, done / path.name)
@@ -2608,6 +2850,14 @@ class Dispatcher:
         # this machine's daily logs and diagnostic snapshots after keep_days; the LaunchAgent's bootstrap log is cut
         # back when it passes 10 MB (it only holds tracebacks, but a crash loop would grow it)
         prefixes = ["leaseresources." + self.machine.casefold() + ".", "snapshot-" + self.machine]
+        jobs = LOG_DIR / "leases"
+        if jobs.is_dir():
+            for path in jobs.iterdir():
+                try:
+                    if time.time() - path.stat().st_mtime > keep:
+                        path.unlink()
+                except OSError:
+                    pass
         if LOG_DIR.is_dir():
             for path in LOG_DIR.iterdir():
                 try:
@@ -2664,6 +2914,7 @@ def cmd_dispatch(args, config: dict) -> None:
     machine = this_machine(config)
     if not take_lock(machine):
         sys.exit(EXIT_ALREADY_RUNNING)
+    seed_local_state(machine)
     d = Dispatcher(config)
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", code " + d.version + ", dimensions "
         + ", ".join(d.meter.dimensions()) + ")")
@@ -2682,6 +2933,7 @@ def cmd_dispatch(args, config: dict) -> None:
             except (OSError, ValueError) as exc:
                 log(machine, "WARN cannot read config, keeping the last one: " + str(exc))
             write_json(local_heartbeat(), {"pid": os.getpid(), "updated": now_iso()})
+            d.ingest_synced()
             d.handle_asks()
             d.handle_new()
             d.handle_orders()
@@ -2789,6 +3041,8 @@ def main() -> None:
     p.add_argument("launch")
     args = parser.parse_args()
     config = load_config()
+    if args.cmd not in ("_runner", "_launch"):
+        seed_local_state(THIS_MACHINE)
     handlers = {"now": cmd_now, "mine": cmd_mine, "trial": cmd_trial, "request": cmd_request, "extend": cmd_extend,
                 "release": cmd_release, "run": cmd_run, "leases": cmd_leases, "status": cmd_status,
                 "compliance": cmd_compliance, "notify-test": cmd_notify_test, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner, "_launch": cmd_launch}

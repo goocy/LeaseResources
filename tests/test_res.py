@@ -334,7 +334,7 @@ class T12Escapes(Base):
             subprocess.Popen(fake + [job], cwd=str(w.allowed), env=env)
 
         def rows():
-            path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
+            path = w.state("Altiplano", "unleased.jsonl")
             if not path.exists():
                 return []
             return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
@@ -416,7 +416,7 @@ class World:
         proc = subprocess.Popen([PYTHON, "-B", str(RES), "dispatch"], stdout=out, stderr=subprocess.STDOUT,
                                 env=self.env(machine, **env), cwd=str(SERVICE))
         self.procs.append(proc)
-        self.wait(lambda: (self.data / "leases" / machine / "dispatcher.json").exists(), 20, "dispatcher report")
+        self.wait(lambda: list((self.data / "leases" / machine / "reports").glob("*.json")), 20, "dispatcher report")
         return proc
 
     def stop(self):
@@ -454,9 +454,16 @@ class World:
     def mail_matching(self, text: str) -> list:
         return [m for m in self.mails() if text in m.get("subject", "")]
 
+    def state(self, machine: str, name: str) -> Path:
+        """A file in that machine's local lease state (not synced since 2026-09-28)."""
+        return self.root / ("local-" + machine) / "leases" / name
+
+    def joblog(self, ident: str) -> Path:
+        return self.data / "logs" / "leases" / (ident + ".log")
+
     def lease(self, machine: str, ident: str) -> dict:
         try:
-            return json.loads((self.data / "leases" / machine / (ident + ".json")).read_text(encoding="utf-8"))
+            return json.loads(self.state(machine, ident + ".json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
 
@@ -688,7 +695,7 @@ class T5Survive(Base):
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
         w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleepy.py"), "60")
         w.wait(lambda: w.lease("Altiplano", lid).get("state") == "running", 20, "running")
-        run = json.loads((w.data / "leases" / "Altiplano" / (lid + ".run.json")).read_text())
+        run = json.loads(w.state("Altiplano", lid + ".run.json").read_text())
         os.kill(run["runner_pid"], signal.SIGKILL)
         os.kill(run["pid"], signal.SIGKILL)
         lost = w.wait(lambda: w.mail_matching(" lost "), 20, "lost mail")
@@ -718,12 +725,15 @@ class T6CrossMachine(Base):
         measured("R6.grant_mail_after_seconds", round(time.monotonic() - t0, 1))
         self.assertEqual(answer[0]["machine"], "Mistral", "the answer must come from Mistral's dispatcher")
         self.assertTrue(w.lease("Mistral", lid))
-        self.assertFalse((w.data / "leases" / "Altiplano" / (lid + ".json")).exists())
+        self.assertFalse(w.state("Altiplano", lid + ".json").exists())
+        synced = sorted(str(p.relative_to(w.data)) for p in (w.data / "leases").rglob("*") if p.is_file())
+        measured("R6.synced_files_after", synced)
+        self.assertTrue(all("/reports/" in s.replace(chr(92), "/") for s in synced), synced)   # requests/asks taken
         run = w.res("Altiplano", "run", "--lease", lid, "--on", "Mistral", "--", PYTHON, str(w.allowed / "sleepy.py"), "3")
         self.assertIn("Run order written", run.stdout, run.stdout + run.stderr)
         fin = w.wait(lambda: [m for m in w.mail_matching("finished") if m["to"] == "Altiplano:Asker"], 30, "finished mail")
         self.assertEqual(fin[0]["machine"], "Mistral")
-        log = (w.data / "leases" / "Mistral" / (lid + ".log")).read_text()
+        log = w.joblog(lid).read_text()
         self.assertIn("starting on Mistral", log)
         measured("R6.finished_subject", fin[0]["subject"])
         status = w.res("Altiplano", "status", lid, "--on", "Mistral")
@@ -756,7 +766,7 @@ class T8Safety(Base):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         w.wait(lambda: w.lease("Altiplano", lid).get("state") == "finished", 20, "local shell run finished")
         self.assertTrue(marker.exists())
-        self.assertIn("local-ok", (w.data / "leases" / "Altiplano" / (lid + ".log")).read_text())
+        self.assertIn("local-ok", w.joblog(lid).read_text())
         self.assertIn("program rule not applied", w.logtext("Altiplano"))
         measured("R8.local_nonpython_run", w.lease("Altiplano", lid).get("state"))
 
@@ -774,7 +784,7 @@ class T8Safety(Base):
             w.wait(lambda: w.lease("Mistral", rid).get("state") == "granted", 15, "remote grant " + name)
             w.res("Altiplano", "run", "--lease", rid, "--on", "Mistral", "--", *argv)
             w.wait(lambda: w.lease("Mistral", rid).get("state") == "refused", 15, "remote refusal " + name)
-            self.assertFalse((w.data / "leases" / "Mistral" / (rid + ".run.json")).exists(), name)
+            self.assertFalse(w.state("Mistral", rid + ".run.json").exists(), name)
             remote[name] = w.lease("Mistral", rid).get("answer", "")[:100]
         self.assertFalse((w.root / "marker-remote.txt").exists())
         self.assertEqual(w.logtext("Mistral").count("REFUSED"), len(cases))
@@ -788,13 +798,17 @@ class T8Safety(Base):
             order = {"lease": sid, "argv": ["/bin/sh", "-c", "echo spoof > " + str(spoof_marker)], "cwd": str(w.allowed),
                      "from_machine": "Altiplano", "ordered": time.strftime("%Y-%m-%dT%H:%M:%S-05:00"), "start": start,
                      "desk": "Altiplano:Owner"}
-            (w.data / "leases" / "Altiplano" / (sid + ".order.json")).write_text(json.dumps(order))
+            planted = w.data / "leases" / "Altiplano" / "asks" / (sid + ".order.260928-000000-000.json")
+            planted.parent.mkdir(parents=True, exist_ok=True)
+            planted.write_text(json.dumps(order))       # the synced folder is the only place another machine can reach
             spoofs[start] = sid
-        w.wait(lambda: w.lease("Altiplano", spoofs["dispatcher"]).get("state") == "refused", 15, "planted dispatcher order refused")
-        time.sleep(4)
+        # Whatever it claims ("start": "res" included), an order from the synced folder is started by the dispatcher under
+        # the program rule, so both are refused.
+        w.wait(lambda: all(w.lease("Altiplano", s).get("state") == "refused" for s in spoofs.values()), 15, "planted orders refused")
+        time.sleep(2)
         self.assertFalse(spoof_marker.exists(), "a planted order must never run")
-        self.assertNotIn(w.lease("Altiplano", spoofs["res"]).get("state"), ("running", "finished", "starting"))
-        self.assertIn("REFUSED run of " + spoofs["dispatcher"], w.logtext("Altiplano"))
+        for s in spoofs.values():
+            self.assertIn("REFUSED run of " + s, w.logtext("Altiplano"))
         measured("R8.planted_orders", {k: w.lease("Altiplano", v).get("state") for k, v in spoofs.items()})
 
         qid = None
@@ -846,7 +860,7 @@ class T9HistoryAndCompliance(Base):
         quick = subprocess.Popen(fake + [short_cmd], cwd=str(w.allowed), env=w.env("Altiplano"))
 
         def rows():
-            path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
+            path = w.state("Altiplano", "unleased.jsonl")
             if not path.exists():
                 return []
             return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
@@ -1085,7 +1099,7 @@ class T14Units(Base):
             d.check_unleased()
         finally:
             res.psutil.process_iter = saved
-        rows = [json.loads(l) for l in (w.data / "leases" / "Altiplano" / "unleased.jsonl").read_text().splitlines() if l.strip()]
+        rows = [json.loads(l) for l in (w.state("Altiplano", "unleased.jsonl")).read_text().splitlines() if l.strip()]
         seen = {int(r["key"].partition("-")[0]) - base: r for r in rows if r["event"] == "seen"}
         measured("units.detector_recorded", {str(k): r["how"] + " | " + (r["commands"][0][:40] if r["commands"] else "") for k, r in sorted(seen.items())})
         self.assertEqual(sorted(seen), [102, 105, 107, 202, 203, 301, 311, 402, 502, 600, 601, 701, 801])
@@ -1151,7 +1165,7 @@ class T16StableRecords(Base):
         shell.wait(40)
 
         def rows():
-            path = w.data / "leases" / "Altiplano" / "unleased.jsonl"
+            path = w.state("Altiplano", "unleased.jsonl")
             return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
         mine = lambda: [r for r in rows() if any("churn.py" in c for c in r.get("commands", [])) or "churn.py" in r.get("shell", "")]
         seen = w.wait(lambda: [r for r in mine() if r["event"] == "seen"], 10, "seen record")
@@ -1216,7 +1230,7 @@ class T18OutputCaps(Base):
         lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
         w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(spew), "5000")               # 5 MB of output
         w.wait(lambda: w.lease("Altiplano", lid).get("state") == "finished", 30, "spewing job finished")
-        log = w.data / "leases" / "Altiplano" / (lid + ".log")
+        log = w.joblog(lid)
         older = log.with_name(log.name + ".1")
         sizes = {"trial_output": trial_size, "lease_log": log.stat().st_size, "lease_log_1": older.stat().st_size if older.exists() else 0}
         fin = w.wait(lambda: w.mail_matching("finished"), 15, "completion mail")
@@ -1236,8 +1250,7 @@ class T18OutputCaps(Base):
         d = res.Dispatcher(res.load_config())
         for i in range(400):
             d.append_unleased({"event": "seen", "at": "x", "key": str(i), "pad": "y" * 100})
-        folder = w.data / "leases" / "Altiplano"
-        current, rotated = folder / "unleased.jsonl", folder / "unleased.1.jsonl"
+        current, rotated = w.state("Altiplano", "unleased.jsonl"), w.state("Altiplano", "unleased.1.jsonl")
         measured("caps.compliance_files", {"current": current.stat().st_size, "rotated": rotated.stat().st_size})
         self.assertLess(current.stat().st_size, 21000)
         self.assertLess(rotated.stat().st_size, 21000)

@@ -13,7 +13,8 @@ command line, user, whether psutil can read its environment (and the error if no
 CLAUDE_CODE_SESSION_ID and LEASERES_LEASE values. It also runs the current detector (res.py beside it) against a
 scratch folder with a short threshold (--after, default 15 s) and stores what it would record.
 
-Output: logs/snapshot-<machine>-<yyMMdd-HHMMSS>.json in the service folder (synced, so Altiplano can read it) and a
+Output: snapshot-<machine>-<yyMMdd-HHMMSS>.json in the machine's local LeaseResources log folder (since 2026-09-28;
+~/Library/Logs/LeaseResources or %LOCALAPPDATA%\\LeaseResources\\logs; pass --out to put it elsewhere, e.g. to share it) and a
 readable tree in a .txt beside it. Needs the LeaseResources venv (psutil). No regular expressions (house rule).
 """
 from __future__ import annotations
@@ -41,6 +42,15 @@ except ImportError:
 INTERESTING = ["bash", "sh", "zsh", "sleep", "cmd", "powershell", "pwsh", "python", "pythonw", "py", "conhost", "node",
                "claude", "mintty", "git"]
 ENV_KEYS = ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "LEASERES_LEASE", "MSYSTEM"]
+
+
+def local_logs() -> Path:
+    """The machine's LeaseResources log folder (not synced since 2026-09-28), as res.py computes it."""
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "LeaseResources" / "logs"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "LeaseResources"
+    return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "LeaseResources" / "logs"
 
 
 def stem(name: str) -> str:
@@ -140,6 +150,7 @@ def detector(after: float):
     scratch = Path(tempfile.mkdtemp(prefix="leaseres-snapshot-"))
     os.environ["LEASERES_DATA"] = str(scratch / "data")
     os.environ["LEASERES_LOCAL"] = str(scratch / "local")
+    os.environ["LEASERES_LOGS"] = str(scratch / "logs")
     sys.path.insert(0, str(SERVICE))
     import res
     d = res.Dispatcher(res.load_config())
@@ -171,11 +182,11 @@ def main() -> None:
             child = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("snapshot_tree started detached (pid " + str(child.pid) + "); first snapshot in " + format(args.delay, "g")
-              + " s, output in " + str(SERVICE / "logs"))
+              + " s, output in " + str(local_logs()))
         return
     machine = socket.gethostname().partition(".")[0]
     stamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    out = Path(args.out) if args.out else SERVICE / "logs" / ("snapshot-" + machine + "-" + stamp + ".json")
+    out = Path(args.out) if args.out else local_logs() / ("snapshot-" + machine + "-" + stamp + ".json")
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         disp, rows_path = detector(args.after)
