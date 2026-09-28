@@ -398,8 +398,9 @@ class World:
         WORLDS.append(self)
 
     def env(self, machine: str, **extra) -> dict:
-        env = dict(os.environ)
-        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        # No Claude variables from the session running the suite: a registered session id made the detector use that
+        # session's real desk (Mistral 2026-09-28). Tests set what they need through **extra.
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("CLAUDE")}
         env.update({"LEASERES_DATA": str(self.data), "LEASERES_CONFIG": str(self.config), "LEASERES_MACHINE": machine,
                     "LEASERES_LOCAL": str(self.root / ("local-" + machine))})
         env.update(extra)
@@ -779,15 +780,20 @@ class T8Safety(Base):
             "link": [PYTHON, str(linked)],
         }
         remote = {}
+        rids = []
         for name, argv in cases.items():
             rid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--on", "Mistral", "--desk", "Altiplano:Owner").stdout)
-            w.wait(lambda: w.lease("Mistral", rid).get("state") == "granted", 15, "remote grant " + name)
+            # The order may arrive before the grant or while the lease queues behind a busy machine; either way the
+            # dispatcher starts it only once granted, and then refuses it.
             w.res("Altiplano", "run", "--lease", rid, "--on", "Mistral", "--", *argv)
-            w.wait(lambda: w.lease("Mistral", rid).get("state") == "refused", 15, "remote refusal " + name)
+            w.wait(lambda: w.lease("Mistral", rid).get("state") == "refused", 45, "remote refusal " + name)
             self.assertFalse(w.state("Mistral", rid + ".run.json").exists(), name)
             remote[name] = w.lease("Mistral", rid).get("answer", "")[:100]
+            rids.append(rid)
         self.assertFalse((w.root / "marker-remote.txt").exists())
-        self.assertEqual(w.logtext("Mistral").count("REFUSED"), len(cases))
+        measured("R8.remote_answers", remote)
+        self.assertEqual(w.logtext("Mistral").count("REFUSED"), len(cases), w.logtext("Mistral"))
+        self.assertEqual(len(set(rids)), len(cases), rids)          # five requests, five distinct lease ids
         w.wait(lambda: len([m for m in w.mail_matching("refused") if m["machine"] == "Mistral"]) == len(cases), 10, "refusal mails")
         measured("R8.remote_refusals", remote)
 
@@ -972,6 +978,39 @@ class T14Units(Base):
         self.assertEqual(probes.read_json(w.root / "half.json"), {})
         self.assertEqual(probes.read_json(w.root / "missing.json"), {})
 
+    def test_disk_attribution_by_machine_delta(self):
+        """A reader working in C: that reads from G: (Mistral): with no open files known, its bytes go to the disks by
+        what each moved, so G: gets them; before, its working folder put them on C: and capped them at C:'s 2.9 MB/s."""
+        import probes
+        probe = probes.DiskProbe.__new__(probes.DiskProbe)
+        probe.dims = {"disk:PhysicalDrive0": {"capacity": 150e6}, "disk:PhysicalDrive3": {"capacity": 150e6}}
+        probe.mounts = {"disk:PhysicalDrive0": ["G:"], "disk:PhysicalDrive3": ["C:", "I:"]}
+        r = probes.Reading(1)
+        r.disk_rate = 124.4e6
+        r.paths = []                                    # Windows: open files are not read; the working folder is not used
+        use = probe.tree([r], 1.0, {"disk:PhysicalDrive0": 126e6, "disk:PhysicalDrive3": 2.9e6})
+        measured("units.disk_attribution", {d: round(v / 1e6, 1) for d, v in use.items()})
+        self.assertGreater(use["disk:PhysicalDrive0"], 115e6)
+        self.assertLess(use["disk:PhysicalDrive3"], 3e6)
+
+    def test_gpu_attribution(self):
+        """GPU use belongs to a tree only through its own compute processes; WDDM's [N/A] memory included."""
+        import probes
+        probe = probes.NvidiaProbe.__new__(probes.NvidiaProbe)
+        probe.exe = "nvidia-smi"
+        rows = {"gpu": [["0", "GPU-1", "NVIDIA GeForce RTX 3060", "84", "10185", "12288"]],
+                "apps": [["GPU-1", "111", "[N/A]"]]}
+        probe._run = lambda args: rows["gpu"] if "--query-gpu" in args[0] else rows["apps"]
+        probe.dims, probe.gpus, probe.apps, probe.users, probe.vram_per_process = {}, {}, {}, {}, True
+        probe._query()
+        other, ollama = probes.Reading(222), probes.Reading(111)
+        quiet = probe.tree([other], 1.0, {})
+        busy = probe.tree([ollama], 1.0, {})
+        measured("units.gpu_attribution", {"trial_without_gpu": quiet, "tree_holding_ollama": {k: round(v) for k, v in busy.items()}})
+        self.assertEqual(quiet, {"vram:0": 0.0, "gpu:0": 0.0})
+        self.assertEqual(round(busy["gpu:0"]), 84)
+        self.assertGreater(busy["vram:0"], 10e9)
+
     def test_disk_cap(self):
         import probes
         probe = probes.DiskProbe.__new__(probes.DiskProbe)
@@ -1058,7 +1097,7 @@ class T14Units(Base):
             Fake(base + 304, base + 302, "conhost.exe", ["conhost.exe", "0x4"], 300, mark),
             # a long Start-Sleep: the pair alone
             Fake(base + 311, base + 1, "cmd.exe", ps_wrapper, 300, mark),
-            Fake(base + 312, base + 311, "powershell.exe", ps_host, 300, mark),
+            Fake(base + 312, base + 311, "powershell.exe", ps_host, 300, dict(mark, CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT="Start-Sleep  150")),
             # Git Bash kept by the Bash tool, its parent chain not reaching claude.exe; an MSYS fork of bash, then
             # sleep.exe whose environment cannot be read
             Fake(base + 401, 77, "bash.exe", git_bash, 3000, mark),
@@ -1109,6 +1148,7 @@ class T14Units(Base):
         self.assertEqual(seen[402]["how"], "command of a persistent tool shell")
         self.assertEqual(seen[601]["how"], "backgrounded, its tool shell gone")
         self.assertEqual(seen[801]["commands"][0], "date +%T; sleep 150; date +%T")
+        self.assertEqual(seen[311]["commands"][0], "Start-Sleep 150")   # from CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT
         self.assertIn("ended between two scans", seen[701].get("note", ""))
         ended = [r for r in rows if r["event"] == "ended"]
         self.assertTrue(ended and all(r.get("session") is not None for r in ended))

@@ -137,16 +137,11 @@ def disk_bytes(proc: psutil.Process):
 
 
 def process_paths(proc: psutil.Process) -> list:
-    """The paths a process has open plus its working folder: where its disk bytes probably go."""
+    """The files a process has open: where its disk bytes go. Not its working folder, which says nothing about that (a
+    reader in C: reading from G: was put on C: and capped at C:'s rate, Mistral 2026-09-28). Nothing on Windows, where
+    psutil's open_files() can stall for a long time on pipe handles (the 10-second trial kill never came, Moosfels)."""
     paths = []
-    try:
-        paths.append(proc.cwd())
-    except (psutil.Error, OSError):
-        pass
     if sys.platform == "win32":
-        # psutil's open_files() on Windows queries every handle and can stall for a long time on pipe handles; on
-        # Moosfels a trial sample took so long that the 10-second kill never came (2026-09-27). The working folder
-        # is all Windows gets.
         return paths
     try:
         paths.extend(f.path for f in proc.open_files())
@@ -359,7 +354,9 @@ class DiskProbe(Probe):
                 dev = self.device_of(path)
                 if dev:
                     devices.add(dev)
-        candidates = sorted(devices) if devices else sorted(self.dims)
+        # Known open files decide the disks; otherwise the bytes are spread over all disks by what each physically
+        # moved in the same interval, which puts a reader of G: on G: even when it runs in C:.
+        candidates = sorted(devices) if devices and sum(system.get(d, 0.0) for d in devices) > 0 else sorted(self.dims)
         weights = {d: system.get(d, 0.0) for d in candidates}
         wsum = sum(weights.values())
         # A tree cannot move more physical bytes than the disks did: Windows' per-process counters include reads
@@ -445,6 +442,7 @@ class NvidiaProbe(Probe):
             self.exe = str(candidate) if candidate.is_file() else None
         self.gpus = {}
         self.apps = {}
+        self.users = {}
         self.vram_per_process = True
         if not self.exe:
             return
@@ -472,16 +470,18 @@ class NvidiaProbe(Probe):
             gpus[row[0]] = {"name": row[2], "util": util or 0.0, "used": (used or 0.0) * MIB, "total": (total or 0.0) * MIB}
             uuids[row[1]] = row[0]
         apps = {}
+        users = {}
         known = True
         for row in self._run(["--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"]):
             if len(row) < 3 or row[0] not in uuids or not row[1].isdigit():
                 continue
+            users.setdefault(uuids[row[0]], set()).add(int(row[1]))
             mem = _number(row[2])
             if mem is None:
-                known = False
+                known = False                     # WDDM drivers report [N/A]; which pids use the GPU is still known
                 continue
             apps.setdefault(uuids[row[0]], {})[int(row[1])] = mem * MIB
-        self.gpus, self.apps, self.vram_per_process = gpus, apps, known
+        self.gpus, self.apps, self.users, self.vram_per_process = gpus, apps, users, known
 
     def system(self, dt):
         self._query()
@@ -492,14 +492,29 @@ class NvidiaProbe(Probe):
         return use
 
     def tree(self, readings, dt, system):
+        """A tree's GPU use comes only from its own processes on the card (nvidia-smi's compute apps), never from the
+        machine's total: a trial on Mistral otherwise asked for 84 % of a GPU it did not touch, because Ollama was busy.
+        With per-process memory: that memory, and utilisation split by memory share. Without (WDDM): a tree holding a
+        compute process gets the card's figures, split evenly among the processes on it; a tree holding none gets 0."""
         pids = {r.pid for r in readings}
         result = {}
         for index, info in self.gpus.items():
+            users = self.users.get(index, set())
+            on_card = users & pids
+            if not on_card:
+                result["vram:" + index] = 0.0
+                result["gpu:" + index] = 0.0
+                continue
             apps = self.apps.get(index, {})
-            mine = sum(mem for pid, mem in apps.items() if pid in pids)
-            everyone = sum(apps.values())
-            result["vram:" + index] = mine
-            result["gpu:" + index] = info["util"] * (mine / everyone) if everyone > 0 else 0.0
+            if apps and all(pid in apps for pid in users):
+                mine = sum(apps[pid] for pid in on_card)
+                everyone = sum(apps.values())
+                result["vram:" + index] = mine
+                result["gpu:" + index] = info["util"] * (mine / everyone) if everyone > 0 else 0.0
+            else:
+                share = len(on_card) / max(1, len(users))
+                result["vram:" + index] = info["used"] * share
+                result["gpu:" + index] = info["util"] * share
         return result
 
 
@@ -568,7 +583,7 @@ class Meter:
     def system_only(self) -> set:
         dims = set()
         for probe in self.probes:
-            if probe.system_only or (isinstance(probe, NvidiaProbe) and not probe.vram_per_process):
+            if probe.system_only:
                 dims.update(probe.dims)
         return dims
 

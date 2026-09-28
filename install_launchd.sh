@@ -11,7 +11,7 @@ set -euo pipefail
 LABEL="com.goocy.leaseresources"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOGDIR="$HOME/Library/Logs/LeaseResources"             # machine-local since 2026-09-28 (nothing rewritten in ResilioSync)
+LOGDIR="$DIR/logs"
 LOG="$LOGDIR/launchd.log"
 VENV="$HOME/venvs/LeaseResources"
 PYTHON="$VENV/bin/python"

@@ -347,12 +347,21 @@ def log(machine: str, message: str) -> None:
 
 
 def new_id(prefix: str, machine: str, folder: Path) -> str:
-    stamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    base = prefix + stamp + "-" + machine
+    """<prefix><yymmdd-HHMMSS><mmm>-<Machine>: milliseconds included, because a request sent to another machine leaves
+    the inbox once taken, so the folder alone cannot tell a new id from one used a moment ago (two requests in one
+    second got one id, 2026-09-28). A local record of ids sent to other machines covers the rest."""
+    now = datetime.datetime.now()
+    base = prefix + now.strftime("%y%m%d-%H%M%S") + "%03d" % (now.microsecond // 1000) + "-" + machine
+    sent = LOCAL_DIR / "sent_ids.json"
+    used = read_json(sent)
     ident, n = base, 1
-    while (folder / (ident + ".json")).exists():
+    while (folder / (ident + ".json")).exists() or ident in used:
         n += 1
         ident = base + "-" + str(n)
+    if prefix == "L":
+        used = {k: v for k, v in used.items() if age_of(v) < 86400}
+        used[ident] = now_iso()
+        write_json(sent, used)
     return ident
 
 
@@ -2389,6 +2398,9 @@ class Dispatcher:
             if env.get("CLAUDECODE") == "1":
                 found = {"session": env.get("CLAUDE_CODE_SESSION_ID", ""), "claude_pid": env.get("CLAUDE_PID", ""),
                          "leased": bool(env.get("LEASERES_LEASE"))}
+                launcher = env.get("CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT", "")
+                if launcher:                          # the PowerShell tool keeps the command it runs here
+                    found["command"] = " ".join(launcher.split())[:300]
             self.env_cache[key] = found
         found = self.env_cache[key]
         if any_marker or not found or not found.get("leased"):
@@ -2581,7 +2593,10 @@ class Dispatcher:
                     if any(self.ignored(c) for c in commands):
                         continue
                     real = [cmd_of(d) for d in descendants if not tool_shell(d) and name_of(d).casefold() not in ignore_names]
-                    asked = tool_command(cmd) or next((tool_command(cmd_of(d)) for d in descendants if tool_command(cmd_of(d))), "")
+                    asked = tool_command(cmd) or next((tool_command(cmd_of(d)) for d in descendants if tool_command(cmd_of(d))), "") \
+                        or next((self.claude_env(info[d][0], key_of(d), any_marker=True).get("command", "")
+                                 for d in [pid] + descendants
+                                 if self.claude_env(info[d][0], key_of(d), any_marker=True).get("command")), "")
                     listed = ([asked[:300]] if asked else []) + [c[:300] for c in real[:4] if not asked or asked not in c]
                     record = {"how": "tool shell", "claude_pid": real_parent(pid), "cwd_pid": pid,
                               "session": session_of([pid] + descendants), "shell": cmd[-160:],
