@@ -177,6 +177,7 @@ class Probe:
         self.config = config
         self.local_dir = local_dir
         self.dims = {}
+        self.learnable = set()           # dimensions whose capacity is learned (not configured), so it may rise
 
     def system(self, dt: float) -> dict:
         return {}
@@ -313,6 +314,7 @@ class DiskProbe(Probe):
                     capacity = float(configured[alias])
             if capacity is None:
                 capacity = max(default, float(learned.get(dim, 0)))
+                self.learnable.add(dim)
             label = ", ".join(kept[:3]) + (" ..." if len(kept) > 3 else "")
             self.dims[dim] = {"capacity": capacity, "label": label, "aliases": aliases}
             self.mounts[dim] = kept
@@ -405,6 +407,7 @@ class NetProbe(Probe):
                 capacity = st.speed * 125000.0
             else:
                 capacity = max(default, float(learned.get(dim, 0)))
+                self.learnable.add(dim)
             self.dims[dim] = {"capacity": capacity, "label": (str(st.speed) + " Mbit/s link" if st.speed else "link speed unknown"),
                               "aliases": [name]}
         self.prev = psutil.net_io_counters(pernic=True) or {}
@@ -536,9 +539,13 @@ PROBES = [CpuProbe, RamProbe, DiskProbe, NvidiaProbe, NetProbe, FileProbe]
 class Meter:
     """Samples every probe: the machine's use of every dimension, and the use of named process trees."""
 
-    def __init__(self, config: dict, local_dir: Path):
+    def __init__(self, config: dict, local_dir: Path, first_sample_rates: bool = True):
+        """first_sample_rates: give a process first seen in this sample its whole life's average as its rate (right
+        for a 10-second trial, where short commands matter); the dispatcher turns it off, because a program's start-up
+        burst averaged over a fraction of a second read as 1.45 cores for a sleeping job (Teppich, 2026-09-27)."""
         self.config = config
         self.local_dir = local_dir
+        self.first_sample_rates = first_sample_rates
         self.probes = []
         for cls in PROBES:
             try:
@@ -604,7 +611,7 @@ class Meter:
                 reading.cpu_rate = max(0.0, (cpu - before[1]) / span)
                 if disk is not None and before[2] is not None:
                     reading.disk_rate = max(0.0, (disk - before[2]) / span)
-        elif ctime > self.last_wall - 0.5:
+        elif self.first_sample_rates and ctime > self.last_wall - 0.5:
             span = max(0.05, time.time() - ctime)        # born since the last sample: its whole life so far
             reading.cpu_rate = cpu / span
             reading.disk_rate = (disk or 0) / span
@@ -648,6 +655,18 @@ class Meter:
         self.last = now
         self.last_wall = time.time()
         return system, per_tree
+
+    def raise_learned(self, learned: dict) -> list:
+        """Raise learned capacities to the highest rate seen, in place, so a running dispatcher uses them at once (it
+        used to see a rise only after a restart; `res now` builds a new meter and always saw it)."""
+        raised = []
+        for probe in self.probes:
+            for dim in probe.learnable:
+                value = float(learned.get(dim, 0))
+                if dim in probe.dims and value > probe.dims[dim]["capacity"]:
+                    probe.dims[dim]["capacity"] = value
+                    raised.append(dim)
+        return raised
 
     def disk_busy(self) -> dict:
         for probe in self.probes:

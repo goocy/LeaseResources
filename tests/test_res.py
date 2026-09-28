@@ -463,7 +463,7 @@ class T1TrialKill(Base):
         t0 = time.monotonic()
         run = w.res("Altiplano", "trial", "--json", "--", PYTHON, str(script), str(pids_file), str(gpu), cwd=w.root, timeout=60)
         wall = time.monotonic() - t0
-        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.returncode, 3, run.stderr)          # cut off: lease needed
         record = json.loads(run.stdout)
         pids = json.loads(pids_file.read_text())
         everyone = set(pids["all"]) | set(pids.get("all2", [])) | {pids[k] for k in "abcdef"} | {pids["main"]}
@@ -490,9 +490,11 @@ class T1TrialKill(Base):
         w.stop()
 
     def test_quick_command_finishes(self):
-        w = World("trial-quick")
+        w = World("trial-quick", {"file_dimensions": {"gpu:VeryLongSimulatedName0": {"capacity": 100, "file": "/nonexistent.json"}}})
         run = w.res("Altiplano", "trial", "--", PYTHON, "-c", "print('quick')")
         self.assertEqual(run.returncode, 0, run.stderr)
+        long_line = [l for l in run.stdout.splitlines() if "gpu:VeryLongSimulatedName0" in l][0]
+        self.assertIn("gpu:VeryLongSimulatedName0  ", long_line, "a long dimension name must not run into its value")
         self.assertIn("no lease needed", run.stdout)
         self.assertIn("quick", run.stdout)
         first = run.stdout.splitlines()[0]
@@ -862,7 +864,7 @@ class T13TrialWatchdog(Base):
         t0 = time.monotonic()
         run = w.res("Altiplano", "trial", "--json", "--", PYTHON, str(script), str(pids_file), cwd=w.root, timeout=40)
         wall = time.monotonic() - t0
-        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.returncode, 3, run.stderr)          # cut off: lease needed
         record = json.loads(run.stdout)
         time.sleep(0.5)
         survivors = [p for p in psutil.process_iter(["cmdline"]) if "time.sleep(60)" in " ".join(p.info.get("cmdline") or [])
@@ -1117,6 +1119,40 @@ class T16StableRecords(Base):
         self.assertEqual(len(seen), 1, seen)
         self.assertEqual(len(ended), 1, ended)
         self.assertGreaterEqual(ended[0]["lifetime"], 14)
+
+
+class T17Teppich(Base):
+    """Teppich's notes: no start-up burst in the dispatcher's rates, learned capacities rising in a running meter."""
+
+    def test_first_sample_rates(self):
+        import probes
+        burner = subprocess.Popen([PYTHON, "-c", "import time\nend = time.time() + 0.4\nwhile time.time() < end: pass\ntime.sleep(5)"])
+        try:
+            time.sleep(0.6)
+            proc = psutil.Process(burner.pid)
+            config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"]}
+            quiet = probes.Meter(config, Path(tempfile.mkdtemp()), first_sample_rates=False)
+            eager = probes.Meter(config, Path(tempfile.mkdtemp()))
+            quiet.last_wall = eager.last_wall = time.time() - 10.0      # the burner was born after the 'last sample'
+            q = quiet.sample({"t": [proc]})[1]["t"]["cpu"]
+            e = eager.sample({"t": [proc]})[1]["t"]["cpu"]
+            measured("teppich.first_sample_cpu", {"dispatcher": round(q, 2), "trial": round(e, 2)})
+            self.assertEqual(q, 0.0)
+            self.assertGreater(e, 0.05)                  # its life's average: 0.4 s of cpu over its age
+        finally:
+            burner.kill()
+
+    def test_learned_capacity_rises_in_a_running_meter(self):
+        import probes
+        config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"], "disk_default_bytes_per_s": 150e6}
+        meter = probes.Meter(config, Path(tempfile.mkdtemp()), first_sample_rates=False)
+        disks = [d for d in meter.dimensions() if d.startswith("disk:")]
+        if not disks:
+            self.skipTest("no disk dimension here")
+        raised = meter.raise_learned({disks[0]: 322e6})
+        measured("teppich.learned_raise", {disks[0]: meter.dimensions()[disks[0]]["capacity"]})
+        self.assertEqual(raised, [disks[0]])
+        self.assertEqual(meter.dimensions()[disks[0]]["capacity"], 322e6)
 
 
 def main():

@@ -730,11 +730,12 @@ def cmd_mine(args, config: dict) -> None:
     after = counters()
     use = per.get("mine", {})
     print("Claude session process " + str(root.pid) + ", " + str(len(procs)) + " processes in its tree:")
+    width = max([len(d) for d in list(use) + list(meter.system_only())] + [10]) + 2
     for dim in sorted(use):
         if use[dim] > 0:
-            print("  " + dim.ljust(14) + human(use[dim], kind_of(dim)) + "   (machine: " + human(system.get(dim, 0.0), kind_of(dim)) + ")")
+            print("  " + dim.ljust(width) + human(use[dim], kind_of(dim)) + "   (machine: " + human(system.get(dim, 0.0), kind_of(dim)) + ")")
     for dim in sorted(meter.system_only()):
-        print("  " + dim.ljust(14) + "not measurable per process (machine: " + human(system.get(dim, 0.0), kind_of(dim)) + ")")
+        print("  " + dim.ljust(width) + "not measurable per process (machine: " + human(system.get(dim, 0.0), kind_of(dim)) + ")")
     rows = [["pid", "age", "cpu (cores)", "ram", "disk", "command"]]
     now = time.time()
     for proc in procs:
@@ -777,13 +778,19 @@ def session_tree_pids(proc) -> list:
 WIN_CREATE_SUSPENDED = 0x4
 
 
-def trial_exit() -> None:
-    """End a trial now. On Windows a probe's native thread that hangs (psutil did) must not keep res alive after the
-    answer is printed, so the process exits hard once its output is flushed."""
+TRIAL_CUT_OFF = 3                                       # exit code of `res trial` when the command needed a lease
+
+
+def trial_exit(code: int = 0) -> None:
+    """End a trial: exit code 0 when the command finished inside the limit, TRIAL_CUT_OFF (3) when it was cut off and
+    needs a lease. On Windows the process exits hard once its output is flushed, so a probe's hung native thread (psutil
+    did hang) cannot keep res alive."""
     sys.stdout.flush()
     sys.stderr.flush()
     if sys.platform == "win32":
-        os._exit(0)
+        os._exit(code)
+    if code:
+        sys.exit(code)
 
 
 def _win_kernel():
@@ -980,7 +987,7 @@ def cmd_trial(args, config: dict) -> None:
     write_json(folder / (ident + ".json"), record)
     if args.json:
         print(json.dumps(record, indent=1))
-        trial_exit()
+        trial_exit(0 if finished else TRIAL_CUT_OFF)
         return
     if finished:
         print("Finished in " + format(elapsed, ".1f") + " s with exit code " + str(exit_code) + ": no lease needed."
@@ -996,12 +1003,14 @@ def cmd_trial(args, config: dict) -> None:
             print("  | " + line)
     print("Profile " + ident + " (peak / mean):")
     dims = meter.dimensions()
+    width = max([len(d) for d in profile] + [10]) + 2
     for dim in sorted(profile, key=lambda d: (list(dims).index(d) if d in dims else 99, d)):
         mark = "  (machine delta, not per process)" if dim in system_only else ""
-        print("  " + dim.ljust(14) + human(profile[dim]["peak"], kind_of(dim)) + " / " + human(profile[dim]["mean"], kind_of(dim)) + mark)
+        print("  " + dim.ljust(width) + human(profile[dim]["peak"], kind_of(dim)) + " / " + human(profile[dim]["mean"], kind_of(dim)) + mark)
     if not finished:
-        print("For the full run: " + res_command() + " request --profile " + ident + " --for <duration> --why \"...\"")
-    trial_exit()
+        print("For the full run: " + res_command() + " request --profile " + ident + " --for <duration> --why \"...\""
+              + "   (exit code " + str(TRIAL_CUT_OFF) + ": cut off, lease needed)")
+    trial_exit(0 if finished else TRIAL_CUT_OFF)
 
 
 # ---------------------------------------------------------------- request, extend, release
@@ -1533,7 +1542,7 @@ class Dispatcher:
         self.machine = this_machine(config)
         self.folder = machine_dir(self.machine)
         self.folder.mkdir(parents=True, exist_ok=True)
-        self.meter = probes.Meter(config, LOCAL_DIR)
+        self.meter = probes.Meter(config, LOCAL_DIR, first_sample_rates=False)
         self.window = collections.deque()             # (monotonic time, {dim: unleased})
         self.last_system = {}
         self.last_measured = {}                       # lease id -> {dim: use}
@@ -1610,6 +1619,9 @@ class Dispatcher:
             if kind_of(dim) in ("disk", "net") and value > float(self.learned.get(dim, 0)):
                 self.learned[dim] = value
                 self.learned_dirty = True
+        if self.learned_dirty:
+            for dim in self.meter.raise_learned(self.learned):
+                log(self.machine, "learned capacity of " + dim + " raised to " + human(self.learned[dim], kind_of(dim)))
 
     # -- admission
     def limits(self) -> dict:
