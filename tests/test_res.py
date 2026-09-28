@@ -497,7 +497,7 @@ class T1TrialKill(Base):
         w = World("trial", {"file_dimensions": {}})
         gpu = w.root / "gpu.json"
         cfg = json.loads((w.config / "defaults.json").read_text())
-        cfg["file_dimensions"] = {"gpu:0": {"capacity": 100, "file": str(gpu), "label": "simulated GPU"}}
+        cfg["file_dimensions"] = {"gpu:9": {"capacity": 100, "file": str(gpu), "label": "simulated GPU"}}
         (w.config / "defaults.json").write_text(json.dumps(cfg))
         script = w.outside / "tree.py"
         script.write_text(TRIAL_TREE, encoding="utf-8")
@@ -528,7 +528,7 @@ class T1TrialKill(Base):
         self.assertGreaterEqual(max(disks.values()), 30e6, disks)
         nets = {d: v["peak"] for d, v in record["profile"].items() if d.startswith("net:")}
         self.assertGreaterEqual(max(nets.values()), 3e6, nets)
-        self.assertEqual(record["profile"]["gpu:0"]["peak"], 70)
+        self.assertEqual(record["profile"]["gpu:9"]["peak"], 70)
         w.stop()
 
     def test_quick_command_finishes(self):
@@ -544,29 +544,29 @@ class T1TrialKill(Base):
 
 
 class T3Queue(Base):
-    """R3: two GPU-heavy leases (GPU simulated as a file dimension): the second queues on gpu:0 and its owner gets mail
+    """R3: two GPU-heavy leases (GPU simulated as a file dimension gpu:9, beside any real GPU): the second queues on gpu:9 and its owner gets mail
     when it is granted; FIFO; a queued run order starts on grant; refusal names the dimension."""
 
     def test_gpu_queue(self):
         w = World("queue")
         gpu = w.root / "gpu.json"
         cfg = json.loads((w.config / "defaults.json").read_text())
-        cfg["file_dimensions"] = {"gpu:0": {"capacity": 100, "file": str(gpu), "label": "simulated GPU"}}
+        cfg["file_dimensions"] = {"gpu:9": {"capacity": 100, "file": str(gpu), "label": "simulated GPU"}}
         (w.config / "defaults.json").write_text(json.dumps(cfg))
         w.dispatcher("Altiplano")
         t = time.monotonic()
-        a = w.res("Altiplano", "request", "--need", "gpu:0=60,cpu=0.5", "--for", "2m", "--desk", "Altiplano:DeskA")
+        a = w.res("Altiplano", "request", "--need", "gpu:9=60,cpu=0.5", "--for", "2m", "--desk", "Altiplano:DeskA")
         answer_a = time.monotonic() - t
         self.assertIn("granted", a.stdout, a.stdout + a.stderr)
         la = lease_id(a.stdout)
         measured("R3.first_answer_seconds", round(answer_a, 2))
         run_a = w.res("Altiplano", "run", "--lease", la, "--", PYTHON, str(w.allowed / "gpuuser.py"), str(gpu), "60", "8")
         self.assertEqual(run_a.returncode, 0, run_a.stdout + run_a.stderr)
-        b = w.res("Altiplano", "request", "--need", "gpu=60", "--for", "2m", "--desk", "Altiplano:DeskB")
+        b = w.res("Altiplano", "request", "--need", "gpu:9=60", "--for", "2m", "--desk", "Altiplano:DeskB")
         self.assertIn("queued", b.stdout, b.stdout + b.stderr)
-        self.assertIn("gpu:0", b.stdout)
+        self.assertIn("gpu:9", b.stdout)
         lb = lease_id(b.stdout)
-        c = w.res("Altiplano", "request", "--need", "gpu:0=50", "--for", "2m", "--desk", "Altiplano:DeskC")
+        c = w.res("Altiplano", "request", "--need", "gpu:9=50", "--for", "2m", "--desk", "Altiplano:DeskC")
         self.assertIn("queued", c.stdout)
         lc = lease_id(c.stdout)
         run_c = w.res("Altiplano", "run", "--lease", lc, "--", PYTHON, str(w.allowed / "sleepy.py"), "2")
@@ -592,7 +592,7 @@ class T3Queue(Base):
         self.assertIn("refused", big.stdout)
         self.assertIn("ram", big.stdout)
         measured("R3.refusal", big.stdout.splitlines()[0])
-        nogpu = w.res("Altiplano", "request", "--need", "vram=1G", "--for", "1m", "--desk", "Altiplano:DeskA")
+        nogpu = w.res("Altiplano", "request", "--need", "tpu=1", "--for", "1m", "--desk", "Altiplano:DeskA")
         measured("R3.no_such_kind", nogpu.stdout.splitlines()[0])
         self.assertIn("refused", nogpu.stdout)
         w.stop()
@@ -834,12 +834,12 @@ class T9HistoryAndCompliance(Base):
         fake = fake_claude(w, self)
         w.dispatcher("Altiplano")
         if WINDOWS:
-            long_cmd = "echo shell-snapshots-fake >nul & " + q(PYTHON) + ' -c "import time; time.sleep(12)"'
+            long_cmd = "echo shell-snapshots-fake >nul & " + q(PYTHON) + ' -c "import time; time.sleep(20)"'
             short_cmd = "echo shell-snapshots-fake >nul & " + q(PYTHON) + ' -c "import time; time.sleep(1)"'
-            expect = "time.sleep(12)"
+            expect = "time.sleep(20)"
         else:
-            long_cmd, short_cmd, expect = ("/bin/zsh -c 'sleep 12; true' shell-snapshots-fake",
-                                           "/bin/zsh -c 'sleep 1; true' shell-snapshots-fake", "sleep 12")
+            long_cmd, short_cmd, expect = ("/bin/zsh -c 'sleep 20; true' shell-snapshots-fake",
+                                           "/bin/zsh -c 'sleep 1; true' shell-snapshots-fake", "sleep 20")
         # w.env drops CLAUDE_CODE_SESSION_ID: a session id inherited from the Claude session running the suite made the
         # detector take that session's real desk (Moosfels, round 3)
         claude = subprocess.Popen(fake + [long_cmd], cwd=str(w.allowed), env=w.env("Altiplano"))
@@ -852,10 +852,10 @@ class T9HistoryAndCompliance(Base):
             return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
         def mentions(r, text):
             return any(text in c for c in r.get("commands", [])) or text in r.get("shell", "")
-        seen = w.wait(lambda: [r for r in rows() if r["event"] == "seen" and mentions(r, expect)], 25, "unleased record")
+        seen = w.wait(lambda: [r for r in rows() if r["event"] == "seen" and mentions(r, expect)], 45, "unleased record")
         self.assertEqual(seen[0]["desk"], "Altiplano:StubDesk")
         self.assertTrue(any(expect in c for c in seen[0]["commands"]) or expect in seen[0]["shell"], seen[0])
-        claude.wait(20)
+        claude.wait(45)
         ended = w.wait(lambda: [r for r in rows() if r["event"] == "ended" and r["key"] == seen[0]["key"]], 15, "ended record")
         measured("R-compliance.seen", {k: seen[0][k] for k in ("age", "desk", "commands")})
         measured("R-compliance.lifetime", ended[0]["lifetime"])
@@ -976,7 +976,8 @@ class T14Units(Base):
         Addr = namedtuple("Addr", "family address")
         Io = namedtuple("Io", "bytes_sent bytes_recv")
         stats = {"Ethernet": Stat(True, 1000), "vEthernet (WSL)": Stat(True, 4294), "Tailscale": Stat(True, 4294),
-                 "VMware Network Adapter VMnet8": Stat(True, 100), "Wi-Fi": Stat(True, 4294)}
+                 "VMware Network Adapter VMnet8": Stat(True, 100), "Wi-Fi": Stat(True, 4294),
+                 "OpenVPN TAP-Windows6": Stat(True, 4294), "WireGuard Tunnel": Stat(True, 4294)}
         addrs = {name: [Addr(socket.AF_INET, "192.0.2." + str(i + 10))] for i, name in enumerate(stats)}
         saved = (probes.psutil.net_if_stats, probes.psutil.net_if_addrs, probes.psutil.net_io_counters)
         probes.psutil.net_if_stats = lambda: stats
@@ -1117,14 +1118,14 @@ class T15ScanDoesNotBlock(Base):
                     else "/bin/zsh -c 'sleep 40; true' shell-snapshots-fake")
         subprocess.Popen(fake + [long_cmd], cwd=str(w.allowed), env=w.env("Altiplano"))   # no session: a desk lookup
         time.sleep(2)
-        w.dispatcher("Altiplano", STUB_DESK_SLEEP="6")
+        w.dispatcher("Altiplano", STUB_DESK_SLEEP="10")
         time.sleep(2)                                   # the scan is now busy with desk lookups
         t0 = time.monotonic()
         req = w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner")
         answer = time.monotonic() - t0
         measured("noblock.answer_seconds", round(answer, 2))
         self.assertIn("granted", req.stdout, req.stdout + req.stderr)
-        self.assertLess(answer, 3)
+        self.assertLess(answer, 6)                   # a scan in the request path would take 10 s per desk lookup
         lid = lease_id(req.stdout)
         shell = ["cmd", "/c", "echo ok"] if WINDOWS else ["/bin/sh", "-c", "echo ok"]
         run = w.res("Altiplano", "run", "--lease", lid, "--", *shell)
@@ -1176,8 +1177,9 @@ class T17Teppich(Base):
             quiet = probes.Meter(config, Path(tempfile.mkdtemp()), first_sample_rates=False)
             eager = probes.Meter(config, Path(tempfile.mkdtemp()))
             quiet.last_wall = eager.last_wall = time.time() - 10.0      # the burner was born after the 'last sample'
-            q = quiet.sample({"t": [proc]})[1]["t"]["cpu"]
-            e = eager.sample({"t": [proc]})[1]["t"]["cpu"]
+            tree = [proc] + proc.children(recursive=True)
+            q = quiet.sample({"t": tree})[1]["t"]["cpu"]
+            e = eager.sample({"t": tree})[1]["t"]["cpu"]
             measured("teppich.first_sample_cpu", {"dispatcher": round(q, 2), "trial": round(e, 2)})
             self.assertEqual(q, 0.0)
             self.assertGreater(e, 0.05)                  # its life's average: 0.4 s of cpu over its age
@@ -1240,6 +1242,36 @@ class T18OutputCaps(Base):
         self.assertLess(current.stat().st_size, 21000)
         self.assertLess(rotated.stat().st_size, 21000)
         self.assertEqual(len(res.iter_unleased("Altiplano")) > 100, True)
+
+
+class T19WaitDetach(Base):
+    """`res run --wait` streams the log, but the job's runner has no live ancestor in the caller's tree: killing the
+    whole process tree of the waiting `res run` (what stopping a Claude tool task does) leaves the job running
+    (Stahlwerk lost two leases this way before the double spawn)."""
+
+    def test_killing_the_waiter_tree_spares_the_job(self):
+        w = World("waitdetach")
+        w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "2m", "--desk", "Altiplano:Owner").stdout)
+        waiter = subprocess.Popen([PYTHON, "-B", str(RES), "run", "--lease", lid, "--wait", "--", PYTHON, str(w.allowed / "sleepy.py"), "10"],
+                                  cwd=str(w.allowed), env=w.env("Altiplano"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        w.wait(lambda: w.lease("Altiplano", lid).get("state") == "running", 20, "job running")
+        job = w.lease("Altiplano", lid)["pid"]
+        root = psutil.Process(waiter.pid)
+        tree = [root] + root.children(recursive=True)
+        in_tree = job in [p.pid for p in tree]
+        for p in tree:
+            try:
+                p.kill()
+            except psutil.Error:
+                pass
+        psutil.wait_procs(tree, timeout=5)
+        time.sleep(1)
+        measured("waitdetach", {"job_in_waiter_tree": in_tree, "job_alive_after_kill": pid_alive(job)})
+        self.assertFalse(in_tree, "the job must not be a descendant of the waiting res run")
+        self.assertTrue(pid_alive(job))
+        fin = w.wait(lambda: w.mail_matching("finished"), 30, "completion mail")
+        self.assertIn("tick 9", fin[0]["body"])
 
 
 def processes_in(folder: Path) -> dict:

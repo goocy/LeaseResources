@@ -43,7 +43,7 @@
   "disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/", "/Volumes/Recovery"],
   "net_default_bytes_per_s": 125000000,
   "net_capacity": {},
-  "net_skip": ["vethernet", "vmware", "virtualbox", "hyper-v", "tailscale", "zerotier", "npcap", "bluetooth", "loopback", "isatap", "teredo"],
+  "net_skip": ["vethernet", "vmware", "virtualbox", "hyper-v", "tailscale", "zerotier", "npcap", "bluetooth", "loopback", "isatap", "teredo", "proton", "wireguard", "openvpn", "tap-windows", "nordlynx", "mullvad", "utun"],
   "net_bogus_speeds_mbit": [4294, 4295],
   "file_dimensions": {},
 

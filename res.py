@@ -611,8 +611,11 @@ def notify(config: dict, machine: str, title: str, body: str) -> None:
         if sys.platform == "win32":
             encoded = base64.b64encode(WINDOWS_TOAST.encode("utf-16-le")).decode("ascii")
             env = dict(os.environ, LEASERES_TITLE=title, LEASERES_BODY=body)
-            subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], env=env,
-                           capture_output=True, timeout=30, creationflags=probes.no_window())
+            run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], env=env,
+                                 capture_output=True, timeout=30, creationflags=probes.no_window())
+            if run.returncode != 0:
+                log(machine, "WARN notification failed: powershell exit " + str(run.returncode) + ": "
+                    + " ".join(run.stderr.decode("utf-8", "replace").split())[:300])
         elif sys.platform == "darwin":
             cmd = ["osascript"]
             for line in MAC_NOTIFY:
@@ -694,7 +697,7 @@ def cmd_now(args, config: dict) -> None:
         unleased = max(0.0, use - measured)
         free = cap * headroom(config, dim) - unleased - planned.get(dim, 0.0)
         label = dims[dim].get("label", "")
-        if dim in busy:
+        if dim in busy and sys.platform != "win32":     # Windows' per-disk read/write times stay 0 (Stahlwerk): not shown
             label += "; busy " + format(busy[dim] * 100, ".0f") + " %"
         rows.append([dim, human(cap, kind), human(use, kind), human(planned.get(dim, 0.0), kind), human(unleased, kind),
                      human(max(0.0, free), kind), label])
@@ -1209,9 +1212,27 @@ def start_runner(machine: str, ident: str, program: list, cwd: str) -> subproces
     python = venv_python(windowless=True)
     if not python.exists():
         python = Path(sys.executable)
-    argv = [str(python), "-B", str(SCRIPT), "_runner", machine, ident, str(launch)]
-    return popen_detached(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          cwd=str(SERVICE_DIR), env=dict(os.environ, LEASERES_MACHINE=machine))
+    # Double spawn: a short-lived intermediate starts the runner and exits at once, so the runner never has a live
+    # ancestor in the caller's tree. Detaching flags alone were not enough: stopping a Claude tool task kills the tree
+    # through live parent pids, and `res run --wait` stayed the runner's parent (two leases lost on Stahlwerk).
+    argv = [str(python), "-B", str(SCRIPT), "_launch", machine, ident, str(launch)]
+    middle = popen_detached(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=str(SERVICE_DIR), env=dict(os.environ, LEASERES_MACHINE=machine))
+    try:
+        middle.wait(30)
+    except subprocess.TimeoutExpired:
+        pass
+    return middle
+
+
+def cmd_launch(args, config: dict) -> None:
+    """The intermediate of the double spawn: start the runner detached, then exit at once."""
+    python = venv_python(windowless=True)
+    if not python.exists():
+        python = Path(sys.executable)
+    argv = [str(python), "-B", str(SCRIPT), "_runner", args.machine, args.ident, args.launch]
+    popen_detached(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   cwd=str(SERVICE_DIR), env=dict(os.environ, LEASERES_MACHINE=args.machine))
 
 
 def cmd_run(args, config: dict) -> None:
@@ -1280,7 +1301,8 @@ def cmd_run(args, config: dict) -> None:
     print("The dispatcher mails " + lease.get("desk", "") + " when it ends, stalls, overruns or runs past "
           + human_duration(lease.get("duration")) + ". No need to poll.")
     if args.wait:
-        print("Waiting (interrupting this only stops the waiting, not the job)...")
+        print("Waiting (interrupting or stopping this only stops the waiting, not the job: the job's runner has no live"
+              " ancestor here)...")
         shown = 0
         while True:
             run = read_json(run_path)
@@ -2757,6 +2779,10 @@ def main() -> None:
     p.add_argument("--body", default="If you can read this, the dispatcher's notifications reach you.")
     sub.add_parser("dispatch")
     sub.add_parser("watch")
+    p = sub.add_parser("_launch")
+    p.add_argument("machine")
+    p.add_argument("ident")
+    p.add_argument("launch")
     p = sub.add_parser("_runner")
     p.add_argument("machine")
     p.add_argument("ident")
@@ -2765,7 +2791,7 @@ def main() -> None:
     config = load_config()
     handlers = {"now": cmd_now, "mine": cmd_mine, "trial": cmd_trial, "request": cmd_request, "extend": cmd_extend,
                 "release": cmd_release, "run": cmd_run, "leases": cmd_leases, "status": cmd_status,
-                "compliance": cmd_compliance, "notify-test": cmd_notify_test, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner}
+                "compliance": cmd_compliance, "notify-test": cmd_notify_test, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner, "_launch": cmd_launch}
     handlers[args.cmd](args, config)
 
 
