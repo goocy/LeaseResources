@@ -8,17 +8,20 @@
 #   ./install_launchd.sh uninstall # unload + remove the agent (leases/ and logs/ are left alone)
 set -euo pipefail
 
+# Under sudo, id -u returns 0 and there is no gui/0 domain: the bootstrap fails and every file created comes out root-owned.
+[[ $EUID -eq 0 ]] && { echo "Run this without sudo: launchctl needs your own GUI domain, and id -u returns 0 under sudo."; exit 1; }
+
 LABEL="com.goocy.leaseresources"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOGDIR="$DIR/logs"
+LOGDIR="$HOME/Library/Logs/LeaseResources"             # machine-local since 2026-09-28 (nothing rewritten in ResilioSync)
 LOG="$LOGDIR/launchd.log"
 VENV="$HOME/venvs/LeaseResources"
 PYTHON="$VENV/bin/python"
 mkdir -p "$LOGDIR"
 
 if [[ "${1:-}" == "uninstall" ]]; then
-    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/$LABEL" || true   # not loaded yet prints "No such process"; anything else is worth seeing
     rm -f "$PLIST"
     echo "Removed LaunchAgent $LABEL."
     exit 0
@@ -59,14 +62,14 @@ cat > "$PLIST" <<PLISTEOF
     <key>ThrottleInterval</key> <integer>60</integer>
     <key>ProcessType</key>      <string>Background</string>
 
-    <!-- Bootstrap output and tracebacks only; res.py writes logs/leaseresources.<machine>.<yyMMdd>.log itself. -->
+    <!-- Bootstrap output and tracebacks only; res.py writes ~/Library/Logs/LeaseResources/leaseresources.<machine>.<yyMMdd>.log itself. -->
     <key>StandardOutPath</key>  <string>$LOG</string>
     <key>StandardErrorPath</key><string>$LOG</string>
 </dict>
 </plist>
 PLISTEOF
 
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/$LABEL" || true   # not loaded yet prints "No such process"; anything else is worth seeing
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "Installed and loaded LaunchAgent $LABEL."
 echo "Runs : $PYTHON -B $DIR/res.py watch"
