@@ -693,9 +693,10 @@ def owner_desk(config: dict, given) -> str:
     except (OSError, subprocess.SubprocessError):
         out = ""
     for line in out.splitlines():
-        words = line.split()
-        if len(words) >= 2 and words[0] == "desk":
-            return words[1]
+        key, _, rest = line.strip().partition(" ")
+        desk = rest.partition("  (")[0].strip()      # desk names may contain spaces; a note in parentheses follows
+        if key == "desk" and desk:
+            return desk
     return this_machine(config) + ":General"
 
 
