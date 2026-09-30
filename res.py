@@ -684,20 +684,37 @@ def mail_env() -> dict:
 
 
 def owner_desk(config: dict, given) -> str:
-    """The desk that gets this lease's mail: --desk, else the calling session's desk from `mail.py whoami`."""
+    """The desk that gets this lease's mail: --desk, else the calling session's desk from `mail.py whoami --desk`, which
+    prints Machine:Desk alone. Parsing the human-readable `whoami` cut desk names at their first space (2026-09-30,
+    "Stahlwerk:Spaced Desk Name" became "Stahlwerk:Spaced", and its lease mail went to General)."""
     if given:
         return given.strip()
     try:
-        out = subprocess.run([sys.executable, "-B", mail_script(config), "whoami"], capture_output=True, text=True,
-                             timeout=30, creationflags=probes.no_window()).stdout
+        out = subprocess.run([sys.executable, "-B", mail_script(config), "whoami", "--desk"], capture_output=True,
+                             text=True, timeout=30, creationflags=probes.no_window()).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
-    for line in out.splitlines():
-        key, _, rest = line.strip().partition(" ")
-        desk = rest.partition("  (")[0].strip()      # desk names may contain spaces; a note in parentheses follows
-        if key == "desk" and desk:
-            return desk
+    desk = out.strip()
+    if ":" in desk and len(desk.splitlines()) == 1:
+        return desk
     return this_machine(config) + ":General"
+
+
+def desk_known(config: dict, desk: str) -> bool:
+    """Whether ClaudeMail has this Machine:Desk (its folder under mail/<Machine>/desks/, case and a leading 'yyMMdd '
+    date stamp ignored, as mail.py matches it). ClaudeMail refuses mail to any other desk."""
+    machine, _, name = desk.partition(":")
+    name = name.strip()
+    if len(name) > 7 and name[:6].isdigit() and name[6] == " ":
+        name = name[7:].strip()
+    root = Path(mail_script(config)).parent / "mail"
+    try:
+        for m in root.iterdir():
+            if m.name.casefold() == machine.strip().casefold():
+                return any(d.is_dir() and d.name.casefold() == name.casefold() for d in (m / "desks").iterdir())
+    except OSError:
+        pass
+    return False
 
 
 def send_mail(config: dict, machine: str, desk: str, subject: str, body: str) -> bool:
@@ -707,6 +724,10 @@ def send_mail(config: dict, machine: str, desk: str, subject: str, body: str) ->
     path.write_text(body, encoding="utf-8")
     ok = False
     for target in [desk, desk.partition(":")[0]]:
+        if target != desk:                            # the desk is gone or was never right: say where this was meant to go
+            path.write_text("(Meant for the desk " + desk + ", which ClaudeMail refused; delivered to this machine's"
+                            " General desk instead. See the LeaseResources log on " + machine + ".)\n\n" + body,
+                            encoding="utf-8")
         try:
             run = subprocess.run([sys.executable, "-B", mail_script(config), "send", "--to", target, "--subject", subject,
                                   "--body-file", str(path), "--to-own-desk"], capture_output=True, text=True, timeout=60,
@@ -1243,6 +1264,12 @@ def cmd_request(args, config: dict) -> None:
              "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "why": args.why or "", "need": need,
              "duration": duration, "state": "requested", "requested": now_iso(), "trial": args.profile or "",
              "command": command, "command_key": command_key(command) if command else "", "margin": margin}
+    if not desk_known(config, lease["desk"]):
+        # The user's ruling (2026-09-30, relayed by Stahlwerk): an unknown desk warns the sender instead of its mail
+        # going quietly to General. The request stands; its mail still reaches General, marked as misaddressed.
+        print("Warning: ClaudeMail has no desk " + lease["desk"] + ", so this lease's mail will go to "
+              + lease["desk"].partition(":")[0] + "'s General desk instead. If that is wrong, `res release "
+              + ident + "` and request again with --desk Machine:Desk (`mail.py desks` lists them).")
     path = lease_path(target, ident) if target == here else folder / (ident + ".json")
     write_json(path, lease)                       # to another machine: a write-once file its dispatcher takes and deletes
     fresh, report = dispatcher_state(target, config)

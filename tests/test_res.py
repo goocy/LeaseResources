@@ -98,6 +98,9 @@ STUB_MAIL = '''
 import json, os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
+if args[:2] == ["whoami", "--desk"]:
+    print(os.environ.get("STUB_DESK", "Altiplano:TestDesk"))
+    sys.exit(0)
 if args and args[0] == "whoami":
     print("machine stub")
     print("session none")
