@@ -5,8 +5,9 @@ A command that finishes within a 10-second trial needs nothing more. Anything lo
 (or another machine's, with --on) for a lease: the trial's profile plus a margin, for a stated duration. The dispatcher
 grants it when, on every dimension, the unleased use measured now plus the leases already granted plus the request
 stays under capacity times the headroom; otherwise it queues it and mails the owner desk when it is granted. A leased
-job runs detached from every Claude process and the dispatcher mails the owner desk (ClaudeMail) when it ends, stalls,
-runs past its duration or uses more than it declared. It never kills a leased job. Design: README.md beside this file,
+job runs detached from every Claude process and the dispatcher tells its owner when it ends, stalls, runs past its
+duration or uses more than it declared: through the output of a process waiting on the lease (res run --wait, res wait)
+while one is alive, otherwise by mail to the owner desk (ClaudeMail). It never kills a leased job. Design: README.md beside this file,
 and the design sketch for decision D-260927-4.
 
 Commands for sessions (python3 on the Mac, python on Windows; any interpreter works, res.py moves itself into its venv):
@@ -15,6 +16,7 @@ Commands for sessions (python3 on the Mac, python on Windows; any interpreter wo
     trial -- COMMAND...                   run under the meter, kill the whole process tree at 10 s, print the profile
     request (--profile TRIAL | --need DIM=AMOUNT,...) --for DURATION [--on MACHINE] [--why TEXT] [--desk M:D]
     run --lease ID [--on MACHINE] [--wait] [--cwd DIR] -- PROGRAM...   start a leased job, detached, with a log
+    wait ID                               attach to a lease on this machine: its output and notices arrive here, no mail
     extend ID [--for DURATION] [--profile TRIAL | --need ...] [--on MACHINE]
     release ID [--kill] [--on MACHINE]
     leases [--on MACHINE | --all]         the leases on a machine
@@ -31,7 +33,8 @@ On disk (synced by Resilio), under this folder's leases/<Machine>/:
     trials/<id>.json   trial profiles (and their output in trials/<id>.out)
     dispatcher.json    the dispatcher's report; history.json durations per command; unleased.jsonl long commands
                        of Claude sessions that ran without a lease (the compliance record, D-260927-4 option b)
-Locally, never synced: ~/.claude/leaseresources/ (the dispatcher's heartbeat, disk map, learned capacities).
+Locally, never synced: ~/.claude/leaseresources/ (the dispatcher's heartbeat, disk map, learned capacities), and in
+the local state folder attached/<id>.json (the process waiting on a lease) and notices/<id>/ (notices written for it).
 
 Requires psutil in ~/venvs/LeaseResources. No regular expressions (house rule).
 """
@@ -80,6 +83,7 @@ if __name__ == "__main__":
     ensure_venv()
 
 import argparse          # noqa: E402
+import atexit            # noqa: E402
 import collections       # noqa: E402
 import datetime          # noqa: E402
 import json              # noqa: E402
@@ -133,6 +137,9 @@ TASK_NAME = "LeaseResources Dispatcher"
 LAUNCHD_LABEL = "com.goocy.leaseresources"
 EXIT_CODE_CHANGED = 3
 EXIT_ALREADY_RUNNING = 4
+EXIT_STILL_RUNNING = 75                                # `res run --wait` / `res wait` stopped for a notice; the job runs on
+ATTENTION_EVENTS = ["overrun", "duration", "stall"]    # notices that end the waiting while the job keeps running
+END_EVENTS = ["finished", "failed", "lost", "start-failed", "refused"]      # notices after which nothing more comes
 ACTIVE = ["granted", "starting", "running"]            # states whose need counts against capacity
 OPEN = ["requested", "queued"] + ACTIVE
 ENDED = ["finished", "failed", "lost", "expired", "released", "killed", "refused"]
@@ -717,7 +724,63 @@ def desk_known(config: dict, desk: str) -> bool:
     return False
 
 
-def send_mail(config: dict, machine: str, desk: str, subject: str, body: str) -> bool:
+def attached_path(ident: str) -> Path:
+    return LOCAL_DIR / "attached" / (ident + ".json")
+
+
+def notice_dir(ident: str) -> Path:
+    return LOCAL_DIR / "notices" / ident
+
+
+def attached_waiter(ident: str):
+    """The live process waiting on this lease (`res run --wait` or `res wait`), or None. While there is one, the
+    dispatcher writes the lease's notices into notice_dir for it instead of mailing them. A file left by a waiter that
+    was killed is harmless: the pid must still belong to a process with the recorded create time."""
+    record = read_json(attached_path(ident))
+    if not record.get("pid") or record.get("create_time") is None:
+        return None
+    return process(record.get("pid"), record.get("create_time"))
+
+
+def attach(ident: str) -> None:
+    """Register this process as the waiter of a lease, until it exits."""
+    me = psutil.Process()
+    write_json(attached_path(ident), {"lease": ident, "pid": me.pid, "create_time": me.create_time(), "attached": now_iso()})
+    atexit.register(detach, ident)
+
+
+def detach(ident: str) -> None:
+    path = attached_path(ident)
+    if read_json(path).get("pid") == os.getpid():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def take_notices(ident: str) -> list:
+    """Claim the notices the dispatcher wrote for this waiter, oldest first: (path, notice) pairs. Claiming renames the
+    file to <name>.<pid>, so the dispatcher, which mails what no live waiter claimed, and this process never both take
+    one notice. The caller deletes each file once it has printed it."""
+    folder = notice_dir(ident)
+    try:
+        names = sorted(p.name for p in folder.iterdir() if p.name.endswith(".json"))
+    except OSError:
+        return []
+    taken = []
+    for name in names:
+        mine = folder / (name + "." + str(os.getpid()))
+        try:
+            probes.replace_retrying(folder / name, mine)
+        except OSError:
+            continue                                    # the dispatcher took it for mail in this very moment
+        taken.append((mine, read_json(mine)))
+    return taken
+
+
+def send_mail(config: dict, machine: str, desk: str, subject: str, body: str, for_session: str = "") -> bool:
+    """Mail to the owner desk; with for_session, only that session of the desk takes it while ClaudeMail can reach it
+    (sibling sessions on one desk took each other's lease notices, Altiplano 2026-09-30)."""
     outbox = LOCAL_DIR / "outbox"
     outbox.mkdir(parents=True, exist_ok=True)
     path = outbox / (datetime.datetime.now().strftime("%y%m%d-%H%M%S-%f") + ".md")
@@ -729,8 +792,9 @@ def send_mail(config: dict, machine: str, desk: str, subject: str, body: str) ->
                             " General desk instead. See the LeaseResources log on " + machine + ".)\n\n" + body,
                             encoding="utf-8")
         try:
+            owner = ["--for-session", for_session] if for_session and target == desk else []
             run = subprocess.run([sys.executable, "-B", mail_script(config), "send", "--to", target, "--subject", subject,
-                                  "--body-file", str(path), "--to-own-desk"], capture_output=True, text=True, timeout=60,
+                                  "--body-file", str(path), "--to-own-desk"] + owner, capture_output=True, text=True, timeout=60,
                                  cwd=str(SERVICE_DIR), env=mail_env(), creationflags=probes.no_window())
             ok = run.returncode == 0
             detail = " ".join((run.stdout + run.stderr).split())[:300]
@@ -1337,7 +1401,8 @@ def cmd_extend(args, config: dict) -> None:
     else:
         write_json(side_path(target, args.id, ".extend.json"), ask)
     if target != here:
-        print("Extension of " + args.id + " sent to " + target + "; the answer comes by mail to " + lease.get("desk", ""))
+        print("Extension of " + args.id + " sent to " + target + "; the answer comes by mail to "
+              + (lease.get("desk") or "the lease's desk"))
         return
     answer = wait_for_answer(path, (lambda d: (d.get("last_extend") or {}).get("asked") == ask["asked"],),
                              num(config, "answer_wait_seconds", 6))
@@ -1420,7 +1485,10 @@ def cmd_run(args, config: dict) -> None:
         if not lease:
             raise SystemExit("No lease " + args.lease + " on " + target + " (" + str(path) + ")")
     else:
-        lease = report_lease(target, args.lease) or {"state": "requested", "desk": ""}   # the report may lag the request
+        # The report lags a new request by Resilio's time both ways; until it lists the lease, the request itself still
+        # lies in the target's inbox and names the desk (without it the note below read "and mails  when it starts").
+        lease = report_lease(target, args.lease) or read_json(inbox(target, "requests") / (args.lease + ".json")) \
+            or {"state": "requested", "desk": ""}
     state = lease.get("state")
     if state == "requested" and target == here:
         # Not answered yet (a busy dispatcher): wait for the answer, since a granted lease starts here directly (any
@@ -1431,6 +1499,12 @@ def cmd_run(args, config: dict) -> None:
         raise SystemExit(args.lease + " is " + state + "; request a new lease.")
     if target == here and side_path(target, args.lease, ".order.json").exists():
         raise SystemExit(args.lease + " already has a run order; one lease, one run.")
+    waiting = bool(args.wait) and target == here
+    if waiting:
+        refuse_second_waiter(args.lease)
+        attach(args.lease)                              # before anything starts, so the first notice already comes here
+    elif args.wait:
+        print("--wait works only for a lease on this machine; " + target + "'s dispatcher reports by mail.")
     cwd = os.path.abspath(args.cwd or os.getcwd())
     local_start = target == here and state == "granted"
     # A direct local run is started by this very process for the session that typed it, so it may run any program
@@ -1457,7 +1531,10 @@ def cmd_run(args, config: dict) -> None:
     if not local_start:
         where = "on " + target + " " if target != here else ""
         print("Run order written; the dispatcher " + where + "starts it when the lease is granted (now: " + str(state)
-              + "), and mails " + lease.get("desk", "") + " when it starts and ends.\n  " + str(path))
+              + ")" + ("." if waiting else ", and mails " + (lease.get("desk") or "the lease's desk") + " when it starts and ends.")
+              + "\n  " + str(path))
+        if waiting:
+            wait_on(target, args.lease, config, lease.get("desk", ""))
         return
     log(here, "local run " + args.lease + " started by res itself (program rule not applied): " + " ".join(order["argv"]))
     start_runner(target, args.lease, order["argv"], cwd)
@@ -1475,30 +1552,130 @@ def cmd_run(args, config: dict) -> None:
         raise SystemExit("The runner did not report within 10 s; see " + str(run_path))
     log_path = side_path(target, args.lease, ".log")
     print("Started " + args.lease + " detached: pid " + str(run["pid"]) + ", log " + str(log_path))
-    print("The dispatcher mails " + lease.get("desk", "") + " when it ends, stalls, overruns or runs past "
-          + human_duration(lease.get("duration")) + ". No need to poll.")
-    if args.wait:
-        print("Waiting (interrupting or stopping this only stops the waiting, not the job: the job's runner has no live"
-              " ancestor here)...")
-        shown = 0
-        while True:
-            run = read_json(run_path)
+    if not waiting:
+        print("The dispatcher mails " + lease.get("desk", "") + " when it ends, stalls, overruns or runs past "
+              + human_duration(lease.get("duration")) + ". No need to poll.")
+        print("Mail to a desk can be taken by another session of that desk. To have this session woken instead, with no"
+              " mail, start the job as a background command with --wait: " + res_command() + " run --lease <id> --wait --"
+              " <program>. For this job, now, as a background command: " + res_command() + " wait " + args.lease)
+        return
+    wait_on(target, args.lease, config, lease.get("desk", ""))
+
+
+def refuse_second_waiter(ident: str) -> None:
+    other = attached_waiter(ident)
+    if other is not None and other.pid != os.getpid():
+        raise SystemExit(ident + " already has a waiting process (pid " + str(other.pid) + "); its notices go there. One"
+                         + " lease, one waiter.")
+
+
+def wait_on(machine: str, ident: str, config: dict, desk: str, from_end: bool = False, grace=None) -> None:
+    """Wait on a lease of this machine as its attached waiter (the caller has called attach): stream the job's log and
+    print the notices the dispatcher writes for this process instead of mailing them. Never returns. A notice that
+    needs attention while the job runs on (overrun, past its duration, stalled) ends the waiting with
+    EXIT_STILL_RUNNING, because the exit is what wakes a Claude session that started this as a background command. The
+    notice of the end exits with the job's exit code (1 if there is none). Should the job or the lease end and no notice
+    come within the grace period (the dispatcher is down), it exits the same way and the dispatcher mails later."""
+    run_path = side_path(machine, ident, ".run.json")
+    log_path = side_path(machine, ident, ".log")
+    if grace is None:
+        grace = 3 * (num(config, "sample_seconds", 5) + num(config, "tick_seconds", 1))
+    shown = 0
+    if from_end:
+        try:
+            shown = log_path.stat().st_size
+        except OSError:
+            pass
+
+    def stop(signum, frame):
+        sys.exit(128 + signum)                          # through atexit, so the attached record goes
+
+    for name in ["SIGTERM", "SIGHUP", "SIGBREAK"]:
+        if hasattr(signal, name):
             try:
-                size = log_path.stat().st_size
-                if size < shown:
-                    shown = 0                           # the log rotated
-                if size > shown:
-                    with open(log_path, "rb") as fh:
-                        fh.seek(shown)
-                        sys.stdout.write(fh.read(size - shown).decode("utf-8", "replace"))
-                        sys.stdout.flush()
-                    shown = size
-            except OSError:
+                signal.signal(getattr(signal, name), stop)
+            except (OSError, ValueError):
                 pass
-            if run.get("ended"):
-                print("\nEnded with exit code " + str(run.get("exit")))
-                sys.exit(run.get("exit") if isinstance(run.get("exit"), int) else 1)
+
+    def stream() -> None:
+        nonlocal shown
+        try:
+            size = log_path.stat().st_size
+            if size < shown:
+                shown = 0                               # the log rotated
+            if size > shown:
+                with open(log_path, "rb") as fh:
+                    fh.seek(shown)
+                    sys.stdout.write(fh.read(size - shown).decode("utf-8", "replace"))
+                    sys.stdout.flush()
+                shown = size
+        except OSError:
+            pass
+
+    def leave(note: str = "") -> None:
+        stream()
+        run = read_json(run_path)
+        if run.get("ended"):
+            print("\nEnded with exit code " + str(run.get("exit")) + note)
+        else:
+            print("\n" + ident + " is " + str(read_json(lease_path(machine, ident)).get("state")) + note)
+        sys.exit(run.get("exit") if isinstance(run.get("exit"), int) else 1)
+
+    print("Waiting on " + ident + ": the job's output and the dispatcher's notices (ended, stalled, overrun, past its"
+          " duration) arrive here. " + (desk or "The owner desk") + " gets mail only if this waiting process dies."
+          " Stopping it stops only the waiting, not the job.", flush=True)
+    ended_at = None
+    try:
+        while True:
+            if read_json(attached_path(ident)).get("pid") != os.getpid():
+                attach(ident)                           # the record was cleared away; without it the notices are mailed
+            run = read_json(run_path)
+            over = bool(run.get("ended")) or read_json(lease_path(machine, ident)).get("state") in ENDED
+            stream()
+            events = []
+            for path, notice in take_notices(ident):
+                print("\n[res] " + str(notice.get("subject", "")) + "\n" + str(notice.get("body", "")), flush=True)
+                try:
+                    path.unlink()                       # only now: a waiter that dies before printing leaves it to be mailed
+                except OSError:
+                    pass
+                events.append(notice.get("event", ""))
+            if any(e in END_EVENTS for e in events):
+                leave()
+            if any(e in ATTENTION_EVENTS for e in events) and not over:
+                print("\nThe job is STILL RUNNING. This waiting process stops here so that its session sees the notice above;"
+                      " re-attach with: " + res_command() + " wait " + ident, flush=True)
+                sys.exit(EXIT_STILL_RUNNING)
+            if over:
+                if ended_at is None:
+                    ended_at = time.monotonic()
+                if time.monotonic() - ended_at >= grace:
+                    leave(" (no notice of the end from the dispatcher within " + human_duration(grace) + "; if it is not"
+                          " running, it mails " + (desk or "the owner desk") + " when it runs again)" if grace else "")
             time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nStopped waiting; the job is not touched. Re-attach with: " + res_command() + " wait " + ident)
+        sys.exit(130)
+
+
+def cmd_wait(args, config: dict) -> None:
+    """Attach to a lease of this machine that already has a waiter no more (or never had one): from now on its notices
+    arrive in this process's output instead of by mail."""
+    here = this_machine(config)
+    lease = read_json(lease_path(here, args.id))
+    if not lease:
+        raise SystemExit("No lease " + args.id + " on " + here + ". res wait attaches only to a lease on this machine; a"
+                         + " lease on another machine reports by mail (res status " + args.id + " --on MACHINE shows it).")
+    if lease.get("from_machine") != here:
+        raise SystemExit(args.id + " was requested from " + str(lease.get("from_machine")) + "; its notices go to "
+                         + lease.get("desk", "") + " by mail, and res wait attaches only to leases requested on this machine.")
+    refuse_second_waiter(args.id)
+    attach(args.id)
+    grace = 3 * (num(config, "sample_seconds", 5) + num(config, "tick_seconds", 1))
+    if lease.get("state") in ENDED and age_of(lease.get("ended") or lease.get("answered")) > grace:
+        grace = 0                                       # long over: print what is still pending for it and leave
+    print(args.id + " is " + str(lease.get("state")) + "; log " + str(side_path(here, args.id, ".log")))
+    wait_on(here, args.id, config, lease.get("desk", ""), from_end=True, grace=grace)
 
 
 def pump_output(stream, path: Path, cap: int, rotate: bool) -> None:
@@ -1840,6 +2017,7 @@ class Dispatcher:
         self.unleased_seen = {}                       # key -> record
         self.shell_sids = {}                          # POSIX: tool shell pid (= its session id) -> claude pid, cwd
         self.env_cache = {}                           # process key -> Claude markers in its environment
+        self.cmdline_refused = set()                  # Windows: process keys that show neither owner nor command line
         self.unleased_pending = {}                    # key -> candidate younger than the threshold
         self.tool_members = {}                        # key -> the tool shell a process was seen under
         self.desk_cache = {}                          # working folder -> desk (from mail.py desk-of)
@@ -1849,6 +2027,7 @@ class Dispatcher:
         self.compliance_at = -1e9
         self.learned = read_json(LOCAL_DIR / "learned_peaks.json")
         self.learned_dirty = False
+        self.notice_seq = 0
         self.version = code_version()
 
     # -- state helpers
@@ -1858,12 +2037,75 @@ class Dispatcher:
     def save(self, lease: dict) -> None:
         write_json(lease_path(self.machine, lease["id"]), lease)
 
-    def mail(self, lease: dict, subject: str, body: str) -> None:
+    def mail(self, lease: dict, subject: str, body: str, event: str = "") -> None:
+        """Tell the lease's owner: through its attached waiter while one is alive (a notice file that process prints
+        and deletes), otherwise by mail to its desk. Never both: flush_notices mails a notice only when its waiter is
+        gone without having taken it."""
+        ident = lease["id"]
         desk = lease.get("desk") or (self.machine + ":General")
         footer = ("\n\nFrom the LeaseResources dispatcher on " + self.machine + " (" + str(SCRIPT) + "). Lease file: "
-                  + str(lease_path(self.machine, lease["id"])) + ". Replies to this mail reach nobody; use `res status "
-                  + lease["id"] + (" --on " + self.machine if lease.get("from_machine") != self.machine else "") + "`.")
-        send_mail(self.config, self.machine, desk, subject, body + footer)
+                  + str(lease_path(self.machine, ident)) + ". Replies to this mail reach nobody; use `res status "
+                  + ident + (" --on " + self.machine if lease.get("from_machine") != self.machine else "") + "`.")
+        session = lease.get("session") or ""
+        if lease.get("from_machine") == self.machine and attached_waiter(ident) is not None:
+            self.notice_seq += 1
+            name = file_stamp() + "-" + "%04d" % (self.notice_seq % 10000) + ".json"
+            try:
+                write_json(notice_dir(ident) / name, {"lease": ident, "event": event, "at": now_iso(), "subject": subject,
+                                                      "body": body, "footer": footer, "desk": desk, "session": session})
+                log(self.machine, "notice for the waiter of " + ident + ": " + subject)
+                return
+            except OSError as exc:
+                log(self.machine, "WARN cannot write a notice for the waiter of " + ident + ", mailing it: " + str(exc))
+        send_mail(self.config, self.machine, desk, subject, body + footer, session)
+
+    def flush_notices(self) -> None:
+        """Mail the notices that were written for an attached waiter which is gone without having taken them. What is
+        pending is read from the notice folders, not from memory, so it survives a restart of the dispatcher. A file
+        named <stamp>.json is untaken; <stamp>.json.<pid> was claimed by the waiter with that pid, which deletes it
+        after printing; <stamp>.json.mail was claimed here for mailing."""
+        try:
+            folders = sorted(p for p in (LOCAL_DIR / "notices").iterdir() if p.is_dir())
+        except OSError:
+            return
+        for folder in folders:
+            waiter = attached_waiter(folder.name)
+            try:
+                paths = sorted(folder.iterdir(), key=lambda p: p.name)
+            except OSError:
+                continue
+            for path in paths:
+                claim = path.name.partition(".json")[2]
+                if claim == "":
+                    if waiter is not None:
+                        continue
+                    claimed = path.with_name(path.name + ".mail")
+                    try:
+                        probes.replace_retrying(path, claimed)
+                    except OSError:
+                        continue                        # a waiter that attached just now took it
+                    path = claimed
+                elif claim[1:].isdigit():
+                    if waiter is not None and str(waiter.pid) == claim[1:]:
+                        continue                        # its waiter is printing it
+                elif claim != ".mail":                  # a temporary file of write_json
+                    try:
+                        if time.time() - path.stat().st_mtime > 60:
+                            path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                notice = read_json(path)
+                if notice.get("subject"):
+                    log(self.machine, "the waiter of " + folder.name + " is gone; mailing its notice: " + notice["subject"])
+                    send_mail(self.config, self.machine, notice.get("desk") or (self.machine + ":General"), notice["subject"],
+                              str(notice.get("body", "")) + str(notice.get("footer", "")), notice.get("session") or "")
+                self.drop(path)
+            if waiter is None:
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
 
     # -- measuring
     def unleased_now(self) -> dict:
@@ -1993,7 +2235,7 @@ class Dispatcher:
         self.save(lease)
         log(self.machine, "request " + lease["id"] + " from " + lease.get("desk", "?") + ": " + lease["state"] + " - " + lease.get("answer", ""))
         if lease.get("from_machine") != self.machine:
-            self.mail(lease, "Lease " + lease["id"] + " on " + self.machine + ": " + lease["state"], self.answer_body(lease))
+            self.mail(lease, "Lease " + lease["id"] + " on " + self.machine + ": " + lease["state"], self.answer_body(lease), "answer")
 
     def grant(self, lease: dict, notes=None) -> None:
         lease["state"] = "granted"
@@ -2028,7 +2270,7 @@ class Dispatcher:
             self.save(lease)
             log(self.machine, "granted queued " + lease["id"])
             if not side_path(self.machine, lease["id"], ".order.json").exists():
-                self.mail(lease, "Lease " + lease["id"] + " granted on " + self.machine, self.answer_body(lease))
+                self.mail(lease, "Lease " + lease["id"] + " granted on " + self.machine, self.answer_body(lease), "granted")
             else:
                 self.start_order(lease)
 
@@ -2051,7 +2293,7 @@ class Dispatcher:
             self.save(lease)
             self.mail(lease, "Run of " + lease["id"] + " refused on " + self.machine, "The run order was refused: " + reason
                       + "\n\nProgram: " + " ".join(argv) + "\nA leased program must be python, pythonw, py or powershell -File with a"
-                      + " script under this machine's allowed roots (config/" + self.machine.casefold() + ".json).")
+                      + " script under this machine's allowed roots (config/" + self.machine.casefold() + ".json).", "refused")
             return
         lease.update(state="starting", starting=now_iso())
         self.save(lease)
@@ -2102,7 +2344,7 @@ class Dispatcher:
             self.save(lease)
             log(self.machine, "extend " + answer)
             if ask.get("from_machine") and ask.get("from_machine") != self.machine:
-                self.mail(lease, "Extension of " + ident + " on " + self.machine, answer)
+                self.mail(lease, "Extension of " + ident + " on " + self.machine, answer, "extended")
         for path in list(self.folder.glob("*.release.json")):
             ident = path.name[: -len(".release.json")]
             ask = read_json(path)
@@ -2213,7 +2455,7 @@ class Dispatcher:
             if run.get("error"):
                 lease.update(state="failed", answer="could not start: " + run["error"], ended=now_iso())
                 self.save(lease)
-                self.mail(lease, "Leased job " + ident + " failed to start on " + self.machine, lease["answer"])
+                self.mail(lease, "Leased job " + ident + " failed to start on " + self.machine, lease["answer"], "start-failed")
                 continue
             if state in ("granted", "starting"):
                 if run.get("pid"):
@@ -2264,7 +2506,8 @@ class Dispatcher:
                               + " %). It keeps running; nothing is killed.\nPid " + str(run.get("pid")) + ", command: "
                               + " ".join(run.get("argv", [])) + "\nLog: " + str(side_path(self.machine, ident, ".log"))
                               + "\nIf it really needs that much, renegotiate: res extend " + ident + " --need " + dim + "="
-                              + format(value * 1.25, ".6g") + (" --on " + self.machine if lease.get("from_machine") != self.machine else ""))
+                              + format(value * 1.25, ".6g") + (" --on " + self.machine if lease.get("from_machine") != self.machine else ""),
+                              "overrun")
             started = parse_iso(lease.get("started"))
             if started and time.time() - started > float(lease.get("duration") or 0) and "duration" not in notices:
                 notices["duration"] = {"at": now_iso()}
@@ -2273,7 +2516,8 @@ class Dispatcher:
                 self.mail(lease, "Leased job " + ident + " ran past its duration",
                           "The leased job " + ident + " on " + self.machine + " has run " + human_duration(time.time() - started)
                           + ", past its stated " + human_duration(lease.get("duration")) + ". It keeps running.\nLog tail:\n\n"
-                          + tail(side_path(self.machine, ident, ".log"), 10) + "\n\nExtend: res extend " + ident + " --for <more>")
+                          + tail(side_path(self.machine, ident, ".log"), 10) + "\n\nExtend: res extend " + ident + " --for <more>",
+                          "duration")
             log_path = side_path(self.machine, ident, ".log")
             try:
                 size = log_path.stat().st_size
@@ -2293,7 +2537,7 @@ class Dispatcher:
                           "The leased job " + ident + " on " + self.machine + " has written no output for "
                           + human_duration(time.monotonic() - since) + ". It keeps running; nothing is killed.\nPid "
                           + str(run.get("pid")) + ", measured now: " + describe_need(measured) + "\nLog tail ("
-                          + str(log_path) + "):\n\n" + tail(log_path, 10))
+                          + str(log_path) + "):\n\n" + tail(log_path, 10), "stall")
             if changed or time.monotonic() - self.last_written.get(ident, 0) > 60:
                 self.save(lease)
                 self.last_written[ident] = time.monotonic()
@@ -2309,7 +2553,8 @@ class Dispatcher:
             self.mail(lease, "Leased job " + lease["id"] + " started on " + self.machine,
                       "The run order of lease " + lease["id"] + " started on " + self.machine + ": pid " + str(run.get("pid"))
                       + "\nCommand: " + " ".join(run.get("argv") or []) + "\nLog: " + str(side_path(self.machine, lease["id"], ".log"))
-                      + "\nYou get mail when it ends, stalls, overruns or runs past " + human_duration(lease.get("duration")) + ".")
+                      + "\nYou get mail when it ends, stalls, overruns or runs past " + human_duration(lease.get("duration")) + ".",
+                      "started")
         return "running"
 
     def finish(self, lease: dict, run: dict, lost: bool = False) -> None:
@@ -2355,7 +2600,7 @@ class Dispatcher:
                 + (compare or "n/a") + ("\nEarlier runs: " + previous if previous else "")
                 + "\n\nLast " + str(int(num(self.config, "log_tail_lines", 30))) + " lines of the log:\n\n```\n"
                 + tail(log_path, int(num(self.config, "log_tail_lines", 30))) + "\n```")
-        self.mail(lease, "Leased job " + ident + " " + state + " on " + self.machine, body)
+        self.mail(lease, "Leased job " + ident + " " + state + " on " + self.machine, body, state)
 
     # -- compliance: long commands of Claude sessions without a lease
     def claude_names(self) -> list:
@@ -2498,8 +2743,13 @@ class Dispatcher:
             user = None
         children = collections.defaultdict(list)
         info = {}
-        for p in psutil.process_iter(["pid", "ppid", "name", "create_time", "cmdline", "username"]):
+        attrs = ["pid", "ppid", "name", "create_time", "cmdline", "username"]
+        if sys.platform == "win32":
+            attrs.remove("cmdline")                   # read by read_cmdline, which asks a refusing process only once
+        for p in psutil.process_iter(attrs):
             data = p.info
+            if "cmdline" not in data and not self.read_cmdline(p, data):
+                continue                              # ended meanwhile; process_iter leaves such a process out too
             info[data["pid"]] = (p, data)
             children[data.get("ppid")].append(data["pid"])
         now = time.time()
@@ -2700,7 +2950,32 @@ class Dispatcher:
             if key not in live_keys:
                 self.end_record(key, now)
         self.env_cache = {k: v for k, v in self.env_cache.items() if k in live_keys}
+        self.cmdline_refused &= live_keys
         self.tool_members = {k: v for k, v in self.tool_members.items() if k in live_keys}
+
+    def read_cmdline(self, proc, data: dict) -> bool:
+        """Windows: put the command line into data as process_iter does (None when refused); False when the process
+        has ended. Unlike parent, name and create time, psutil does not keep a command line between scans, and every
+        refusal costs it about 12 ms (two attempts, each starting with an enumeration of all pids). On Moosfels that
+        was 152 processes of services and other users, 1.8 s of kernel time in every scan and 0.3 cores all day
+        (2026-10-03). So a process that shows neither its owner nor its command line is not asked again: what this
+        user may open of a process does not change while the process lives. A command line that can be read is read
+        anew in every scan, as before."""
+        key = str(data["pid"]) + "-" + format(float(data.get("create_time") or 0), ".2f")
+        if key in self.cmdline_refused:
+            data["cmdline"] = None
+            return True
+        try:
+            data["cmdline"] = proc.cmdline()
+        except psutil.AccessDenied:
+            data["cmdline"] = None
+            if data.get("username") is None and data.get("create_time"):
+                self.cmdline_refused.add(key)
+        except psutil.ZombieProcess:                  # a NoSuchProcess by class, but process_iter keeps it, with None
+            data["cmdline"] = None
+        except psutil.NoSuchProcess:
+            return False
+        return True
 
     def write_seen(self, key: str, rec: dict, now: float, note: str = "") -> None:
         rec = dict(rec)
@@ -2882,6 +3157,12 @@ class Dispatcher:
                             probes.replace_retrying(path, done / path.name)
                         except OSError:
                             pass
+        try:
+            for path in (LOCAL_DIR / "attached").iterdir():           # left by waiters that were killed
+                if attached_waiter(path.name.rpartition(".json")[0]) is None and time.time() - path.stat().st_mtime > 3600:
+                    path.unlink()
+        except OSError:
+            pass
         for folder in [done, trial_dir(self.machine)]:
             if folder.is_dir():
                 for path in folder.iterdir():
@@ -2980,6 +3261,10 @@ def cmd_dispatch(args, config: dict) -> None:
             d.handle_asks()
             d.handle_new()
             d.handle_orders()
+            try:
+                d.flush_notices()
+            except Exception as exc:                          # a damaged notice file must not hold up metering and the queue
+                log(machine, "WARN notices: " + type(exc).__name__ + ": " + str(exc))
             now = time.monotonic()
             if now - last_sample >= num(d.config, "sample_seconds", 5):
                 d.sample()
@@ -3024,7 +3309,24 @@ def cmd_watch(args, config: dict) -> None:
 
 # ---------------------------------------------------------------- main
 
+def lenient_output() -> None:
+    """Printing never raises on a character the output stream cannot encode. Job output is echoed as it was decoded
+    (UTF-8 with replacement: the trial's output tail, a lease's log tail, the waiter's stream and its notices), so it
+    can hold U+FFFD where a child wrote another encoding, and anything outside the console's code page. A Windows
+    console or pipe encodes as cp1252 and raises on anything outside it (Python's default handler there,
+    surrogateescape, raises as strict does on everything but lone surrogates): `res trial` raised UnicodeEncodeError
+    in the middle of its report, after the command had finished with exit code 0, and the profile was lost (Moosfels
+    2026-10-03). With backslashreplace such a character is printed as its escape (U+FFFD as a backslash and ufffd);
+    encoding and buffering stay as they were."""
+    for stream in [sys.stdout, sys.stderr]:
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass                                        # no stream at all (pythonw), or one that is not a text wrapper
+
+
 def main() -> None:
+    lenient_output()
     parser = argparse.ArgumentParser(prog="res", description="Resource leases (LeaseResources). See README.md beside res.py.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("now", help="every dimension on this machine")
@@ -3058,6 +3360,8 @@ def main() -> None:
     p.add_argument("--wait", action="store_true")
     p.add_argument("--cwd")
     p.add_argument("command", nargs=argparse.REMAINDER)
+    p = sub.add_parser("wait", help="attach to a lease on this machine: its output and notices arrive here, not by mail")
+    p.add_argument("id")
     p = sub.add_parser("leases", help="the leases on a machine")
     p.add_argument("--on")
     p.add_argument("--all", action="store_true")
@@ -3087,7 +3391,7 @@ def main() -> None:
     if args.cmd not in ("_runner", "_launch"):
         seed_local_state(THIS_MACHINE)
     handlers = {"now": cmd_now, "mine": cmd_mine, "trial": cmd_trial, "request": cmd_request, "extend": cmd_extend,
-                "release": cmd_release, "run": cmd_run, "leases": cmd_leases, "status": cmd_status,
+                "release": cmd_release, "run": cmd_run, "wait": cmd_wait, "leases": cmd_leases, "status": cmd_status,
                 "compliance": cmd_compliance, "notify-test": cmd_notify_test, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner, "_launch": cmd_launch}
     handlers[args.cmd](args, config)
 
