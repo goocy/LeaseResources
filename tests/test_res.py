@@ -278,11 +278,17 @@ class T11Mine(Base):
     def test_per_process_columns(self):
         w = World("mine")
         fake = fake_claude(w, self)
-        (w.allowed / "busy.py").write_text("import time\nend = time.time() + 5\nwhile time.time() < end: pass\n")
+        # Both jobs must still run when `res mine` prints its rows, so they run for up to 60 s and are ended as soon as
+        # it has printed (POSIX: the shell kills them; Windows: the teardown does). They ran for 5 s until 2026-10-03,
+        # which gave `res mine` 3.5 s: in a fresh sandbox it first maps the disks, one diskutil call per volume, and
+        # with the suite started by Altiplano's dispatcher (a launchd Background job, its children at background
+        # priority) `res mine` took 4.8 s alone and 8 to 9 s beside these two jobs (their rows then say "10 s"), so
+        # both jobs had ended and the table held no row for either.
+        (w.allowed / "busy.py").write_text("import time\nend = time.time() + 60\nwhile time.time() < end: pass\n")
         # Bounded by size as well as time: it rewrites one 64 MB file in place (on a RAM disk 5 s of writing reached
         # several GB, Stahlwerk 2026-09-27).
         (w.allowed / "writer.py").write_text(
-            "import os, time\nchunk = os.urandom(1 << 20)\nend = time.time() + 5\n"
+            "import os, time\nchunk = os.urandom(1 << 20)\nend = time.time() + 60\n"
             "with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'w.bin'), 'wb') as fh:\n"
             "    while time.time() < end:\n        if fh.tell() >= 64 << 20:\n            fh.seek(0)\n"
             "        fh.write(chunk)\n        fh.flush()\n        os.fsync(fh.fileno())\n")
@@ -293,9 +299,9 @@ class T11Mine(Base):
                    + q(w.allowed / "writer.py") + ' & ' + q(PYTHON)
                    + ' -c "import time; time.sleep(1.5)" & ' + q(PYTHON) + ' -B ' + q(RES) + ' mine > ' + q(out))
         else:
-            cmd = (q(PYTHON) + " " + q(w.allowed / "busy.py") + " & " + q(PYTHON) + " " + q(w.allowed / "writer.py")
-                   + " & sleep 1.5; " + q(PYTHON) + " -B " + q(RES)
-                   + " mine > " + q(out) + "; wait")
+            cmd = (q(PYTHON) + " " + q(w.allowed / "busy.py") + " & busy=$!; " + q(PYTHON) + " " + q(w.allowed / "writer.py")
+                   + " & writer=$!; sleep 1.5; " + q(PYTHON) + " -B " + q(RES)
+                   + " mine > " + q(out) + "; kill $busy $writer; wait")
         subprocess.run(fake + [cmd], cwd=str(w.allowed), env=env, timeout=60)
         text = out.read_text()
         rows = {}
@@ -333,6 +339,7 @@ class T12Escapes(Base):
                 "true shell-snapshots-fake; nohup /bin/sleep 17 >/dev/null 2>&1 & sleep 3",
                 "true shell-snapshots-fake; " + PYTHON + " -c 'import os, time; os.setsid(); time.sleep(16)' >/dev/null 2>&1 &",
             ]
+        jobs_started = time.time()
         for job in jobs:
             subprocess.Popen(fake + [job], cwd=str(w.allowed), env=env)
 
@@ -344,7 +351,29 @@ class T12Escapes(Base):
 
         def find(text):
             return [r for r in rows() if r["event"] == "seen" and any(text in c for c in r.get("commands", []))]
-        nohup_py = w.wait(lambda: find("sleeper.py 15"), 25, "nohup python job")
+
+        def own(text):
+            """The job's own record, not one of its tool shell, which names the job among its commands too. The second
+            job's shell lives 3 s, the sandbox's threshold, plus what starting and ending it costs, so it is recorded as
+            a long command itself: after the job when the scans miss it at that age, before the job when one meets it
+            (Altiplano 2026-10-03, suite started by the dispatcher: the first record with "sleep 17" was the shell's)."""
+            return [r for r in find(text) if r["how"] != "tool shell"]
+        overdue = []
+
+        def waited(text, what):
+            """A record is due about 5 s after the jobs start (threshold 3 s, a scan every 2 s). The first one still
+            missing 10 s after the start has the processes of all the jobs noted for the failure message, while they
+            still run (they live 15 to 17 s); each wait lasts 25 s in all, as before."""
+            first = max(0.5, jobs_started + 10 - time.time())
+            try:
+                return w.wait(lambda: own(text), first, what)
+            except AssertionError:
+                if not overdue:
+                    overdue.append("  the jobs' processes " + format(time.time() - jobs_started, ".0f") + " s after their start:\n"
+                                   + w.process_evidence(["sleeper.py 15", "sleep 17", "time.sleep(16)"], jobs_started - 1))
+            return w.wait(lambda: own(text), 25 - first, what + " (25 s in all)",
+                          evidence=lambda: overdue[0] + "\n" + w.unleased_evidence("Altiplano"))
+        nohup_py = waited("sleeper.py 15", "nohup python job")
         if WINDOWS:
             measured("escapes.detached_python_windows", {k: nohup_py[0][k] for k in ("how", "desk", "age", "session")})
             self.assertEqual(nohup_py[0]["how"], "left the Claude tree (environment marker)")
@@ -352,11 +381,12 @@ class T12Escapes(Base):
             self.assertFalse(find("sleeper.py 14"), "a leased job must not count as unleased")
             w.stop()
             return
-        nohup_sleep = w.wait(lambda: find("sleep 17"), 25, "nohup /bin/sleep job")
-        setsid_py = w.wait(lambda: find("time.sleep(16)"), 25, "setsid python job")
+        nohup_sleep = waited("sleep 17", "nohup /bin/sleep job")
+        setsid_py = waited("time.sleep(16)", "setsid python job")
         measured("escapes.nohup_python", {k: nohup_py[0][k] for k in ("how", "desk", "age", "session")})
         measured("escapes.nohup_apple_sleep", {k: nohup_sleep[0][k] for k in ("how", "desk", "age")})
         measured("escapes.setsid_python", {k: setsid_py[0][k] for k in ("how", "desk", "age", "session")})
+        measured("escapes.records_with_sleep_17", [[r["how"], r["age"], r.get("note", "")] for r in find("sleep 17")])
         self.assertEqual(nohup_sleep[0]["how"], "backgrounded, its tool shell gone")
         self.assertEqual(setsid_py[0]["how"], "left the Claude tree (environment marker)")
         self.assertEqual(setsid_py[0]["session"], "fake-session")
@@ -401,9 +431,13 @@ class World:
         WORLDS.append(self)
 
     def env(self, machine: str, **extra) -> dict:
-        # No Claude variables from the session running the suite: a registered session id made the detector use that
-        # session's real desk (Mistral 2026-09-28). Tests set what they need through **extra.
-        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("CLAUDE")}
+        # Nothing of the session or the lease the suite itself runs under. No Claude variables: a registered session id
+        # made the detector use that session's real desk (Mistral 2026-09-28). No LeaseResources variables: run as a
+        # leased job, as the house rule asks, every process of the suite inherited the runner's LEASERES_LEASE, and the
+        # detector rightly passes over a leased job's processes, so T12's detached job was never recorded (Stahlwerk and
+        # Moosfels 2026-10-03; Moosfels' pass of 2026-09-27 was a run without a lease). Tests set what they need through
+        # **extra.
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("CLAUDE", "LEASERES_"))}
         env.update({"LEASERES_DATA": str(self.data), "LEASERES_CONFIG": str(self.config), "LEASERES_MACHINE": machine,
                     "LEASERES_LOCAL": str(self.root / ("local-" + machine))})
         env.update(extra)
@@ -475,18 +509,58 @@ class World:
         return "".join(p.read_text(encoding="utf-8") for p in sorted((self.data / "logs").glob("leaseresources." + machine.casefold() + ".*")))
 
     @staticmethod
-    def wait(cond, timeout, what="condition", step=0.25):
+    def process_evidence(texts: list, since: float) -> str:
+        """The live processes started after `since` whose command line holds one of `texts`, with the environment
+        markers the unleased detector goes by. For a compliance test whose record is overdue, taken while the job still
+        runs: command line and parent are read only of the young processes, because on Moosfels with 400 processes
+        (2026-10-03) a pass asking every process's parent took 3.4 to 6 s and every command line another 1.5 s, longer
+        than the job had left to live (Windows takes a snapshot of the whole table for each parent asked)."""
+        lines = []
+        for proc in psutil.process_iter(["pid", "create_time"]):
+            if float(proc.info.get("create_time") or 0) < since or proc.info["pid"] == os.getpid():
+                continue
+            try:
+                cmd = " ".join(proc.cmdline())
+                parent = proc.ppid()
+            except (psutil.Error, OSError):
+                continue
+            if not any(text in cmd for text in texts):
+                continue
+            try:
+                env = proc.environ()
+                marks = json.dumps({k: env[k] for k in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "LEASERES_LEASE")
+                                    if k in env})
+            except (psutil.Error, OSError) as exc:
+                marks = "environment unreadable: " + type(exc).__name__
+            lines.append("    " + str(proc.info["pid"]) + " <" + str(parent) + "> age "
+                         + format(time.time() - float(proc.info.get("create_time") or 0), ".0f") + " s " + marks + " :: " + cmd[-100:])
+        return "\n".join(lines or ["    no live process with any of " + json.dumps(texts) + " in its command line"])
+
+    def unleased_evidence(self, machine: str) -> str:
+        """The last compliance records and the dispatcher's last log lines, short enough to arrive in the mailed log
+        tail when the suite runs on another machine."""
+        path = self.state(machine, "unleased.jsonl")
+        rows = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        lines = ["  " + str(len(rows)) + " compliance records, the last:"] + ["    " + row[:240] for row in rows[-4:]]
+        lines.append("  dispatcher log, last lines:")
+        lines.extend("    " + line[:240] for line in self.logtext(machine).splitlines()[-5:])
+        return "\n".join(lines)
+
+    @staticmethod
+    def wait(cond, timeout, what="condition", step=0.25, evidence=None):
+        """`evidence`, a function returning text, is called when the wait times out and its text added to the failure."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             value = cond()
             if value:
                 return value
             time.sleep(step)
-        raise AssertionError("timed out after " + str(timeout) + " s waiting for " + what)
+        raise AssertionError("timed out after " + str(timeout) + " s waiting for " + what
+                             + ("\n" + evidence() if evidence is not None else ""))
 
 
 def lease_id(output: str) -> str:
-    for word in output.replace(":", " ").split():
+    for word in output.replace(":", " ").replace("`", " ").split():      # the unknown-desk warning quotes the id in backticks
         if word.startswith("L") and "-" in word and word[1:7].isdigit():
             return word
     raise AssertionError("no lease id in: " + output)
@@ -674,8 +748,14 @@ class T5Survive(Base):
         w.wait(lambda: w.lease("Altiplano", lid).get("state") == "running", 20, "job running")
         job_pid = w.lease("Altiplano", lid)["pid"]
         os.killpg(shell.pid, signal.SIGINT)
-        os.killpg(shell.pid, signal.SIGHUP)
-        os.killpg(shell.pid, signal.SIGKILL)
+        for later in [signal.SIGHUP, signal.SIGKILL]:
+            try:
+                os.killpg(shell.pid, later)
+            except (ProcessLookupError, PermissionError):
+                # Nobody left to signal: the group has died of the signal before. macOS answers EPERM, not ESRCH, as
+                # long as the group's dead members are not reaped (Altiplano 2026-10-03: SIGKILL refused in 2 of 30
+                # back-to-back triples below the dispatcher, SIGHUP in 30 of 30 with 2 ms between the signals).
+                break
         shell.wait(5)
         time.sleep(1)
         survived_group_kill = pid_alive(job_pid)
@@ -742,6 +822,22 @@ class T6CrossMachine(Base):
         measured("R6.finished_subject", fin[0]["subject"])
         status = w.res("Altiplano", "status", lid, "--on", "Mistral")
         self.assertIn("finished", status.stdout)
+        w.stop()
+
+    def test_run_order_names_the_desk(self):
+        """A run order given right after the request, before the target's report lists the lease, still says which desk
+        gets the mail (it printed "and mails  when it starts and ends", Moosfels 2026-10-03). No dispatcher runs here,
+        so the report never has the lease: the desk comes from the request while it lies in the target's inbox, and
+        once that is gone too the sentence does without a name."""
+        w = World("crossdesk")
+        req = w.res("Altiplano", "request", "--need", "cpu=1", "--for", "2m", "--on", "Mistral", "--desk", "Altiplano:Asker")
+        lid = lease_id(req.stdout)
+        program = [PYTHON, str(w.allowed / "sleepy.py"), "1"]
+        run = w.res("Altiplano", "run", "--lease", lid, "--on", "Mistral", "--", *program)
+        self.assertIn("and mails Altiplano:Asker when it starts and ends", run.stdout, run.stdout + run.stderr)
+        (w.data / "leases" / "Mistral" / "requests" / (lid + ".json")).unlink()
+        run = w.res("Altiplano", "run", "--lease", lid, "--on", "Mistral", "--", *program)
+        self.assertIn("and mails the lease's desk when it starts and ends", run.stdout, run.stdout + run.stderr)
         w.stop()
 
 
@@ -940,7 +1036,13 @@ class T13TrialWatchdog(Base):
         measured("watchdog.wall_seconds", round(wall, 1))
         measured("watchdog.killed", len(record["killed"]))
         self.assertFalse(record["finished"])
-        self.assertLess(wall, 16)
+        # The kill itself is held to the trial's own clock, as in T1. The wall time also holds what `res trial` needs
+        # to start and to end, 1.6 s on Stahlwerk and 3.5 to 7 s below the dispatcher of a Mac (Altiplano 2026-10-03:
+        # 13.6 to 14.3 s in four runs, 16.6 to 17.0 s in four more while the machine was busy, against the 16 this
+        # bound was), so it is only held below the 30 s before which a kill that waited for the sampling loop could
+        # not come.
+        self.assertLess(record["seconds"], 11.5)
+        self.assertLess(wall, 25)
         self.assertEqual(alive, [])
 
 
@@ -1162,6 +1264,52 @@ class T14Units(Base):
         self.assertEqual(comp.returncode, 0, comp.stderr)
         self.assertIn("without a lease: 13", comp.stdout)
 
+    def test_refused_command_line_asked_once(self):
+        """Windows: psutil keeps no command line between scans and spends about 12 ms on each refusal (Moosfels: 152
+        processes of services, 1.8 s of every scan). A process that shows neither owner nor command line is asked once
+        while it lives; one that shows its owner is asked in every scan, a readable command line is read anew, a
+        process that has ended is left out and a zombie is kept without a command line, as process_iter does both."""
+        w = World("units-cmdline")
+        res = self.load(w)
+
+        class Fake:
+            def __init__(self, answer):
+                self.answer, self.asked = answer, 0
+
+            def cmdline(self):
+                self.asked += 1
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+                return list(self.answer)
+        service = Fake(res.psutil.AccessDenied(4488))
+        own = Fake(res.psutil.AccessDenied(700))
+        readable = Fake(["python.exe", "job.py"])
+        ended = Fake(res.psutil.NoSuchProcess(900))
+        zombie = Fake(res.psutil.ZombieProcess(950))
+        rows = [(service, {"pid": 4488, "create_time": 100.0, "username": None}, True, None),
+                (own, {"pid": 700, "create_time": 100.0, "username": "goocy"}, True, None),
+                (readable, {"pid": 800, "create_time": 100.0, "username": None}, True, ["python.exe", "job.py"]),
+                (ended, {"pid": 900, "create_time": 100.0, "username": None}, False, None),
+                (zombie, {"pid": 950, "create_time": 100.0, "username": None}, True, None)]
+        d = res.Dispatcher(res.load_config())
+        for _scan in range(3):
+            for proc, data, alive, expected in rows:
+                data = dict(data)
+                self.assertEqual(d.read_cmdline(proc, data), alive)
+                if alive:
+                    self.assertEqual(data["cmdline"], expected)
+        asked = [service.asked, own.asked, readable.asked, ended.asked, zombie.asked]
+        measured("units.cmdline_asked_in_3_scans", asked)
+        self.assertEqual(asked, [1, 3, 3, 3, 3])
+        self.assertEqual(d.cmdline_refused, {"4488-100.00"})
+        saved = res.psutil.process_iter
+        try:
+            res.psutil.process_iter = lambda attrs=None: []
+            d.check_unleased()                        # the process is gone from the table: its refusal is forgotten
+        finally:
+            res.psutil.process_iter = saved
+        self.assertEqual(d.cmdline_refused, set())
+
 
 class T15ScanDoesNotBlock(Base):
     """A slow compliance scan (every desk lookup taking 3 s, and long tool shells on the machine to record: at least the
@@ -1226,22 +1374,28 @@ class T17Teppich(Base):
 
     def test_first_sample_rates(self):
         import probes
-        burner = subprocess.Popen([PYTHON, "-c", "import time\nend = time.time() + 0.4\nwhile time.time() < end: pass\ntime.sleep(5)"])
+        # The meters before the burner: a meter built in an empty folder maps the disks first, one diskutil call per
+        # volume. Built after the burner's start, the two were ready 5.9 s after it on Altiplano with the suite started
+        # by the dispatcher (2026-10-03), the burner had ended at 5.4 s, and both modes read 0: no reading at all, which
+        # the first assertion took for the 0.0 it wants.
+        config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"]}
+        quiet = probes.Meter(config, Path(tempfile.mkdtemp()), first_sample_rates=False)
+        eager = probes.Meter(config, Path(tempfile.mkdtemp()))
+        burner = subprocess.Popen([PYTHON, "-c", "import time\nend = time.time() + 0.4\nwhile time.time() < end: pass\ntime.sleep(60)"])
         try:
             time.sleep(0.6)
             proc = psutil.Process(burner.pid)
-            config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"]}
-            quiet = probes.Meter(config, Path(tempfile.mkdtemp()), first_sample_rates=False)
-            eager = probes.Meter(config, Path(tempfile.mkdtemp()))
             quiet.last_wall = eager.last_wall = time.time() - 10.0      # the burner was born after the 'last sample'
             tree = [proc] + proc.children(recursive=True)
             q = quiet.sample({"t": tree})[1]["t"]["cpu"]
             e = eager.sample({"t": tree})[1]["t"]["cpu"]
             measured("teppich.first_sample_cpu", {"dispatcher": round(q, 2), "trial": round(e, 2)})
+            self.assertIsNone(burner.poll(), "the burner ended before it was metered")
             self.assertEqual(q, 0.0)
             self.assertGreater(e, 0.05)                  # its life's average: 0.4 s of cpu over its age
         finally:
             burner.kill()
+            burner.wait()
 
     def test_learned_capacity_rises_in_a_running_meter(self):
         import probes
@@ -1328,6 +1482,238 @@ class T19WaitDetach(Base):
         self.assertTrue(pid_alive(job))
         fin = w.wait(lambda: w.mail_matching("finished"), 30, "completion mail")
         self.assertIn("tick 9", fin[0]["body"])
+
+
+class T20Waiter(Base):
+    """A notice goes to the process waiting on the lease (`res run --wait`, `res wait`) while one is alive, and by mail
+    only otherwise; never both, never neither (lease mail to a desk was taken by sibling sessions, 2026-09-30)."""
+
+    def waiter(self, w, name, *args, **env):
+        """A waiting res process with its output in a file: (process, output path)."""
+        out = w.root / (name + ".out")
+        fh = open(out, "wb")
+        w.files = getattr(w, "files", []) + [fh]
+        proc = subprocess.Popen([PYTHON, "-B", str(RES)] + list(args), cwd=str(w.allowed), env=w.env("Altiplano", **env),
+                                stdout=fh, stderr=subprocess.STDOUT)
+        w.procs.append(proc)
+        return proc, out
+
+    def leftovers(self, w, lid) -> list:
+        local = w.root / "local-Altiplano"
+        found = [str(p) for p in (local / "notices" / lid).glob("*")] if (local / "notices" / lid).is_dir() else []
+        return found + [str(p) for p in (local / "attached").glob(lid + "*")]
+
+    def test_overrun_stops_the_waiter_and_wait_reattaches(self):
+        w = World("waiter-overrun")
+        w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "ram=100M,cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
+        t0 = time.monotonic()
+        first, out1 = self.waiter(w, "first", "run", "--lease", lid, "--wait", "--", PYTHON, str(w.allowed / "ramhog.py"), "600", "14")
+        code = first.wait(40)
+        text = out1.read_text()
+        measured("waiter.overrun_exit", {"code": code, "after_seconds": round(time.monotonic() - t0, 1)})
+        self.assertEqual(code, 75, text)
+        self.assertIn("[res] Leased job " + lid + " uses more ram than declared", text)
+        self.assertIn("STILL RUNNING", text)
+        self.assertIn("wait " + lid, text)
+        self.assertTrue(pid_alive(w.lease("Altiplano", lid).get("pid")), "the job must keep running after the notice")
+        second, out2 = self.waiter(w, "second", "wait", lid)
+        code = second.wait(40)
+        text = out2.read_text()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(text.count("[res] Leased job " + lid + " finished on Altiplano"), 1, text)
+        self.assertIn("Peak use vs declared", text)
+        self.assertIn("Ended with exit code 0", text)
+        time.sleep(3)
+        measured("waiter.mail_subjects_after_overrun_run", [m["subject"] for m in w.mails()])
+        self.assertEqual(w.mail_matching("uses more ram"), [])
+        self.assertEqual(w.mail_matching("finished"), [])
+        self.assertEqual(self.leftovers(w, lid), [])
+
+    def test_duration_and_stall_are_each_delivered_once(self):
+        w = World("waiter-stall", {"stall_minutes": 0.1})
+        w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "3s", "--desk", "Altiplano:Owner").stdout)
+        proc, out = self.waiter(w, "wait0", "run", "--lease", lid, "--wait", "--", PYTHON, str(w.allowed / "silent.py"), "20")
+        codes, texts = [], []
+        for attempt in range(1, 6):
+            codes.append(proc.wait(40))
+            texts.append(out.read_text())
+            if codes[-1] != 75:
+                break
+            self.assertIn("STILL RUNNING", texts[-1])
+            self.assertTrue(pid_alive(w.lease("Altiplano", lid).get("pid")), "the job must keep running after the notice")
+            proc, out = self.waiter(w, "wait" + str(attempt), "wait", lid)
+        self.assertEqual(codes[0], 75, texts[0])
+        self.assertEqual(codes[-1], 0, texts[-1])
+        time.sleep(3)
+        split = {}
+        for subject in ["ran past its duration", "looks stalled", "finished on Altiplano"]:
+            shown = sum(text.count("[res] Leased job " + lid + " " + subject) for text in texts)
+            mailed = len(w.mail_matching(subject))
+            split[subject] = {"shown": shown, "mailed": mailed}
+            self.assertEqual(shown + mailed, 1, subject + ": " + json.dumps(split) + "\n" + "\n-----\n".join(texts))
+        measured("waiter.stall_run", {"exit_codes": codes, "deliveries": split})
+        self.assertEqual(split["ran past its duration"]["shown"], 1)
+        self.assertEqual(split["finished on Altiplano"]["shown"], 1)
+
+    def test_without_a_waiter_mail_goes_out(self):
+        w = World("waiter-none")
+        w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        run = w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleepy.py"), "3")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("The dispatcher mails Altiplano:Owner", run.stdout)
+        self.assertIn("--wait", run.stdout, "the plain run must recommend the waiting form")
+        self.assertIn("wait " + lid, run.stdout)
+        fin = w.wait(lambda: w.mail_matching("finished"), 30, "completion mail")
+        self.assertEqual(fin[0]["to"], "Altiplano:Owner")
+        self.assertIn("tick 2", fin[0]["body"])
+        time.sleep(2)
+        self.assertEqual(len(w.mail_matching("finished")), 1)
+        self.assertEqual(self.leftovers(w, lid), [])
+
+    @POSIX_ONLY
+    def test_notice_of_a_dead_waiter_is_mailed(self):
+        """The waiter is frozen (alive, but takes nothing), so the notice of the end is written for it; then it is
+        killed. The dispatcher, restarted in between, mails that notice from the file, to the requesting session."""
+        w = World("waiter-dead")
+        disp = w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner",
+                             CLAUDE_CODE_SESSION_ID="session-of-the-waiter").stdout)
+        proc, out = self.waiter(w, "frozen", "run", "--lease", lid, "--wait", "--", PYTHON, str(w.allowed / "sleepy.py"), "3")
+        w.wait(lambda: w.lease("Altiplano", lid).get("state") == "running", 20, "job running")
+        os.kill(proc.pid, signal.SIGSTOP)
+        refused = w.res("Altiplano", "wait", lid)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("already has a waiting process", refused.stdout + refused.stderr)
+        notices = w.root / "local-Altiplano" / "notices" / lid
+        files = w.wait(lambda: sorted(notices.glob("*.json")) if notices.is_dir() else [], 30, "a notice file for the frozen waiter")
+        notice = json.loads(files[0].read_text())
+        measured("waiter.notice_keys", sorted(notice))
+        self.assertEqual(notice["event"], "finished")
+        self.assertEqual(w.mails(), [], "nothing is mailed while the waiter lives")
+        disp.terminate()
+        disp.wait(5)
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(5)
+        self.assertEqual(w.mails(), [])
+        w.dispatcher("Altiplano")
+        fin = w.wait(lambda: w.mail_matching("finished"), 20, "the dead waiter's notice as mail")
+        self.assertEqual(fin[0]["to"], "Altiplano:Owner")
+        self.assertEqual(fin[0]["subject"], notice["subject"])
+        self.assertIn("tick 2", fin[0]["body"])
+        self.assertIn("From the LeaseResources dispatcher", fin[0]["body"])
+        argv = fin[0]["argv"]
+        self.assertEqual(argv[argv.index("--for-session") + 1], "session-of-the-waiter")
+        w.wait(lambda: not notices.exists(), 10, "the notice folder gone")
+        time.sleep(2)
+        self.assertEqual(len(w.mails()), 1, [m["subject"] for m in w.mails()])
+        self.assertNotIn("finished on Altiplano", out.read_text())
+
+    def test_end_of_a_waited_run_is_delivered_once(self):
+        w = World("waiter-end")
+        w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        proc, out = self.waiter(w, "good", "run", "--lease", lid, "--wait", "--", PYTHON, str(w.allowed / "sleepy.py"), "3")
+        code = proc.wait(40)
+        text = out.read_text()
+        self.assertEqual(code, 0, text)
+        self.assertIn("tick 2", text)
+        self.assertEqual(text.count("[res] Leased job " + lid + " finished on Altiplano"), 1, text)
+        self.assertIn("Peak use vs declared", text)
+        self.assertNotIn("The dispatcher mails", text)
+        lid2 = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        proc, out = self.waiter(w, "bad", "run", "--lease", lid2, "--wait", "--", PYTHON, str(w.allowed / "fail.py"))
+        code = proc.wait(40)
+        text = out.read_text()
+        self.assertEqual(code, 3, text)
+        self.assertEqual(text.count("[res] Leased job " + lid2 + " failed on Altiplano"), 1, text)
+        time.sleep(3)
+        self.assertEqual(w.mails(), [], "a waited run must not be mailed as well")
+        self.assertEqual(self.leftovers(w, lid) + self.leftovers(w, lid2), [])
+
+    def test_waiter_leaves_when_the_dispatcher_is_down(self):
+        w = World("waiter-nodispatcher")
+        disp = w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        disp.terminate()
+        disp.wait(5)
+        t0 = time.monotonic()
+        proc, out = self.waiter(w, "alone", "run", "--lease", lid, "--wait", "--", PYTHON, str(w.allowed / "sleepy.py"), "2")
+        code = proc.wait(40)
+        text = out.read_text()
+        measured("waiter.no_dispatcher_exit_after_seconds", round(time.monotonic() - t0, 1))
+        self.assertEqual(code, 0, text)
+        self.assertIn("Ended with exit code 0", text)
+        self.assertIn("no notice of the end", text)
+        self.assertEqual(w.mails(), [])
+        w.dispatcher("Altiplano")
+        w.wait(lambda: w.mail_matching("finished"), 20, "completion mail once the dispatcher runs again")
+        time.sleep(2)
+        self.assertEqual(len(w.mails()), 1, [m["subject"] for m in w.mails()])
+
+
+ODD_JOB = '''
+import sys
+out = sys.stdout.buffer
+out.write(b"STR" + bytes([0xC5]) + b"NG written as cp1252" + bytes([10]))
+out.write(b"arrow and kanji " + bytes([0xE2, 0x86, 0x92, 0x20, 0xE6, 0x97, 0xA5, 0xE6, 0x9C, 0xAC, 10]))
+out.write(b"plain last line" + bytes([10]))
+out.flush()
+'''
+
+
+class T21EchoEncoding(Base):
+    """Echoed job output never raises on a character the output stream cannot encode. A job's output is decoded as
+    UTF-8 with replacement, so a line a child wrote in cp1252 holds U+FFFD, and a UTF-8 line can hold anything; on a
+    Windows console or pipe (cp1252) printing either raised UnicodeEncodeError in the middle of `res trial`'s
+    report, after the command had finished with exit code 0, and hid the profile (Moosfels 2026-10-03). The stream is
+    forced to strict cp1252 here, so the test means the same on the Macs."""
+
+    ESC = chr(92)
+    ODD = "STR" + ESC + "ufffdNG written as cp1252"
+    WIDE = "arrow and kanji " + ESC + "u2192 " + ESC + "u65e5" + ESC + "u672c"
+
+    def job(self, w) -> Path:
+        path = w.allowed / "odd.py"
+        path.write_text(ODD_JOB, encoding="utf-8")
+        return path
+
+    def res_cp1252(self, w, *args, timeout=60):
+        """res with strict cp1252 output streams: (exit code, stdout, stderr)."""
+        run = subprocess.run([PYTHON, "-B", str(RES)] + list(args), capture_output=True, timeout=timeout, cwd=str(w.allowed),
+                             env=w.env("Altiplano", PYTHONIOENCODING="cp1252"))
+        return run.returncode, run.stdout.decode("cp1252"), run.stderr.decode("cp1252", "replace")
+
+    def test_trial_tail(self):
+        w = World("echo-trial")
+        code, out, err = self.res_cp1252(w, "trial", "--", PYTHON, str(self.job(w)))
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("UnicodeEncodeError", err)
+        self.assertIn("no lease needed", out)
+        self.assertIn("  | " + self.ODD, out)
+        self.assertIn("  | " + self.WIDE, out)
+        self.assertIn("  | plain last line", out)
+        self.assertIn("Profile T", out.partition("plain last line")[2], "the profile must follow the output tail")
+
+    def test_waiter_stream_notice_and_status_tail(self):
+        w = World("echo-wait")
+        job = self.job(w)
+        w.dispatcher("Altiplano")
+        lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "1m", "--desk", "Altiplano:Owner").stdout)
+        code, out, err = self.res_cp1252(w, "run", "--lease", lid, "--wait", "--", PYTHON, str(job))
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("UnicodeEncodeError", err)
+        self.assertIn("[res] Leased job " + lid + " finished on Altiplano", out)
+        measured("echo.waiter_odd_lines", {"odd": out.count(self.ODD), "wide": out.count(self.WIDE)})
+        self.assertGreaterEqual(out.count(self.ODD), 2, "once in the streamed log, once in the notice's log tail\n" + out)
+        self.assertGreaterEqual(out.count(self.WIDE), 2, out)
+        self.assertIn("Ended with exit code 0", out)
+        code, out, err = self.res_cp1252(w, "status", lid)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("  | " + self.ODD, out)
+        self.assertIn("  | " + self.WIDE, out)
 
 
 def processes_in(folder: Path) -> dict:
