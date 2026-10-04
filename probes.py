@@ -244,16 +244,26 @@ def _mac_physical_disk(mountpoint: str):
 WINDOWS_PARTITIONS = "Get-Partition | Where-Object DriveLetter | ForEach-Object { [string]$_.DriveLetter + ' ' + [string]$_.DiskNumber }"
 
 
-def disk_map(local_dir: Path, max_age: float = 3600) -> dict:
+def disk_map(local_dir: Path, max_age: float = 3600, skip=()) -> dict:
     """physical disk name (as psutil.disk_io_counters(perdisk=True) names it) -> list of mount points / drive letters.
-    Cached per machine in the local folder for an hour, because it costs a diskutil or PowerShell call per volume."""
+    Cached per machine in the local folder for an hour, because it costs a diskutil or PowerShell call per volume.
+    A mount that starts with an entry of skip (the config's disk_skip_mounts) is left out before that call: until
+    2026-10-03 the map held every mount and DiskProbe dropped those afterwards, on Altiplano 11 of 12 diskutil calls,
+    about 1 s of every first meter in a local folder and 3 s below the dispatcher. The cache names the entries it was
+    built with and serves every caller whose list has them all; one written before that names none and holds every
+    mount, so DiskProbe still filters what it gets."""
+    skip = sorted(set(s for s in skip if s))
     cache = local_dir / "disks.json"
     cached = read_json(cache)
-    if cached.get("host") == socket.gethostname() and time.time() - float(cached.get("at", 0)) < max_age:
+    built_with = cached.get("skip", [])
+    if (cached.get("host") == socket.gethostname() and time.time() - float(cached.get("at", 0)) < max_age
+            and isinstance(built_with, list) and all(s in skip for s in built_with)):
         return cached.get("map", {})
     mapping = {}
     if sys.platform == "darwin":
         for part in psutil.disk_partitions(all=False):
+            if any(part.mountpoint.startswith(s) for s in skip):
+                continue
             disk = _mac_physical_disk(part.mountpoint)
             if disk:
                 mapping.setdefault(disk, []).append(part.mountpoint)
@@ -265,15 +275,17 @@ def disk_map(local_dir: Path, max_age: float = 3600) -> dict:
             out = ""
         for line in out.splitlines():
             letter, _, number = line.strip().partition(" ")
-            if letter and number.strip().isdigit():
+            if letter and number.strip().isdigit() and not any((letter + ":").startswith(s) for s in skip):
                 mapping.setdefault("PhysicalDrive" + number.strip(), []).append(letter + ":")
     else:
         for part in psutil.disk_partitions(all=False):
+            if any(part.mountpoint.startswith(s) for s in skip):
+                continue
             name = Path(part.device).name
             base = name.rstrip("0123456789") if name.startswith("sd") or name.startswith("hd") else name
             mapping.setdefault(base, []).append(part.mountpoint)
     try:
-        write_json(cache, {"host": socket.gethostname(), "at": time.time(), "map": mapping})
+        write_json(cache, {"host": socket.gethostname(), "at": time.time(), "map": mapping, "skip": skip})
     except OSError:
         pass
     return mapping
@@ -290,8 +302,8 @@ class DiskProbe(Probe):
     def __init__(self, config, local_dir):
         super().__init__(config, local_dir)
         counters = psutil.disk_io_counters(perdisk=True) or {}
-        mapping = disk_map(local_dir)
         skip = [s for s in config.get("disk_skip_mounts", []) if s]
+        mapping = disk_map(local_dir, skip=skip)
         learned = _learned(local_dir, "learned_peaks")
         configured = config.get("disk_capacity", {})
         default = float(config.get("disk_default_bytes_per_s", 150e6))

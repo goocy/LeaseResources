@@ -1153,6 +1153,80 @@ class T14Units(Base):
         self.assertEqual(caps["net:Ethernet"], 125e6)
         self.assertEqual(caps["net:Wi-Fi"], 125e6, "a 4294 Mbit/s link speed is ignored")
 
+    def test_disk_map_asks_only_about_kept_mounts(self):
+        """A Mac's volumes, faked: diskutil is asked about the mounts disk_skip_mounts keeps and no others (until
+        2026-10-03 about all of them, 12 calls for 1 kept mount on Altiplano), and the disk dimensions are the ones a
+        map of every mount gives, which is also what a disks.json written by the older code holds."""
+        import probes
+        from collections import namedtuple
+        from types import SimpleNamespace
+        Part = namedtuple("Part", "device mountpoint fstype")
+        Io = namedtuple("Io", "read_bytes write_bytes read_time write_time")
+        physical = {"/": "disk0", "/System/Volumes/VM": "disk0", "/System/Volumes/Preboot": "disk0",
+                    "/System/Volumes/Data": "disk0", "/Library/Developer/CoreSimulator/Volumes/iOS_23A343": "disk5",
+                    "/Volumes/Recovery": "disk0", "/Volumes/Archive": "disk8"}
+        skip = ["/Library/Developer/CoreSimulator", "/System/Volumes/", "/Volumes/Recovery"]
+        config = {"disk_skip_mounts": skip}
+        asked = []
+
+        def physical_disk(mountpoint):
+            asked.append(mountpoint)
+            return physical[mountpoint]
+
+        def dimensions(folder):
+            probe = probes.DiskProbe(config, folder)
+            return {"dims": probe.dims, "mounts": probe.mounts, "learnable": sorted(probe.learnable)}
+        def powershell(argv, **options):
+            return SimpleNamespace(stdout="C 0\nD 1\nE 1\n")
+        saved = (probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters,
+                 probes._mac_physical_disk)
+        # sys and subprocess: this module's names only, not the interpreter's modules
+        probes.sys = SimpleNamespace(platform="darwin")
+        probes.subprocess = SimpleNamespace(run=powershell, SubprocessError=subprocess.SubprocessError)
+        probes.psutil.disk_partitions = lambda all=False: [Part("/dev/x", m, "apfs") for m in physical]
+        probes.psutil.disk_io_counters = lambda perdisk=False: {d: Io(0, 0, 0, 0) for d in sorted(set(physical.values()))}
+        probes._mac_physical_disk = physical_disk
+        try:
+            fresh, older, every, windows, linux = (Path(tempfile.mkdtemp(dir=str(SCRATCH))) for _ in range(5))
+            new = dimensions(fresh)
+            asked_fresh = list(asked)
+            self.assertEqual(asked_fresh, ["/", "/Volumes/Archive"])
+            written = probes.read_json(fresh / "disks.json")
+            del asked[:]
+            new_again = dimensions(fresh)
+            asked_cached = list(asked)
+            full = probes.disk_map(every)                # no skip list: every mount, as the older code mapped them
+            asked_full = list(asked)
+            del asked[:]
+            probes.write_json(older / "disks.json", {"host": socket.gethostname(), "at": time.time(), "map": full})
+            old = dimensions(older)
+            asked_older = list(asked)
+            narrower = probes.disk_map(fresh, skip=skip[:1])            # a list that no longer covers the cached map
+            asked_narrower = list(asked)
+            probes.sys.platform = "win32"                # the other two branches leave the same mounts out
+            letters = probes.disk_map(windows, skip=["D:"])
+            probes.sys.platform = "linux"
+            mounted = probes.disk_map(linux, skip=skip)
+        finally:
+            (probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters,
+             probes._mac_physical_disk) = saved
+        measured("units.disk_map", {"asked": asked_fresh, "asked_without_skip": len(asked_full), "dims": sorted(new["dims"]),
+                                    "map": written.get("map"), "windows": letters, "linux": mounted})
+        self.assertEqual(letters, {"PhysicalDrive0": ["C:"], "PhysicalDrive1": ["E:"]})
+        self.assertEqual(mounted, {"x": ["/", "/Volumes/Archive"]})
+        self.assertEqual(written.get("map"), {"disk0": ["/"], "disk8": ["/Volumes/Archive"]})
+        self.assertEqual(written.get("skip"), sorted(skip))
+        self.assertEqual(asked_cached, [], "the second probe in the folder is served from disks.json")
+        self.assertEqual(sorted(asked_full), sorted(physical))
+        self.assertEqual(sorted(full), ["disk0", "disk5", "disk8"])
+        self.assertEqual(new["mounts"], {"disk:disk0": ["/"], "disk:disk8": ["/Volumes/Archive"]})
+        self.assertEqual(new_again, new)
+        self.assertEqual(asked_older, [], "a disks.json of the older code, with every mount, is served as it is")
+        self.assertEqual(old, new, "the same dimensions, labels and aliases as from a map of every mount")
+        self.assertIn("/System/Volumes/Data", asked_narrower)
+        self.assertEqual(narrower["disk0"], ["/", "/System/Volumes/VM", "/System/Volumes/Preboot", "/System/Volumes/Data",
+                                             "/Volumes/Recovery"])
+
     def test_detector_windows_shape(self):
         w = World("units-detector")
         res = self.load(w)
