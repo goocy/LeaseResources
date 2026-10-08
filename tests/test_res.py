@@ -1082,6 +1082,104 @@ class T14Units(Base):
             platform.INIT_BOOT_TIME = real
         measured("units.clock_shift_undone", 2.0)
 
+    def test_clock_correction_does_not_split_an_unleased_record(self):
+        """The compliance scan keys a process by pid and create time, and a restarted dispatcher takes back the open
+        records by those keys. With psutil's create time in the key, a dispatcher that read 2 s ahead and its successor
+        that reads 0 s ahead disagreed, and a long-lived unleased process was ended and recorded a second time at the
+        restart (pid 77102 on Altiplano, 2026-10-08 16:31:31, there at 1 s). A real process, a scan over a table of
+        that process alone, psutil's remembered boot time moved as in the test above."""
+        platform = psutil._psplatform
+        if not hasattr(platform, "adjust_proc_create_time") or not getattr(platform, "INIT_BOOT_TIME", 0):
+            self.skipTest("this psutil does not shift create times")
+        w = World("units-clock-scan")
+        res = self.load(w)
+        child = subprocess.Popen([PYTHON, "-c", "import time; time.sleep(600)"], cwd=str(w.allowed), start_new_session=True,
+                                 env=w.env("Altiplano", CLAUDECODE="1"), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        w.procs.append(child)
+        path = w.state("Altiplano", "unleased.jsonl")
+
+        def rows(event):
+            if not path.exists():
+                return []
+            return [r for r in (json.loads(l) for l in path.read_text().splitlines() if l.strip()) if r["event"] == event]
+
+        def dispatcher():
+            d = res.Dispatcher(res.load_config())
+            d.config = dict(d.config, unleased_after_seconds=1)
+            return d
+
+        def scan(d, procs):
+            def table(attrs=None):                        # as process_iter: the same objects, read anew in every scan
+                for p in procs:
+                    p.info = p.as_dict(attrs=attrs)
+                return list(procs)
+            res.psutil.process_iter = table
+            d.check_unleased()
+        time.sleep(4)                                     # older than the threshold of 1 s, also when read 2 s ahead
+        kernel = res.created(psutil.Process(child.pid))
+        real = platform.INIT_BOOT_TIME
+        saved = res.psutil.process_iter
+        try:
+            platform.INIT_BOOT_TIME = real - 2            # the old dispatcher reads every create time 2 s ahead
+            old = dispatcher()
+            first = psutil.Process(child.pid)
+            scan(old, [first])
+            self.assertEqual(len(rows("seen")), 1, "the scan did not record the test's process")
+            platform.INIT_BOOT_TIME = real                # the shift changes while the Process object keeps its reading
+            scan(old, [first])
+            self.assertEqual([len(rows("seen")), len(rows("ended"))], [1, 0])
+            new = dispatcher()                            # the restart: nothing in memory, new Process objects, no shift
+            new.restore_unleased()
+            second = psutil.Process(child.pid)
+            scan(new, [second])
+            self.assertEqual([len(rows("seen")), len(rows("ended"))], [1, 0], "recorded a second time after the restart")
+            key = rows("seen")[0]["key"]
+            self.assertEqual(key, str(child.pid) + "-" + format(kernel, ".2f"))     # the kernel's time, not psutil's
+            platform.INIT_BOOT_TIME = real - 2            # and the other way round: read without a shift, then 2 s ahead
+            scan(new, [second])
+            scan(new, [psutil.Process(child.pid)])        # also when psutil hands out a new object for the process
+            self.assertEqual([len(rows("seen")), len(rows("ended"))], [1, 0])
+            platform.INIT_BOOT_TIME = real
+            # A record of the code before this change: its key holds the create time 2 s ahead. It is taken back as the
+            # same process, and ends under the key it was written with, which is what `res compliance` pairs it by.
+            for ahead in [1, 2]:
+                was = str(child.pid) + "-" + format(kernel + ahead, ".2f")
+                path.write_text(json.dumps(dict(rows("seen")[0], key=was)) + "\n", encoding="utf-8")
+                third = dispatcher()
+                third.restore_unleased()
+                scan(third, [psutil.Process(child.pid)])
+                self.assertEqual([[r["key"] for r in rows("seen")], len(rows("ended"))], [[was], 0])
+            child.kill()
+            child.wait()
+            scan(third, [])
+            self.assertEqual([[r["key"] for r in rows("seen")], [r["key"] for r in rows("ended")]], [[was], [was]])
+            self.assertIsInstance(rows("ended")[0]["lifetime"], int)
+            # Another process under the same pid, started a minute apart, is still not taken for the recorded one.
+            me = psutil.Process()
+            other = str(me.pid) + "-" + format(res.created(me) - 60, ".2f")
+            path.write_text(json.dumps(dict(rows("seen")[0], key=other)) + "\n", encoding="utf-8")
+            fourth = dispatcher()
+            fourth.restore_unleased()
+            self.assertEqual(fourth.unleased_seen, {})
+            self.assertEqual([r.get("note") for r in rows("ended")], ["ended while the dispatcher was down"])
+            # So is a key that holds no time at all: it ends the record and does not stop the dispatcher's start.
+            path.write_text(json.dumps(dict(rows("seen")[0], key=str(me.pid) + "-abc")) + "\n", encoding="utf-8")
+            fifth = dispatcher()
+            fifth.restore_unleased()
+            self.assertEqual([fifth.unleased_seen, len(rows("ended"))], [{}, 1])
+            # The kernel's time is remembered per Process object, not per pid: a new object under a known pid is read
+            # anew (here two stand-ins for processes that are gone, so each keeps the reading it came with).
+            class Gone:
+                pid = 9000001
+            one, two = Gone(), Gone()
+            self.assertEqual([fifth.created_in_scan(one, 100.0), fifth.created_in_scan(two, 200.0),
+                              fifth.created_in_scan(two, 300.0), fifth.created_in_scan(one, 100.0)], [100.0, 200.0, 200.0, 100.0])
+        finally:
+            platform.INIT_BOOT_TIME = real
+            res.psutil.process_iter = saved
+        measured("units.clock_shift_scan_key", key)
+
     def test_replace_and_read_retry(self):
         import probes
         w = World("units-io")

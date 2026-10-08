@@ -451,6 +451,9 @@ def describe_need(need: dict) -> str:
 
 # ---------------------------------------------------------------- processes
 
+RESTORE_TOLERANCE = 5.0                                # Macs: seconds a recorded key may be off the kernel's create time
+
+
 def clock_shift() -> float:
     """The seconds psutil adds to every create_time() it returns in this process. psutil 7.1 and later, on macOS and
     the BSDs, moves create times by however far the system's boot time has moved since psutil was imported (the clock
@@ -466,6 +469,11 @@ def clock_shift() -> float:
         return 0.0
 
 
+def shifts_create_times() -> bool:
+    """Whether this psutil moves create times at all (the Macs: yes; Windows: no)."""
+    return getattr(psutil._psplatform, "adjust_proc_create_time", None) is not None
+
+
 def created(proc) -> float:
     """When the kernel says the process started: the same number in every process, for the process's whole life. Use
     it wherever a create time is recorded for, or compared with, another process's reading, never proc.create_time()
@@ -474,10 +482,10 @@ def created(proc) -> float:
     return psutil.Process(proc.pid).create_time() - clock_shift()
 
 
-def process(pid, create_time=None):
+def process(pid, create_time=None, tolerance: float = 1.0):
     try:
         proc = psutil.Process(int(pid))
-        if create_time is not None and abs(created(proc) - float(create_time)) > 1.0:
+        if create_time is not None and abs(created(proc) - float(create_time)) > tolerance:
             return None
         if proc.status() == psutil.STATUS_ZOMBIE:
             return None
@@ -2041,6 +2049,7 @@ class Dispatcher:
         self.shell_sids = {}                          # POSIX: tool shell pid (= its session id) -> claude pid, cwd
         self.env_cache = {}                           # process key -> Claude markers in its environment
         self.cmdline_refused = set()                  # Windows: process keys that show neither owner nor command line
+        self.kernel_created = {}                      # macOS: pid -> (the scan's psutil.Process, the kernel's create time)
         self.unleased_pending = {}                    # key -> candidate younger than the threshold
         self.tool_members = {}                        # key -> the tool shell a process was seen under
         self.desk_cache = {}                          # working folder -> desk (from mail.py desk-of)
@@ -2769,8 +2778,11 @@ class Dispatcher:
         attrs = ["pid", "ppid", "name", "create_time", "cmdline", "username"]
         if sys.platform == "win32":
             attrs.remove("cmdline")                   # read by read_cmdline, which asks a refusing process only once
+        shifting = shifts_create_times()
         for p in psutil.process_iter(attrs):
             data = p.info
+            if shifting and data.get("create_time") is not None:
+                data["create_time"] = self.created_in_scan(p, data["create_time"])
             if "cmdline" not in data and not self.read_cmdline(p, data):
                 continue                              # ended meanwhile; process_iter leaves such a process out too
             info[data["pid"]] = (p, data)
@@ -2973,8 +2985,35 @@ class Dispatcher:
             if key not in live_keys:
                 self.end_record(key, now)
         self.env_cache = {k: v for k, v in self.env_cache.items() if k in live_keys}
+        self.kernel_created = {pid: v for pid, v in self.kernel_created.items() if pid in info}
         self.cmdline_refused &= live_keys
         self.tool_members = {k: v for k, v in self.tool_members.items() if k in live_keys}
+
+    def created_in_scan(self, proc, reading: float) -> float:
+        """macOS: the kernel's create time of a process of the scan, in place of the reading psutil hands out, so that
+        a key means the same process to this dispatcher at any later time and to the dispatcher after it. psutil's
+        reading holds the clock shift (see clock_shift) of the moment the Process object was first asked, process_iter
+        hands out the same object in every scan, and the shift moves meanwhile, so taking the present shift from an old
+        reading is wrong. The kernel's time is read once, through a new Process, when the scan first meets an object,
+        and remembered for as long as process_iter hands out that object (a new object under a known pid is another
+        process, or the same one read anew): a few calls per new process, none later. The shift is asked before and
+        after the reading, and the reading repeated if it moved in between, so no key is built on a shift that did not
+        belong to its reading."""
+        known = self.kernel_created.get(proc.pid)
+        if known is not None and known[0] is proc:
+            return known[1]
+        shift = clock_shift()
+        try:
+            for _attempt in range(3):
+                value = psutil.Process(proc.pid).create_time() - shift
+                after = clock_shift()
+                if after == shift:
+                    break
+                shift = after
+        except psutil.Error:                          # ended since process_iter read it
+            value = reading - shift
+        self.kernel_created[proc.pid] = (proc, value)
+        return value
 
     def read_cmdline(self, proc, data: dict) -> bool:
         """Windows: put the command line into data as process_iter does (None when refused); False when the process
@@ -3027,12 +3066,18 @@ class Dispatcher:
         seen = self.unleased_seen.pop(key, None)
         if seen is None:
             return
-        self.append_unleased({"event": "ended", "at": now_iso(), "key": key, "desk": seen.get("desk"),
+        self.append_unleased({"event": "ended", "at": now_iso(), "key": seen.get("key") or key, "desk": seen.get("desk"),
                               "session": seen.get("session", ""), "how": seen.get("how"),
                               "lifetime": round(now - seen.get("first", now))})
 
     def restore_unleased(self) -> None:
-        """After a restart: take back the records that were seen and not ended, so a process is recorded once."""
+        """After a restart: take back the records that were seen and not ended, so a process is recorded once. On the
+        Macs a key written by the code up to 2026-10-08 holds psutil's create time, which was ahead of the kernel's by
+        the whole seconds of that dispatcher's clock shift (see clock_shift; 1 and 2 s were seen), while the scan now
+        keys by the kernel's. There a record is taken back when its pid lives and was created within RESTORE_TOLERANCE
+        of the key's time (a pid cannot come round again that fast), is tracked under the key the scan gives the
+        process, and keeps the key it was written with for its `ended` row, which is what `res compliance` pairs the
+        two by."""
         open_records = {}
         for row in iter_unleased(self.machine):
             if row.get("event") == "seen":
@@ -3042,13 +3087,20 @@ class Dispatcher:
         now = time.time()
         for key, row in open_records.items():
             pid_text, _, ctime = str(key).partition("-")
-            proc = process(pid_text, ctime) if pid_text.isdigit() else None
+            proc = process(pid_text, ctime, RESTORE_TOLERANCE if shifts_create_times() else 1.0) if pid_text.isdigit() else None
+            scan_key, first = key, None
+            if proc is not None and shifts_create_times():
+                try:
+                    first = created(proc)
+                    scan_key = pid_text + "-" + format(first, ".2f")
+                except psutil.Error:
+                    proc = None
             if proc is None:
                 self.append_unleased({"event": "ended", "at": now_iso(), "key": key, "desk": row.get("desk"),
                                       "session": row.get("session", ""), "how": row.get("how"), "lifetime": None,
                                       "note": "ended while the dispatcher was down"})
                 continue
-            self.unleased_seen[key] = dict(row, first=float(ctime or now), restored=True)
+            self.unleased_seen[scan_key] = dict(row, first=float(ctime or now) if first is None else first, restored=True)
 
     def escaped_parent(self, pid: int, info: dict, now: float, after: float) -> bool:
         """Whether pid would itself be recorded as an escaped job (so its children are not recorded separately)."""
