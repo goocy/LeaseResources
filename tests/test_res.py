@@ -1060,6 +1060,28 @@ class T14Units(Base):
         spec.loader.exec_module(module)
         return module
 
+    def test_clock_correction_does_not_lose_a_runner(self):
+        """psutil 7.1+ on macOS moves create times by however far the boot time has moved since it was imported. A
+        dispatcher that has run for days must still recognise a runner that recorded its own create time a moment ago
+        (four running jobs were reported lost on Altiplano, 2026-10-07 and -08)."""
+        platform = psutil._psplatform
+        if not hasattr(platform, "adjust_proc_create_time") or not getattr(platform, "INIT_BOOT_TIME", 0):
+            self.skipTest("this psutil does not shift create times")
+        res = self.load(World("units-clock"))
+        me = psutil.Process()
+        recorded = res.created(me)                        # what a runner writes at its start
+        me.create_time()                                  # psutil keeps this reading in the object
+        real = platform.INIT_BOOT_TIME
+        platform.INIT_BOOT_TIME = real - 2                # as if the clock had been corrected by 2 s since the import
+        try:
+            self.assertAlmostEqual(psutil.Process().create_time() - recorded, 2.0, places=3)   # psutil alone disagrees
+            self.assertAlmostEqual(res.created(me), recorded, places=3)             # also through a Process made before
+            self.assertIsNotNone(res.process(me.pid, recorded))
+            self.assertIsNone(res.process(me.pid, recorded - 5))                    # another process with this pid
+        finally:
+            platform.INIT_BOOT_TIME = real
+        measured("units.clock_shift_undone", 2.0)
+
     def test_replace_and_read_retry(self):
         import probes
         w = World("units-io")

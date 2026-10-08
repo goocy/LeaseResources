@@ -451,10 +451,33 @@ def describe_need(need: dict) -> str:
 
 # ---------------------------------------------------------------- processes
 
+def clock_shift() -> float:
+    """The seconds psutil adds to every create_time() it returns in this process. psutil 7.1 and later, on macOS and
+    the BSDs, moves create times by however far the system's boot time has moved since psutil was imported (the clock
+    being corrected, mostly after sleep). The kernel's own value never changes, so a dispatcher that had run for days
+    and a runner started a second ago disagreed about the runner by two whole seconds, and four jobs were reported
+    lost while they ran (Altiplano, 2026-10-07 and -08). Zero on Windows, and with a psutil that does not shift."""
+    adjust = getattr(psutil._psplatform, "adjust_proc_create_time", None)
+    if adjust is None:
+        return 0.0
+    try:
+        return float(adjust(0.0))
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return 0.0
+
+
+def created(proc) -> float:
+    """When the kernel says the process started: the same number in every process, for the process's whole life. Use
+    it wherever a create time is recorded for, or compared with, another process's reading, never proc.create_time()
+    (see clock_shift). Read through a new psutil.Process, because an old one keeps the first create time it returned,
+    with the shift of that moment."""
+    return psutil.Process(proc.pid).create_time() - clock_shift()
+
+
 def process(pid, create_time=None):
     try:
         proc = psutil.Process(int(pid))
-        if create_time is not None and abs(proc.create_time() - float(create_time)) > 1.0:
+        if create_time is not None and abs(created(proc) - float(create_time)) > 1.0:
             return None
         if proc.status() == psutil.STATUS_ZOMBIE:
             return None
@@ -745,7 +768,7 @@ def attached_waiter(ident: str):
 def attach(ident: str) -> None:
     """Register this process as the waiter of a lease, until it exits."""
     me = psutil.Process()
-    write_json(attached_path(ident), {"lease": ident, "pid": me.pid, "create_time": me.create_time(), "attached": now_iso()})
+    write_json(attached_path(ident), {"lease": ident, "pid": me.pid, "create_time": created(me), "attached": now_iso()})
     atexit.register(detach, ident)
 
 
@@ -1756,7 +1779,7 @@ def cmd_runner(args, config: dict) -> None:
     launch = Path(args.launch)
     run_path = side_path(machine, ident, ".run.json")
     me = psutil.Process()
-    run = {"runner_pid": me.pid, "runner_create_time": me.create_time(), "started": now_iso()}
+    run = {"runner_pid": me.pid, "runner_create_time": created(me), "started": now_iso()}
     if not under(launch.resolve(), (LOCAL_DIR / "launch").resolve()):
         write_json(run_path, dict(run, error="launch file outside the local folder: " + str(launch), ended=now_iso(), exit=None))
         return
@@ -1791,7 +1814,7 @@ def cmd_runner(args, config: dict) -> None:
                               daemon=True)
     pumper.start()
     try:
-        child_ctime = psutil.Process(child.pid).create_time()
+        child_ctime = created(psutil.Process(child.pid))
     except psutil.Error:
         child_ctime = None
     run.update({"pid": child.pid, "create_time": child_ctime, "argv": argv, "cwd": cwd})
