@@ -1,6 +1,6 @@
 {
   "_about": "LeaseResources settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case), which only that machine edits. Units: cpu in cores, ram and vram in bytes, disk and net in bytes per second, gpu in percent. See README.md for each key.",
-  "machines": ["Mistral", "Moosfels", "Stahlwerk", "Teppich", "Altiplano", "Sandbank"],
+  "machines": ["Mistral", "Moosfels", "Stahlwerk", "Teppich", "Altiplano", "Sandbank", "Pulvermaar"],
   "hostnames": {},
 
   "headroom": 0.85,
