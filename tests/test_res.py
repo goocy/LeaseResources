@@ -1203,20 +1203,133 @@ class T14Units(Base):
         self.assertEqual(probes.read_json(w.root / "half.json"), {})
         self.assertEqual(probes.read_json(w.root / "missing.json"), {})
 
-    def test_disk_attribution_by_machine_delta(self):
-        """A reader working in C: that reads from G: (Mistral): with no open files known, its bytes go to the disks by
-        what each moved, so G: gets them; before, its working folder put them on C: and capped them at C:'s 2.9 MB/s."""
+    def test_disk_attribution_by_open_files(self):
+        """Each process's bytes go to the disks it has files open on, never to disks other programs keep busy (Mistral,
+        2026-10-25 and -26: a verify reading only F: was blamed for C: at 146.5 MB/s, G: at 20.1 MB/s and E: at 132.1
+        MB/s, and a copy from H: to F: for G:). The figures are those of that afternoon."""
         import probes
         probe = probes.DiskProbe.__new__(probes.DiskProbe)
-        probe.dims = {"disk:PhysicalDrive0": {"capacity": 150e6}, "disk:PhysicalDrive3": {"capacity": 150e6}}
-        probe.mounts = {"disk:PhysicalDrive0": ["G:"], "disk:PhysicalDrive3": ["C:", "I:"]}
-        r = probes.Reading(1)
-        r.disk_rate = 124.4e6
-        r.paths = []                                    # Windows: open files are not read; the working folder is not used
-        use = probe.tree([r], 1.0, {"disk:PhysicalDrive0": 126e6, "disk:PhysicalDrive3": 2.9e6})
-        measured("units.disk_attribution", {d: round(v / 1e6, 1) for d, v in use.items()})
-        self.assertGreater(use["disk:PhysicalDrive0"], 115e6)
-        self.assertLess(use["disk:PhysicalDrive3"], 3e6)
+        letters = {"PhysicalDrive0": ["G:"], "PhysicalDrive2": ["E:"], "PhysicalDrive3": ["C:", "I:"],
+                   "PhysicalDrive5": ["F:"], "PhysicalDrive6": ["H:"]}
+        probe.mounts = {"disk:" + d: m for d, m in letters.items()}
+        probe.dims = {d: {"capacity": 250e6} for d in probe.mounts}
+        system = {"disk:PhysicalDrive0": 20.1e6, "disk:PhysicalDrive2": 132.1e6, "disk:PhysicalDrive3": 146.5e6,
+                  "disk:PhysicalDrive5": 139e6, "disk:PhysicalDrive6": 0.0}
+        verify, runner, copy, talker = (probes.Reading(n) for n in range(4))
+        verify.disk_rate, verify.paths = 150e6, ["F:\\annas.iso"]        # page-cache reads counted too
+        runner.disk_rate, runner.paths = 0.2e6, ["C:\\Users\\goocy\\AppData\\Local\\LeaseResources\\logs\\leases\\L.log"]
+        talker.disk_rate, talker.paths = 50e6, []                        # network or pipe I/O, no file open
+        alone = probe.tree([verify, runner, talker], 5.0, system)
+        copy.disk_rate, copy.paths = 360e6, ["H:\\a.iso", "F:\\b.iso"]
+        both = probe.tree([copy], 5.0, dict(system, **{"disk:PhysicalDrive5": 180e6, "disk:PhysicalDrive6": 180e6}))
+        measured("units.disk_attribution", {"verify": {d: round(v / 1e6, 1) for d, v in alone.items()},
+                                            "copy": {d: round(v / 1e6, 1) for d, v in both.items()}})
+        self.assertEqual(alone["disk:PhysicalDrive5"], 139e6, "capped at what F: moved")
+        self.assertAlmostEqual(alone["disk:PhysicalDrive3"], 0.2e6, delta=1, msg="only the runner's log writes are on C:")
+        self.assertEqual([alone["disk:PhysicalDrive" + n] for n in "026"], [0.0, 0.0, 0.0])
+        self.assertEqual(both["disk:PhysicalDrive5"], 180e6)
+        self.assertEqual(both["disk:PhysicalDrive6"], 180e6)
+        self.assertEqual([both["disk:PhysicalDrive" + n] for n in "023"], [0.0, 0.0, 0.0])
+
+    def test_hot_swapped_disk_becomes_a_dimension(self):
+        """A disk plugged in after the probe was made is a dimension from the next sample on, under Windows' own number,
+        and one pulled out is gone; the disk map is asked again only when the disks or mounts change, and a new meter
+        (res trial) gets the new map from disks.json (Mistral, 2026-10-25: F: and H:, plugged into the hot-swap bays
+        after the dispatcher started, were 'no such disk here' for every request for two days)."""
+        import probes
+        from collections import namedtuple
+        from types import SimpleNamespace
+        Part = namedtuple("Part", "device mountpoint fstype opts")
+        Io = namedtuple("Io", "read_bytes write_bytes read_time write_time")
+        letters = {"G": 0, "D": 1, "E": 2, "C": 3, "I": 3, "K": 4}
+        calls = []
+
+        def powershell(argv, **options):
+            calls.append(argv)
+            return SimpleNamespace(stdout="".join(l + " " + str(n) + "\n" for l, n in letters.items()))
+        saved = (probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters)
+        probes.sys = SimpleNamespace(platform="win32")
+        probes.subprocess = SimpleNamespace(run=powershell)
+        probes.psutil.disk_partitions = lambda all=False: [Part(l + ":\\", l + ":\\", "NTFS", "rw,fixed") for l in letters]
+        probes.psutil.disk_io_counters = lambda perdisk=False: {"PhysicalDrive" + str(n): Io(1, 1, 0, 0) for n in letters.values()}
+        try:
+            folder = Path(tempfile.mkdtemp(dir=str(SCRATCH)))
+            probe = probes.DiskProbe({"disk_skip_mounts": []}, folder)
+            first, asked_first = sorted(probe.dims), len(calls)
+            probe.system(5.0)
+            asked_quiet = len(calls)
+            letters.update(F=5, H=6)
+            use = probe.system(5.0)
+            added, asked_added, f_aliases = sorted(probe.dims), len(calls), probe.dims["disk:PhysicalDrive5"]["aliases"]
+            fresh = sorted(probes.DiskProbe({"disk_skip_mounts": []}, folder).dims)
+            asked_fresh = len(calls)
+            del letters["H"]
+            probe.system(5.0)
+            pulled = sorted(probe.dims)
+        finally:
+            probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters = saved
+        measured("units.hot_swap", {"first": first, "added": added, "pulled": pulled, "powershell_calls": len(calls)})
+        self.assertEqual(first, ["disk:PhysicalDrive" + n for n in "01234"])
+        self.assertEqual([asked_first, asked_quiet], [1, 1], "no new map while nothing changes")
+        self.assertEqual(added, ["disk:PhysicalDrive" + n for n in "0123456"])
+        self.assertEqual(f_aliases, ["PhysicalDrive5", "F:", "F"], "a request for disk:F resolves to it")
+        self.assertEqual(use["disk:PhysicalDrive5"], 0.0, "no rate before its second sample")
+        self.assertEqual(asked_added, 2)
+        self.assertEqual([fresh, asked_fresh], [added, 2], "a new meter is served the new map from disks.json")
+        self.assertEqual(pulled, ["disk:PhysicalDrive" + n for n in "012345"])
+
+    def test_unreadable_files_and_failing_probe(self):
+        """A process whose open files may not be read (elevated, or another user's: 143 of 290 on Mistral) keeps its cpu
+        and ram reading and counts on no disk; a probe that raises is reported in Meter.errors instead of vanishing (a
+        failed disk map would otherwise read as zero disk use, unseen)."""
+        import probes
+        config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"], "disk_paths_seconds": 1}
+        meter = probes.Meter(config, Path(tempfile.mkdtemp(dir=str(SCRATCH))))
+        me = psutil.Process()
+
+        def denied():
+            raise psutil.AccessDenied(me.pid)
+        me.open_files = denied
+        disk = [p for p in meter.probes if isinstance(p, probes.DiskProbe)][0]
+
+        def broken(dt):
+            raise subprocess.CalledProcessError(1, "powershell.exe")
+        meter.sample({"t": [me]})
+        quiet_errors = list(meter.errors)
+        disk.system = broken
+        use = meter.sample({"t": [me]})[1]["t"]
+        measured("units.unreadable_and_failing", {"ram": use.get("ram"), "errors": meter.errors})
+        self.assertEqual(quiet_errors, [])
+        self.assertEqual(probes.process_paths(me), [], "no known disk")
+        self.assertGreater(use["ram"], 1e6, "the process is still metered")
+        self.assertEqual([e.partition(":")[0] for e in meter.errors], ["DiskProbe.system", "DiskProbe.tree"])
+
+    def test_open_files_of_a_reader(self):
+        """process_paths finds the file a reader holds open, on Windows too (not read there from 2026-09-27 to
+        2026-10-26), and leaves out the Windows folder's resource files that every process holds."""
+        import probes
+        target = SCRATCH / "held-open.bin"
+        target.write_bytes(b"x" * 4096)
+        holder = subprocess.Popen([PYTHON, "-c", "import sys, time\nf = open(sys.argv[1], 'rb')\ntime.sleep(60)", str(target)])
+        wanted = os.path.normcase(os.path.realpath(str(target)))
+        found, took = [], 0.0
+        try:
+            proc = psutil.Process(holder.pid)
+            deadline = time.time() + 10
+            while time.time() < deadline and wanted not in found:
+                started = time.perf_counter()               # the venv's python.exe on Windows runs the base one as a child
+                found = [os.path.normcase(os.path.realpath(p)) for q in [proc] + proc.children(recursive=True)
+                         for p in probes.process_paths(q)]
+                took = time.perf_counter() - started
+                time.sleep(0.2)
+        finally:
+            holder.kill()
+            holder.wait()
+        measured("units.open_files", {"paths": found, "seconds": round(took, 3)})
+        self.assertIn(wanted, found)
+        if WINDOWS:
+            system = os.path.normcase(os.environ["SystemRoot"])
+            self.assertEqual([p for p in found if p.startswith(system)], [])
 
     def test_gpu_attribution(self):
         """GPU use belongs to a tree only through its own compute processes; WDDM's [N/A] memory included."""
@@ -1242,7 +1355,7 @@ class T14Units(Base):
         probe.dims = {"disk:PhysicalDrive0": {"capacity": 150e6}, "disk:PhysicalDrive1": {"capacity": 150e6}}
         probe.mounts = {"disk:PhysicalDrive0": ["C:"], "disk:PhysicalDrive1": ["F:"]}
         r = probes.Reading(1)
-        r.disk_rate = 355e6
+        r.disk_rate, r.paths = 355e6, ["C:\\cached.bin"]
         use = probe.tree([r], 1.0, {"disk:PhysicalDrive0": 1.6e6, "disk:PhysicalDrive1": 0.0})
         measured("units.disk_cap", {d: round(v) for d, v in use.items()})
         self.assertLessEqual(sum(use.values()), 1.6e6 + 1)
@@ -1276,7 +1389,8 @@ class T14Units(Base):
     def test_disk_map_asks_only_about_kept_mounts(self):
         """A Mac's volumes, faked: diskutil is asked about the mounts disk_skip_mounts keeps and no others (until
         2026-10-03 about all of them, 12 calls for 1 kept mount on Altiplano), and the disk dimensions are the ones a
-        map of every mount gives, which is also what a disks.json written by the older code holds."""
+        map of every mount gives. A disks.json without the signature of the disks it was made for (written before
+        2026-10-26) is rebuilt once and gives the same dimensions."""
         import probes
         from collections import namedtuple
         from types import SimpleNamespace
@@ -1315,18 +1429,19 @@ class T14Units(Base):
             del asked[:]
             new_again = dimensions(fresh)
             asked_cached = list(asked)
-            full = probes.disk_map(every)                # no skip list: every mount, as the older code mapped them
+            signature = written["signature"]
+            full = probes.disk_map(every, signature)     # no skip list: every mount, as the older code mapped them
             asked_full = list(asked)
             del asked[:]
-            probes.write_json(older / "disks.json", {"host": socket.gethostname(), "at": time.time(), "map": full})
+            probes.write_json(older / "disks.json", {"host": socket.gethostname(), "at": time.time(), "map": full, "skip": []})
             old = dimensions(older)
             asked_older = list(asked)
-            narrower = probes.disk_map(fresh, skip=skip[:1])            # a list that no longer covers the cached map
+            narrower = probes.disk_map(fresh, signature, skip=skip[:1])  # a list that no longer covers the cached map
             asked_narrower = list(asked)
             probes.sys.platform = "win32"                # the other two branches leave the same mounts out
-            letters = probes.disk_map(windows, skip=["D:"])
+            letters = probes.disk_map(windows, signature, skip=["D:"])
             probes.sys.platform = "linux"
-            mounted = probes.disk_map(linux, skip=skip)
+            mounted = probes.disk_map(linux, signature, skip=skip)
         finally:
             (probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters,
              probes._mac_physical_disk) = saved
@@ -1341,7 +1456,7 @@ class T14Units(Base):
         self.assertEqual(sorted(full), ["disk0", "disk5", "disk8"])
         self.assertEqual(new["mounts"], {"disk:disk0": ["/"], "disk:disk8": ["/Volumes/Archive"]})
         self.assertEqual(new_again, new)
-        self.assertEqual(asked_older, [], "a disks.json of the older code, with every mount, is served as it is")
+        self.assertEqual(asked_older, ["/", "/Volumes/Archive"], "a disks.json without a signature is rebuilt")
         self.assertEqual(old, new, "the same dimensions, labels and aliases as from a map of every mount")
         self.assertIn("/System/Volumes/Data", asked_narrower)
         self.assertEqual(narrower["disk0"], ["/", "/System/Volumes/VM", "/System/Volumes/Preboot", "/System/Volumes/Data",
@@ -1572,7 +1687,7 @@ class T17Teppich(Base):
         # volume. Built after the burner's start, the two were ready 5.9 s after it on Altiplano with the suite started
         # by the dispatcher (2026-10-03), the burner had ended at 5.4 s, and both modes read 0: no reading at all, which
         # the first assertion took for the 0.0 it wants.
-        config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"]}
+        config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"], "disk_paths_seconds": 1}
         quiet = probes.Meter(config, Path(tempfile.mkdtemp()), first_sample_rates=False)
         eager = probes.Meter(config, Path(tempfile.mkdtemp()))
         burner = subprocess.Popen([PYTHON, "-c", "import time\nend = time.time() + 0.4\nwhile time.time() < end: pass\ntime.sleep(60)"])
@@ -1593,7 +1708,8 @@ class T17Teppich(Base):
 
     def test_learned_capacity_rises_in_a_running_meter(self):
         import probes
-        config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"], "disk_default_bytes_per_s": 150e6}
+        config = {"disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/"], "disk_default_bytes_per_s": 150e6,
+                  "disk_paths_seconds": 1}
         meter = probes.Meter(config, Path(tempfile.mkdtemp()), first_sample_rates=False)
         disks = [d for d in meter.dimensions() if d.startswith("disk:")]
         if not disks:

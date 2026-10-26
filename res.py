@@ -17,7 +17,7 @@ Commands for sessions (python3 on the Mac, python on Windows; any interpreter wo
     request (--profile TRIAL | --need DIM=AMOUNT,...) --for DURATION [--on MACHINE] [--why TEXT] [--desk M:D]
     run --lease ID [--on MACHINE] [--wait] [--cwd DIR] -- PROGRAM...   start a leased job, detached, with a log
     wait ID                               attach to a lease on this machine: its output and notices arrive here, no mail
-    extend ID [--for DURATION] [--profile TRIAL | --need ...] [--on MACHINE]
+    extend ID [--for DURATION] [--profile TRIAL | --need ...] [--on MACHINE]   --for sets the new total, from the start
     release ID [--kill] [--on MACHINE]
     leases [--on MACHINE | --all]         the leases on a machine
     status [ID] [--on MACHINE]            one lease with its log tail, or the dispatcher and compliance summary
@@ -1172,6 +1172,7 @@ def cmd_trial(args, config: dict) -> None:
     t0 = time.monotonic()
     root = process(child.pid)
     seen = {}
+    probe_errors = set()
     peaks = collections.defaultdict(float)
     sums = collections.defaultdict(float)
     samples = 0
@@ -1221,7 +1222,8 @@ def cmd_trial(args, config: dict) -> None:
                     pass
             last_session_scan = time.monotonic()
         live = [p for p in seen.values() if alive(p)]
-        system, per = meter.sample({"trial": live}, want_paths=sys.platform != "win32")
+        system, per = meter.sample({"trial": live})
+        probe_errors.update(meter.errors)
         use = per.get("trial", {})
         for dim in system_only:
             use[dim] = max(0.0, system.get(dim, 0.0) - baseline.get(dim, 0.0))
@@ -1251,8 +1253,10 @@ def cmd_trial(args, config: dict) -> None:
               "started": started_wall, "seconds": round(elapsed, 2), "finished": finished,
               "exit": exit_code if finished else None, "killed": killed, "survivors": still,
               "profile": profile, "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "output": str(out_path),
-              "attribution": {d: "machine delta over baseline" for d in system_only}}
+              "attribution": {d: "machine delta over baseline" for d in system_only}, "probe_errors": sorted(probe_errors)}
     write_json(folder / (ident + ".json"), record)
+    for error in sorted(probe_errors):
+        print("WARN probe failed, its dimensions are missing from some samples of this profile: " + error)
     if args.json:
         print(json.dumps(record, indent=1))
         trial_exit(0 if finished else TRIAL_CUT_OFF)
@@ -2038,6 +2042,7 @@ class Dispatcher:
         self.folder = machine_dir(self.machine)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.meter = probes.Meter(config, LOCAL_DIR, first_sample_rates=False)
+        self.probe_errors = set()                     # what the probes raised in the last sample, each logged once
         self.window = collections.deque()             # (monotonic time, {dim: unleased})
         self.last_system = {}
         self.last_measured = {}                       # lease id -> {dim: use}
@@ -2160,7 +2165,17 @@ class Dispatcher:
             proc = process(run.get("runner_pid"), run.get("runner_create_time"))
             if proc is not None:
                 trees[lease["id"]] = tree_of(proc)
+        before = set(self.meter.dimensions())
         system, per = self.meter.sample(trees)
+        after = set(self.meter.dimensions())
+        for error in self.meter.errors:
+            if error not in self.probe_errors:
+                log(self.machine, "WARN probe failed, its dimensions are left out of the sample: " + error)
+        self.probe_errors = set(self.meter.errors)
+        if after != before:
+            log(self.machine, "disks changed: added " + (", ".join(sorted(after - before)) or "none") + "; gone "
+                + (", ".join(sorted(before - after)) or "none") + "; dimensions now " + ", ".join(self.meter.dimensions()))
+            self.meter.raise_learned(self.learned)
         system_only = self.meter.system_only()
         running_need = collections.defaultdict(float)
         for lease in leases:
@@ -2358,7 +2373,7 @@ class Dispatcher:
             if "duration" in ask:
                 lease["duration"] = float(ask["duration"])
                 lease.get("notices", {}).pop("duration", None)
-                parts.append("duration now " + human_duration(lease["duration"]))
+                parts.append("duration now " + human_duration(lease["duration"]) + " in total, counted from the start")
             if ask.get("need"):
                 need, notes, refusal = self.normalise(ask["need"])
                 merged = dict(lease.get("need") or {})
@@ -2548,7 +2563,8 @@ class Dispatcher:
                 self.mail(lease, "Leased job " + ident + " ran past its duration",
                           "The leased job " + ident + " on " + self.machine + " has run " + human_duration(time.time() - started)
                           + ", past its stated " + human_duration(lease.get("duration")) + ". It keeps running.\nLog tail:\n\n"
-                          + tail(side_path(self.machine, ident, ".log"), 10) + "\n\nExtend: res extend " + ident + " --for <more>",
+                          + tail(side_path(self.machine, ident, ".log"), 10) + "\n\nExtend: res extend " + ident
+                          + " --for <new total duration, counted from the job's start, not an addition>",
                           "duration")
             log_path = side_path(self.machine, ident, ".log")
             try:
@@ -3421,7 +3437,8 @@ def main() -> None:
     p.add_argument("--extend", help="extend this lease instead (same as res extend)")
     p = sub.add_parser("extend", help="more time or resources for a lease")
     p.add_argument("id")
-    p.add_argument("--for", dest="duration")
+    p.add_argument("--for", dest="duration", help="the lease's new total duration, counted from the job's start (not added"
+                   " to the old one): a job 4 h into a 5 h lease that needs 2 h more asks --for 6h")
     p.add_argument("--profile")
     p.add_argument("--need")
     p.add_argument("--on")

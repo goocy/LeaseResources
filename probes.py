@@ -15,7 +15,7 @@ Kinds and units:
             else (a simulator in the tests, or a future exporter)
 
 Per-process use is exact for cpu and ram, near-exact for disk bytes (macOS: proc_pid_rusage; Windows and Linux: psutil
-io_counters, which on Windows counts all I/O, not only disk) and spread across the disks the tree has files open on;
+io_counters, which on Windows counts all I/O, not only disk) and put on the disks each process has files open on;
 vram per process comes from nvidia-smi where the driver reports it, GPU utilisation is split by vram share. Network use
 per process cannot be measured with psutil, so net dimensions are 'system only': callers attribute them themselves.
 
@@ -138,15 +138,20 @@ def disk_bytes(proc: psutil.Process):
 
 def process_paths(proc: psutil.Process) -> list:
     """The files a process has open: where its disk bytes go. Not its working folder, which says nothing about that (a
-    reader in C: reading from G: was put on C: and capped at C:'s rate, Mistral 2026-09-28). Nothing on Windows, where
-    psutil's open_files() can stall for a long time on pipe handles (the 10-second trial kill never came, Moosfels)."""
-    paths = []
-    if sys.platform == "win32":
-        return paths
+    reader in C: reading from G: was put on C: and capped at C:'s rate, Mistral 2026-09-28). On Windows the files under
+    the Windows folder are left out: every process holds kernel32.dll.mui and KernelBase.dll.mui there, which would put
+    every job on C:. Windows was skipped from 2026-09-27 to 2026-10-26 on the suspicion that open_files() stalled a
+    trial on Moosfels; on Mistral on 2026-10-26 (psutil 7.2.2) it took 0.04 to 0.4 s per process (2017 files of
+    a busy program in 0.41 s) and holds the GIL meanwhile, so the Meter reads it at most every disk_paths_seconds. A process
+    whose files this user may not read (another user's or an elevated one: 143 of 290 readable processes on Mistral)
+    has no known disk, and its cpu and ram are still read."""
     try:
-        paths.extend(f.path for f in proc.open_files())
-    except (psutil.Error, OSError):
-        pass
+        paths = [f.path for f in proc.open_files()]
+    except psutil.AccessDenied:
+        return []
+    if sys.platform == "win32":
+        system = os.environ["SystemRoot"].casefold() + "\\"
+        paths = [p for p in paths if not p.casefold().startswith(system)]
     return paths
 
 
@@ -244,21 +249,28 @@ def _mac_physical_disk(mountpoint: str):
 WINDOWS_PARTITIONS = "Get-Partition | Where-Object DriveLetter | ForEach-Object { [string]$_.DriveLetter + ' ' + [string]$_.DiskNumber }"
 
 
-def disk_map(local_dir: Path, max_age: float = 3600, skip=()) -> dict:
+def disk_signature(counters: dict, skip=()) -> list:
+    """What changes when a disk or a volume comes or goes: the physical disks the I/O counters name, and the mounts that
+    skip keeps. Cheap (under a millisecond on Mistral), so DiskProbe compares it on every sample."""
+    mounts = [p.mountpoint for p in psutil.disk_partitions(all=False) if not any(p.mountpoint.startswith(s) for s in skip)]
+    return [sorted(counters), sorted(mounts)]
+
+
+def disk_map(local_dir: Path, signature: list, max_age: float = 3600, skip=()) -> dict:
     """physical disk name (as psutil.disk_io_counters(perdisk=True) names it) -> list of mount points / drive letters.
-    Cached per machine in the local folder for an hour, because it costs a diskutil or PowerShell call per volume.
+    Cached per machine in the local folder for an hour and for as long as the disks and mounts are the ones it was built
+    with (signature, from disk_signature), because it costs a diskutil or PowerShell call per volume. Until 2026-10-26 the
+    cache ignored the disks present, so a disk plugged in within the hour was missing from every new meter.
     A mount that starts with an entry of skip (the config's disk_skip_mounts) is left out before that call: until
     2026-10-03 the map held every mount and DiskProbe dropped those afterwards, on Altiplano 11 of 12 diskutil calls,
     about 1 s of every first meter in a local folder and 3 s below the dispatcher. The cache names the entries it was
-    built with and serves every caller whose list has them all; one written before that names none and holds every
-    mount, so DiskProbe still filters what it gets."""
+    built with and serves every caller whose list has them all."""
     skip = sorted(set(s for s in skip if s))
     cache = local_dir / "disks.json"
     cached = read_json(cache)
-    built_with = cached.get("skip", [])
     if (cached.get("host") == socket.gethostname() and time.time() - float(cached.get("at", 0)) < max_age
-            and isinstance(built_with, list) and all(s in skip for s in built_with)):
-        return cached.get("map", {})
+            and cached.get("signature") == signature and all(s in skip for s in cached["skip"])):
+        return cached["map"]
     mapping = {}
     if sys.platform == "darwin":
         for part in psutil.disk_partitions(all=False):
@@ -268,11 +280,8 @@ def disk_map(local_dir: Path, max_age: float = 3600, skip=()) -> dict:
             if disk:
                 mapping.setdefault(disk, []).append(part.mountpoint)
     elif sys.platform == "win32":
-        try:
-            out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PARTITIONS],
-                                 capture_output=True, text=True, timeout=30, creationflags=no_window()).stdout
-        except (OSError, subprocess.SubprocessError):
-            out = ""
+        out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PARTITIONS],
+                             capture_output=True, text=True, timeout=30, creationflags=no_window(), check=True).stdout
         for line in out.splitlines():
             letter, _, number = line.strip().partition(" ")
             if letter and number.strip().isdigit() and not any((letter + ":").startswith(s) for s in skip):
@@ -284,10 +293,7 @@ def disk_map(local_dir: Path, max_age: float = 3600, skip=()) -> dict:
             name = Path(part.device).name
             base = name.rstrip("0123456789") if name.startswith("sd") or name.startswith("hd") else name
             mapping.setdefault(base, []).append(part.mountpoint)
-    try:
-        write_json(cache, {"host": socket.gethostname(), "at": time.time(), "map": mapping, "skip": skip})
-    except OSError:
-        pass
+    write_json(cache, {"host": socket.gethostname(), "at": time.time(), "map": mapping, "skip": skip, "signature": signature})
     return mapping
 
 
@@ -297,20 +303,31 @@ def _learned(local_dir: Path, name: str) -> dict:
 
 class DiskProbe(Probe):
     """One dimension per physical disk, in bytes/s. Capacity: 'disk_capacity' in the config (by name or label alias),
-    else the highest rate ever seen on that disk (learned by the dispatcher), at least 'disk_default_bytes_per_s'."""
+    else the highest rate ever seen on that disk (learned by the dispatcher), at least 'disk_default_bytes_per_s'.
+    The dimensions are rebuilt whenever a disk or a mount comes or goes (disk_signature, checked on every sample): until
+    2026-10-26 they were fixed when the probe was made, and Mistral's dispatcher, started with five disks, refused every
+    lease on the hot-swapped F: and H: for two days ('no such disk here') and put their bytes on the other disks."""
 
     def __init__(self, config, local_dir):
         super().__init__(config, local_dir)
-        counters = psutil.disk_io_counters(perdisk=True) or {}
-        skip = [s for s in config.get("disk_skip_mounts", []) if s]
-        mapping = disk_map(local_dir, skip=skip)
-        learned = _learned(local_dir, "learned_peaks")
-        configured = config.get("disk_capacity", {})
-        default = float(config.get("disk_default_bytes_per_s", 150e6))
+        self.skip = [s for s in config.get("disk_skip_mounts", []) if s]
+        self.signature = None
         self.mounts = {}
+        self.prev = psutil.disk_io_counters(perdisk=True)
+        self.refresh(self.prev)
+        self.last_rates = {}
+
+    def refresh(self, counters: dict) -> None:
+        signature = disk_signature(counters, self.skip)
+        if signature == self.signature:
+            return
+        mapping = disk_map(self.local_dir, signature, skip=self.skip)
+        learned = _learned(self.local_dir, "learned_peaks")
+        configured = self.config.get("disk_capacity", {})
+        default = float(self.config.get("disk_default_bytes_per_s", 150e6))
+        dims, mounts, learnable = {}, {}, set()
         for disk in sorted(counters):
-            mounts = mapping.get(disk, [])
-            kept = [m for m in mounts if not any(m.startswith(s) for s in skip)]
+            kept = [m for m in mapping.get(disk, []) if not any(m.startswith(s) for s in self.skip)]
             if not kept:
                 continue
             dim = "disk:" + disk
@@ -321,15 +338,15 @@ class DiskProbe(Probe):
                     capacity = float(configured[alias])
             if capacity is None:
                 capacity = max(default, float(learned.get(dim, 0)))
-                self.learnable.add(dim)
+                learnable.add(dim)
             label = ", ".join(kept[:3]) + (" ..." if len(kept) > 3 else "")
-            self.dims[dim] = {"capacity": capacity, "label": label, "aliases": aliases}
-            self.mounts[dim] = kept
-        self.prev = counters
-        self.last_rates = {}
+            dims[dim] = {"capacity": capacity, "label": label, "aliases": aliases}
+            mounts[dim] = kept
+        self.dims, self.mounts, self.learnable, self.signature = dims, mounts, learnable, signature
 
     def system(self, dt):
-        now = psutil.disk_io_counters(perdisk=True) or {}
+        now = psutil.disk_io_counters(perdisk=True)
+        self.refresh(now)
         use = {}
         busy = {}
         for dim in self.dims:
@@ -356,27 +373,20 @@ class DiskProbe(Probe):
         return best
 
     def tree(self, readings, dt, system):
-        total = sum(r.disk_rate for r in readings)
+        """Each process's bytes go to the disks it has files open on, split by what each of those disks physically
+        moved, and no disk gets more than it moved: Windows' per-process counters include reads served from the page
+        cache (355 MB/s per process against 1.6 MB/s on the disk, Moosfels 2026-09-27) and network and pipe I/O. The
+        bytes of a process with no file open on a known disk go to no disk; they stay in the machine's unleased use.
+        Until 2026-10-26 a tree's bytes went to the disks by what each moved whenever no open file was known, always on
+        Windows, so a job reading only F: was blamed for C:, G: and E:, which other programs kept busy
+        (Mistral, 2026-10-25 and -26)."""
         result = {dim: 0.0 for dim in self.dims}
-        if total <= 0 or not self.dims:
-            return result
-        devices = set()
         for r in readings:
-            for path in r.paths:
-                dev = self.device_of(path)
-                if dev:
-                    devices.add(dev)
-        # Known open files decide the disks; otherwise the bytes are spread over all disks by what each physically
-        # moved in the same interval, which puts a reader of G: on G: even when it runs in C:.
-        candidates = sorted(devices) if devices and sum(system.get(d, 0.0) for d in devices) > 0 else sorted(self.dims)
-        weights = {d: system.get(d, 0.0) for d in candidates}
-        wsum = sum(weights.values())
-        # A tree cannot move more physical bytes than the disks did: Windows' per-process counters include reads
-        # served from the page cache (355 MB/s per process against 1.6 MB/s on the disk, Moosfels 2026-09-27).
-        total = min(total, wsum)
-        for d in candidates:
-            result[d] = total * (weights[d] / wsum) if wsum > 0 else 0.0
-        return result
+            disks = sorted(set(self.device_of(p) for p in r.paths) - {None})
+            moved = sum(system[d] for d in disks)
+            for d in disks:
+                result[d] += r.disk_rate * system[d] / moved if moved > 0 else 0.0
+        return {d: min(v, system[d]) for d, v in result.items()}
 
 
 def _usable_interface(addrs) -> bool:
@@ -583,6 +593,9 @@ class Meter:
             if probe.dims:
                 self.probes.append(probe)
         self.prev = {}                                    # (pid, create_time) -> (time, cpu seconds, disk bytes)
+        self.paths = {}                                   # (pid, create_time) -> (time, open files), see process_paths
+        self.paths_seconds = float(config["disk_paths_seconds"])
+        self.errors = []                                  # what the probes raised in the last sample
         self.last = time.monotonic()
         self.last_wall = time.time()
 
@@ -618,7 +631,7 @@ class Meter:
                 return kind + ":0"
         return None
 
-    def _read(self, proc: psutil.Process, now: float, want_paths: bool):
+    def _read(self, proc: psutil.Process, now: float):
         try:
             with proc.oneshot():
                 ctime = proc.create_time()
@@ -643,27 +656,37 @@ class Meter:
             reading.cpu_rate = cpu / span
             reading.disk_rate = (disk or 0) / span
         self.prev[key] = (now, cpu, disk)
-        if want_paths:
-            reading.paths = process_paths(proc)
+        # Open files matter only for a process that moved bytes. They are read at once when none are known (a writer
+        # that opened, filled and closed a 200 MB file within a second was missed by a plain 1-second cache, suite
+        # T1 on Mistral, 2026-10-26) and otherwise at most every disk_paths_seconds; an idle process is never read.
+        known = self.paths.get(key)
+        if reading.disk_rate > 0 and (not known or not known[1] or now - known[0] >= self.paths_seconds):
+            try:
+                self.paths[key] = known = (now, process_paths(proc))
+            except psutil.NoSuchProcess:
+                return None
+        reading.paths = known[1] if known else []
         return reading
 
-    def sample(self, trees: dict, want_paths: bool = True) -> tuple:
+    def sample(self, trees: dict) -> tuple:
         """trees: {name: [psutil.Process]} -> (system {dim: use}, {name: {dim: use}}). System-only dimensions are
-        absent from the per-tree results."""
+        absent from the per-tree results. A probe that raises leaves its dimensions out of this sample and the others
+        go on; what it raised is in self.errors for the caller to report (until 2026-10-26 it was dropped unseen)."""
         now = time.monotonic()
         dt = max(1e-3, now - self.last)
         system = {}
+        self.errors = []
         for probe in self.probes:
             try:
                 system.update(probe.system(dt))
-            except Exception:
-                pass
+            except Exception as exc:
+                self.errors.append(type(probe).__name__ + ".system: " + type(exc).__name__ + ": " + str(exc))
         per_tree = {}
         seen = set()
         for name, procs in trees.items():
             readings = []
             for proc in procs:
-                r = self._read(proc, now, want_paths)
+                r = self._read(proc, now)
                 if r is not None:
                     readings.append(r)
                     seen.add(proc.pid)
@@ -673,12 +696,13 @@ class Meter:
                     continue
                 try:
                     use.update(probe.tree(readings, dt, system))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.errors.append(type(probe).__name__ + ".tree: " + type(exc).__name__ + ": " + str(exc))
             for dim in self.system_only():
                 use.pop(dim, None)
             per_tree[name] = use
         self.prev = {k: v for k, v in self.prev.items() if k[0] in seen}
+        self.paths = {k: v for k, v in self.paths.items() if k[0] in seen}
         self.last = now
         self.last_wall = time.time()
         return system, per_tree
