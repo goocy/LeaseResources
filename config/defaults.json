@@ -41,7 +41,7 @@
   "disk_default_bytes_per_s": 150000000,
   "disk_capacity": {},
   "disk_paths_seconds": 1,
-  "disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/", "/Volumes/Recovery"],
+  "disk_skip_mounts": ["/Library/Developer/CoreSimulator", "/System/Volumes/", "/Volumes/Recovery", "/private/var/run/com.apple.security.cryptexd/"],
   "net_default_bytes_per_s": 125000000,
   "net_capacity": {},
   "net_skip": ["vethernet", "vmware", "virtualbox", "hyper-v", "tailscale", "zerotier", "npcap", "bluetooth", "loopback", "isatap", "teredo", "proton", "wireguard", "openvpn", "tap-windows", "nordlynx", "mullvad", "utun"],
