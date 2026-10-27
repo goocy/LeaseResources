@@ -221,8 +221,10 @@ def inbox(machine: str, kind: str) -> Path:
 
 
 def file_stamp() -> str:
-    now = datetime.datetime.now()
-    return now.strftime("%y%m%d-%H%M%S-") + "%03d" % (now.microsecond // 1000)
+    """UTC, ending in Z, since 2026-10-27: a local-time stamp goes back with the clock (a time zone change, the DST
+    fall-back), and then a new report sorted as the oldest and was deleted at once (Pulvermaar, 2026-10-26)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime("%y%m%d-%H%M%S-") + "%03dZ" % (now.microsecond // 1000)
 
 
 def report_names(machine: str) -> list:
@@ -230,7 +232,7 @@ def report_names(machine: str) -> list:
     if not folder.is_dir():
         return []
     return sorted((p for p in folder.iterdir() if p.name.endswith(".json") and not p.name.startswith(".")),
-                  key=lambda p: p.name, reverse=True)
+                  key=lambda p: (p.stem.endswith("Z"), p.name), reverse=True)    # a local-time name is from before: older
 
 
 def read_report(machine: str) -> dict:
