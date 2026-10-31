@@ -729,15 +729,15 @@ def owner_desk(config: dict, given) -> str:
     "Stahlwerk:Spaced Desk Name" became "Stahlwerk:Spaced", and its lease mail went to General)."""
     if given:
         return given.strip()
-    try:
-        out = subprocess.run([sys.executable, "-B", mail_script(config), "whoami", "--desk"], capture_output=True,
-                             text=True, timeout=30, creationflags=probes.no_window()).stdout
-    except (OSError, subprocess.SubprocessError):
-        out = ""
-    desk = out.strip()
-    if ":" in desk and len(desk.splitlines()) == 1:
-        return desk
-    return this_machine(config) + ":General"
+    run = subprocess.run([sys.executable, "-B", mail_script(config), "whoami", "--desk"], capture_output=True,
+                         text=True, timeout=30, creationflags=probes.no_window())
+    desk = run.stdout.strip()
+    # No fallback to Machine:General since 2026-10-30: under ClaudeMail v4 that desk is Home, where every notice would
+    # open a new session. A desk that cannot be told is an error the requester sees.
+    if not (run.returncode == 0 and ":" in desk and len(desk.splitlines()) == 1):
+        raise SystemExit("mail.py whoami --desk did not name this session's desk (exit " + str(run.returncode) + "): "
+                         + " ".join((run.stdout + run.stderr).split())[-300:] + "\nGive --desk Machine:Desk.")
+    return desk
 
 
 def desk_known(config: dict, desk: str) -> bool:
@@ -818,24 +818,19 @@ def send_mail(config: dict, machine: str, desk: str, subject: str, body: str, fo
     outbox.mkdir(parents=True, exist_ok=True)
     path = outbox / (datetime.datetime.now().strftime("%y%m%d-%H%M%S-%f") + ".md")
     path.write_text(body, encoding="utf-8")
-    ok = False
-    for target in [desk, desk.partition(":")[0]]:
-        if target != desk:                            # the desk is gone or was never right: say where this was meant to go
-            path.write_text("(Meant for the desk " + desk + ", which ClaudeMail refused; delivered to this machine's"
-                            " General desk instead. See the LeaseResources log on " + machine + ".)\n\n" + body,
-                            encoding="utf-8")
-        try:
-            owner = ["--for-session", for_session] if for_session and target == desk else []
-            run = subprocess.run([sys.executable, "-B", mail_script(config), "send", "--to", target, "--subject", subject,
-                                  "--body-file", str(path), "--to-own-desk"] + owner, capture_output=True, text=True, timeout=60,
-                                 cwd=str(SERVICE_DIR), env=mail_env(), creationflags=probes.no_window())
-            ok = run.returncode == 0
-            detail = " ".join((run.stdout + run.stderr).split())[:300]
-        except (OSError, subprocess.SubprocessError) as exc:
-            detail = str(exc)
-        log(machine, ("mailed " if ok else "WARN mail failed ") + target + ": " + subject + " (ClaudeMail: " + detail + ")")
-        if ok:
-            break
+    # One target since 2026-10-30. The second try on the bare machine without --for-session would, under ClaudeMail v4,
+    # open a new Home session for every notice that the first try could not place; ClaudeMail itself now tells a
+    # sender's session when mail waits, and this failure is notified below.
+    owner = ["--for-session", for_session] if for_session else []
+    try:
+        run = subprocess.run([sys.executable, "-B", mail_script(config), "send", "--to", desk, "--subject", subject,
+                              "--body-file", str(path), "--to-own-desk"] + owner, capture_output=True, text=True, timeout=60,
+                             cwd=str(SERVICE_DIR), env=mail_env(), creationflags=probes.no_window())
+        ok = run.returncode == 0
+        detail = " ".join((run.stdout + run.stderr).split())[:300]
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, detail = False, str(exc)
+    log(machine, ("mailed " if ok else "WARN mail failed ") + desk + ": " + subject + " (ClaudeMail: " + detail + ")")
     if not ok:
         notify(config, machine, "LeaseResources: " + subject, "Mail to " + desk + " failed; see the log.")
     try:
@@ -907,9 +902,19 @@ def headroom(config: dict, dim: str) -> float:
     return num(config, "headroom", 0.85)
 
 
+REPORT_SECONDS = 600       # a report on every change, else every 10 minutes (every minute until 2026-10-30, which left
+                           # some 40,000 deleted files in each reports folder for every Resilio peer to walk)
+FRESH_SECONDS = 1500       # a dispatcher counts as reporting while its newest report is younger than this
+
+
 def dispatcher_state(machine: str, config: dict) -> tuple:
+    """(reporting, its newest report). This machine's dispatcher counts as running while its local heartbeat is under
+    two minutes old, as take_lock trusts it; another machine's while its report is younger than FRESH_SECONDS."""
     report = read_report(machine)
-    fresh = age_of(report.get("updated")) < 180
+    if machine == this_machine(config):
+        beat = local_heartbeat()
+        return beat.is_file() and age_of(read_json(beat).get("updated")) < 120, report
+    fresh = age_of(report.get("updated")) < FRESH_SECONDS
     return fresh, report
 
 
@@ -1367,10 +1372,11 @@ def cmd_request(args, config: dict) -> None:
              "command": command, "command_key": command_key(command) if command else "", "margin": margin}
     if not desk_known(config, lease["desk"]):
         # The user's ruling (2026-09-30, relayed by Stahlwerk): an unknown desk warns the sender instead of its mail
-        # going quietly to General. The request stands; its mail still reaches General, marked as misaddressed.
-        print("Warning: ClaudeMail has no desk " + lease["desk"] + ", so this lease's mail will go to "
-              + lease["desk"].partition(":")[0] + "'s General desk instead. If that is wrong, `res release "
-              + ident + "` and request again with --desk Machine:Desk (`mail.py desks` lists them).")
+        # going quietly to General. The request stands. Since 2026-10-30 its mail is not sent anywhere else: ClaudeMail
+        # refuses it, and the failure is a desktop notification and a log line on this machine.
+        print("Warning: ClaudeMail has no desk " + lease["desk"] + ", so this lease's mail will be refused, and only a"
+              " desktop notification on " + here + " will say so. If that is wrong, `res release " + ident
+              + "` and request again with --desk Machine:Desk (`mail.py sessions` lists the desks).")
     path = lease_path(target, ident) if target == here else folder / (ident + ".json")
     write_json(path, lease)                       # to another machine: a write-once file its dispatcher takes and deletes
     fresh, report = dispatcher_state(target, config)
@@ -2081,7 +2087,7 @@ class Dispatcher:
         and deletes), otherwise by mail to its desk. Never both: flush_notices mails a notice only when its waiter is
         gone without having taken it."""
         ident = lease["id"]
-        desk = lease.get("desk") or (self.machine + ":General")
+        desk = lease["desk"]                                  # every lease names its desk (owner_desk)
         footer = ("\n\nFrom the LeaseResources dispatcher on " + self.machine + " (" + str(SCRIPT) + "). Lease file: "
                   + str(lease_path(self.machine, ident)) + ". Replies to this mail reach nobody; use `res status "
                   + ident + (" --on " + self.machine if lease.get("from_machine") != self.machine else "") + "`.")
@@ -2137,7 +2143,7 @@ class Dispatcher:
                 notice = read_json(path)
                 if notice.get("subject"):
                     log(self.machine, "the waiter of " + folder.name + " is gone; mailing its notice: " + notice["subject"])
-                    send_mail(self.config, self.machine, notice.get("desk") or (self.machine + ":General"), notice["subject"],
+                    send_mail(self.config, self.machine, notice["desk"], notice["subject"],
                               str(notice.get("body", "")) + str(notice.get("footer", "")), notice.get("session") or "")
                 self.drop(path)
             if waiter is None:
@@ -3211,7 +3217,7 @@ class Dispatcher:
     # -- report, housekeeping
     def report(self) -> None:
         """Publish what other machines need (`--on`): a new report file when the content changed, or at least every
-        60 s as a heartbeat; never a rewrite in place. Measurements that change every sample do not count as a change."""
+        REPORT_SECONDS as a heartbeat; never a rewrite in place. Measurements that change every sample do not count as a change."""
         dims = self.meter.dimensions()
         limits = self.limits()
         leases = self.leases()
@@ -3230,7 +3236,7 @@ class Dispatcher:
                   "planned": self.planned(), "queue": [l["id"] for l in leases if l.get("state") == "queued"],
                   "active": [l["id"] for l in leases if l.get("state") in ACTIVE], "leases": summary,
                   "compliance": self.compliance_cache}
-        if stable != self.last_report or time.monotonic() - self.last_report_at > 60:
+        if stable != self.last_report or time.monotonic() - self.last_report_at > REPORT_SECONDS:
             write_report(self.machine, dict(stable, updated=now_iso(), unleased=self.unleased_now(), system=self.last_system))
             self.last_report = stable
             self.last_report_at = time.monotonic()
