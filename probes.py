@@ -80,7 +80,7 @@ def replace_retrying(source, target) -> None:
 
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp" + str(os.getpid()))
+    tmp = path.with_name("." + path.name + "." + str(os.getpid()) + ".tmp")   # *.tmp is in Resilio's ignore list
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=1, sort_keys=True)
     try:
