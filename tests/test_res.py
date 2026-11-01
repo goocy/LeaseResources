@@ -812,7 +812,7 @@ class T6CrossMachine(Base):
         self.assertFalse(w.state("Altiplano", lid + ".json").exists())
         synced = sorted(str(p.relative_to(w.data)) for p in (w.data / "leases").rglob("*") if p.is_file())
         measured("R6.synced_files_after", synced)
-        self.assertTrue(all("/reports/" in s.replace(chr(92), "/") for s in synced), synced)   # requests/asks taken
+        self.assertTrue(all(s.replace(chr(92), "/").split("/")[2] in ("reports", "beats") for s in synced), synced)  # requests/asks taken
         run = w.res("Altiplano", "run", "--lease", lid, "--on", "Mistral", "--", PYTHON, str(w.allowed / "sleepy.py"), "3")
         self.assertIn("Run order written", run.stdout, run.stdout + run.stderr)
         fin = w.wait(lambda: [m for m in w.mail_matching("finished") if m["to"] == "Altiplano:Asker"], 30, "finished mail")
@@ -2046,6 +2046,133 @@ def processes_in(folder: Path) -> dict:
         except psutil.Error:
             continue
     return found
+
+
+class T22QuietPublishing(Base):
+    """Since 2026-10-31 (the I/O audit of that day): a lease record is parsed again only when it changed, the compliance
+    record is read only past what was taken from it, and a report goes out only when its content changed, with a small
+    beat every REPORT_SECONDS by which other machines see the dispatcher run."""
+
+    load = T14Units.load
+
+    def test_leases_parsed_only_when_changed(self):
+        w = World("quiet-leases")
+        res = self.load(w)
+        folder = res.machine_dir("Altiplano")
+        folder.mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            res.write_json(folder / ("L" + str(i) + ".json"), {"id": "L" + str(i), "state": "granted", "requested": str(i)})
+        (folder / "L0.run.json").write_text("{}", encoding="utf-8")               # a side file, never a lease
+        parsed = []
+        real = res.read_json
+        res.read_json = lambda path: parsed.append(Path(path).name) or real(path)
+        ids = lambda: [l["id"] for l in res.all_leases("Altiplano")]
+        self.assertEqual(ids(), ["L0", "L1", "L2", "L3", "L4"])
+        self.assertEqual(len(parsed), 5)
+        leases = res.all_leases("Altiplano")
+        self.assertEqual(len(parsed), 5, "an unchanged lease is not parsed again")
+        leases[0]["state"] = "changed in memory only"
+        self.assertEqual(res.all_leases("Altiplano")[0]["state"], "granted", "callers get copies")
+        res.write_json(folder / "L1.json", {"id": "L1", "state": "running", "requested": "1"})    # the same size
+        self.assertEqual(res.all_leases("Altiplano")[1]["state"], "running")
+        self.assertEqual(parsed[5:], ["L1.json"])
+        (folder / "L4.json").unlink()
+        self.assertEqual(ids(), ["L0", "L1", "L2", "L3"])
+        (folder / "L5.json").write_text("{half a rec", encoding="utf-8")           # unreadable: read again next time
+        ids()
+        ids()
+        self.assertEqual(parsed[6:], ["L5.json", "L5.json"])
+        measured("quiet.lease_parses", {"first": 5, "unchanged": 0, "one_changed": 1})
+
+    def test_compliance_record_read_only_past_what_was_taken(self):
+        w = World("quiet-unleased", {"compliance_log_max_bytes": 20000})
+        res = self.load(w)
+        d = res.Dispatcher(res.load_config())
+        path, rotated = w.state("Altiplano", "unleased.jsonl"), w.state("Altiplano", "unleased.1.jsonl")
+        chunks = []
+        real = res.jsonl_rows
+        res.jsonl_rows = lambda data: chunks.append(len(data)) or real(data)
+
+        def append(n):
+            for i in range(n):
+                d.append_unleased({"event": ["seen", "ended"][i % 2], "at": res.now_iso(), "key": str(i // 2),
+                                   "desk": "Altiplano:Test", "lifetime": i, "shell": "y" * 100})
+
+        def expected():
+            rows = []
+            for f in [rotated, path]:
+                if f.exists():
+                    rows += [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
+            return [{k: r[k] for k in res.COUNTED if k in r} for r in rows]
+
+        append(40)
+        self.assertEqual(res.unleased_counted("Altiplano"), expected())
+        self.assertEqual(chunks, [path.stat().st_size])
+        res.unleased_counted("Altiplano")
+        self.assertEqual(chunks[1:], [0], "nothing new, nothing read")
+        before = path.stat().st_size
+        append(6)
+        self.assertEqual(res.unleased_counted("Altiplano"), expected())
+        self.assertEqual(chunks[2:], [path.stat().st_size - before], "only the appended bytes")
+        line = json.dumps({"event": "seen", "at": res.now_iso(), "key": "half", "desk": "Altiplano:Test"}) + "\n"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line[:20])
+        self.assertEqual(len(res.unleased_counted("Altiplano")), 46, "a line still being written waits")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line[20:])
+        self.assertEqual(res.unleased_counted("Altiplano")[-1]["key"], "half")
+        self.assertFalse(rotated.exists())
+        taken, last = len(chunks), path.stat().st_size
+        append(120)                                       # past compliance_log_max_bytes: the record rotates once
+        self.assertTrue(rotated.exists())
+        self.assertEqual(res.unleased_counted("Altiplano"), expected())
+        self.assertEqual(sum(chunks[taken:]), rotated.stat().st_size - last + path.stat().st_size,
+                         "the rotated file is read on from where it was, not again from its start")
+        self.assertEqual(len(res.UNLEASED_TAKEN), 2)
+        lines = res.compliance_lines("Altiplano", 7)
+        self.assertIn("long commands of Claude sessions without a lease: " + str(len([r for r in expected()
+                      if r["event"] == "seen"])), "\n".join(lines))
+        measured("quiet.unleased_bytes", {"first": chunks[0], "unchanged": chunks[1], "after_rotation": sum(chunks[taken:]),
+                                          "files_now": rotated.stat().st_size + path.stat().st_size})
+
+    def test_report_only_on_change_and_a_beat(self):
+        w = World("quiet-report")
+        res = self.load(w)
+        d = res.Dispatcher(res.load_config())
+        written = []
+        real = res.write_report
+        res.write_report = lambda machine, kind, report: written.append(kind) or real(machine, kind, report)
+        d.report()
+        self.assertEqual(sorted(written), ["beats", "reports"])
+        for _ in range(3):
+            d.report()
+        self.assertEqual(len(written), 2, "nothing changed, nothing written")
+        d.beat_at -= res.REPORT_SECONDS + 1
+        d.report()
+        self.assertEqual(written[2:], ["beats"])
+        res.write_json(res.lease_path("Altiplano", "L1"), {"id": "L1", "state": "queued", "requested": res.now_iso(),
+                                                           "need": {"cpu": 0.5}})
+        d.report()
+        self.assertEqual(written[3:], ["reports"])
+        published = res.read_published("Altiplano")
+        self.assertEqual(published["queue"], ["L1"])
+        self.assertTrue(published["compliance"][0].startswith("Compliance on Altiplano"), published["compliance"])
+        beats = sorted((w.data / "leases" / "Altiplano" / "beats").glob("*.json"))
+        self.assertEqual(len(beats), 2)
+        self.assertLess(beats[-1].stat().st_size, 2000)
+        config = res.load_config()
+        stale = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - res.FRESH_SECONDS - 60))
+        real("Mistral", "reports", {"updated": stale, "pid": 1, "queue": []})
+        self.assertFalse(res.dispatcher_state("Mistral", config)[0])
+        real("Mistral", "beats", {"updated": res.now_iso(), "pid": 1, "compliance": ["from the beat"]})
+        fresh, report = res.dispatcher_state("Mistral", config)
+        self.assertTrue(fresh)
+        self.assertEqual(report["compliance"], ["from the beat"])
+        real("Stahlwerk", "reports", {"updated": res.now_iso(), "pid": 2, "compliance": ["a report from before beats"]})
+        fresh, report = res.dispatcher_state("Stahlwerk", config)
+        self.assertTrue(fresh)
+        self.assertEqual(report["compliance"], ["a report from before beats"])
+        measured("quiet.writes", written)
 
 
 def remove_scratch() -> str:

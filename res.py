@@ -85,6 +85,7 @@ if __name__ == "__main__":
 import argparse          # noqa: E402
 import atexit            # noqa: E402
 import collections       # noqa: E402
+import copy              # noqa: E402
 import datetime          # noqa: E402
 import json              # noqa: E402
 import shutil            # noqa: E402
@@ -227,28 +228,37 @@ def file_stamp() -> str:
     return now.strftime("%y%m%d-%H%M%S-") + "%03dZ" % (now.microsecond // 1000)
 
 
-def report_names(machine: str) -> list:
-    folder = synced_dir(machine) / "reports"
+def report_names(machine: str, kind: str) -> list:
+    """The files of one kind the dispatcher publishes, newest first: "reports" (what other machines need about its
+    leases) or "beats" (its heartbeat with the compliance summary)."""
+    assert kind in ("reports", "beats"), kind
+    folder = synced_dir(machine) / kind
     if not folder.is_dir():
         return []
     return sorted((p for p in folder.iterdir() if p.name.endswith(".json") and not p.name.startswith(".")),
                   key=lambda p: (p.stem.endswith("Z"), p.name), reverse=True)    # a local-time name is from before: older
 
 
-def read_report(machine: str) -> dict:
-    """The newest dispatcher report that parses; Resilio may still be delivering the very newest one."""
-    for path in report_names(machine):
+def read_report(machine: str, kind: str) -> dict:
+    """The newest dispatcher report (or beat) that parses; Resilio may still be delivering the very newest one."""
+    for path in report_names(machine, kind):
         report = read_json(path)
         if report:
             return report
     return {}
 
 
-def write_report(machine: str, report: dict) -> None:
+def read_published(machine: str) -> dict:
+    """The newest report with the newest beat over it: the beat's `updated`, `pid` and `compliance` are the later ones.
+    A dispatcher before 2026-10-31 wrote no beats; its reports carried all three."""
+    return dict(read_report(machine, "reports"), **read_report(machine, "beats"))
+
+
+def write_report(machine: str, kind: str, report: dict) -> None:
     """A new file per report (never rewritten in place: Resilio conflicts), then all but it and the one before it go."""
-    path = synced_dir(machine) / "reports" / (file_stamp() + ".json")
+    path = synced_dir(machine) / kind / (file_stamp() + ".json")
     write_json(path, report)
-    for old in report_names(machine)[2:]:
+    for old in report_names(machine, kind)[2:]:
         try:
             old.unlink()
         except OSError:
@@ -256,7 +266,7 @@ def write_report(machine: str, report: dict) -> None:
 
 
 def report_lease(machine: str, ident: str) -> dict:
-    return (read_report(machine).get("leases") or {}).get(ident) or {}
+    return (read_report(machine, "reports").get("leases") or {}).get(ident) or {}
 
 
 def lease_path(machine: str, ident: str) -> Path:
@@ -320,22 +330,44 @@ def seed_local_state(machine: str) -> None:
         log(machine, "seeded local state from the synced copy: " + json.dumps(dict(counts)))
 
 
-def is_lease_file(path: Path) -> bool:
-    name = path.name
+def is_lease_file(name: str) -> bool:
     return name.endswith(".json") and not any(name.endswith(s) for s in SUFFIXES) and name not in \
         ("dispatcher.json", "history.json") and not name.startswith(".")
+
+
+PARSED = {}     # folder -> {file name: ((st_mtime_ns, st_size), parsed object)}, as read_folder last saw the folder
+
+
+def read_folder(folder: Path, wanted) -> list:
+    """Copies of the JSON objects in the files of folder whose names `wanted` accepts. A file is parsed again only when
+    its modification time or size changed since the last call in this process, and the dispatcher lists its lease
+    records every second (all of them parsed every second until 2026-10-31). The listing's figures are those of the
+    whole file on Windows as well, because every writer replaces a file whole (write_json renames a closed temporary
+    file over it). An object that comes back empty (unreadable, or replaced while it was read) is read again next time.
+    Copies, because the dispatcher changes the leases it is handed before it saves them."""
+    seen = PARSED.get(folder, {})
+    now = {}
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if not wanted(entry.name) or not entry.is_file():
+                continue
+            stat = entry.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+            if entry.name in seen and seen[entry.name][0] == key:
+                now[entry.name] = seen[entry.name]
+                continue
+            data = read_json(Path(entry.path))
+            if data:
+                now[entry.name] = (key, data)
+    PARSED[folder] = now
+    return [copy.deepcopy(data) for _, data in now.values()]
 
 
 def all_leases(machine: str) -> list:
     folder = machine_dir(machine)
     if not folder.is_dir():
         return []
-    found = []
-    for path in folder.iterdir():
-        if path.is_file() and is_lease_file(path):
-            data = read_json(path)
-            if data.get("id"):
-                found.append(data)
+    found = [data for data in read_folder(folder, is_lease_file) if data.get("id")]
     return sorted(found, key=lambda d: (d.get("requested", ""), d.get("id", "")))
 
 
@@ -902,15 +934,16 @@ def headroom(config: dict, dim: str) -> float:
     return num(config, "headroom", 0.85)
 
 
-REPORT_SECONDS = 600       # a report on every change, else every 10 minutes (every minute until 2026-10-30, which left
-                           # some 40,000 deleted files in each reports folder for every Resilio peer to walk)
-FRESH_SECONDS = 1500       # a dispatcher counts as reporting while its newest report is younger than this
+REPORT_SECONDS = 600       # a beat every 10 minutes; a report only on a change (since 2026-10-31; until then a report on
+                           # every change and every 10 minutes, and every minute until 2026-10-30, which left some 40,000
+                           # deleted files in each reports folder for every Resilio peer to walk)
+FRESH_SECONDS = 1500       # a dispatcher counts as reporting while its newest beat is younger than this
 
 
 def dispatcher_state(machine: str, config: dict) -> tuple:
     """(reporting, its newest report). This machine's dispatcher counts as running while its local heartbeat is under
-    two minutes old, as take_lock trusts it; another machine's while its report is younger than FRESH_SECONDS."""
-    report = read_report(machine)
+    two minutes old, as take_lock trusts it; another machine's while its beat is younger than FRESH_SECONDS."""
+    report = read_published(machine)
     if machine == this_machine(config):
         beat = local_heartbeat()
         return beat.is_file() and age_of(read_json(beat).get("updated")) < 120, report
@@ -1870,7 +1903,7 @@ def cmd_leases(args, config: dict) -> None:
     machines = config["machines"] if args.all else [canonical_machine(args.on, config) if args.on else this_machine(config)]
     here = this_machine(config)
     for machine in machines:
-        leases = all_leases(machine) if machine == here else list((read_report(machine).get("leases") or {}).values())
+        leases = all_leases(machine) if machine == here else list((read_report(machine, "reports").get("leases") or {}).values())
         if not args.ended:
             leases = [l for l in leases if l.get("state") in OPEN or age_of(l.get("ended") or l.get("answered")) < 86400]
         if not leases and args.all:
@@ -1918,21 +1951,62 @@ def cmd_status(args, config: dict) -> None:
             print("  | " + line)
 
 
-def iter_unleased(machine: str) -> list:
-    """The compliance record: the rotated older file first, then the current one."""
+UNLEASED_FILES = ["unleased.1.jsonl", "unleased.jsonl"]     # the compliance record: the rotated older file first
+
+
+def jsonl_rows(data: bytes) -> list:
+    """The objects of the lines in data; a line that does not parse is passed over."""
     rows = []
-    for name in ["unleased.1.jsonl", "unleased.jsonl"]:
+    for line in data.decode("utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return rows
+
+
+def iter_unleased(machine: str) -> list:
+    """The whole compliance record, every field."""
+    rows = []
+    for name in UNLEASED_FILES:
         try:
-            with open(machine_dir(machine) / name, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        try:
-                            rows.append(json.loads(line))
-                        except ValueError:
-                            continue
-        except OSError:
-            pass
+            rows += jsonl_rows((machine_dir(machine) / name).read_bytes())
+        except FileNotFoundError:                      # no record yet, or the rotation's moment between the two files
+            continue
+    return rows
+
+
+COUNTED = ("event", "at", "key", "desk", "lifetime")     # what compliance_lines counts in a compliance record row
+UNLEASED_TAKEN = {}   # (st_dev, st_ino) of a record file -> (bytes taken, their rows cut to COUNTED)
+
+
+def unleased_counted(machine: str) -> list:
+    """The compliance record's rows cut to COUNTED, each file read only past what this process took from it before
+    (until 2026-10-31 the dispatcher re-read the whole record, 3 to 10 MB, every 10 minutes). The record is only
+    appended to, a whole line at a time, and its rotation renames unleased.jsonl to unleased.1.jsonl, which keeps the
+    file's identity and so what was taken from it. A line still being written waits for the next call."""
+    global UNLEASED_TAKEN
+    rows, taken = [], {}
+    for name in UNLEASED_FILES:
+        try:
+            fh = open(machine_dir(machine) / name, "rb")
+        except FileNotFoundError:                      # no record yet, or the rotation's moment between the two files
+            continue
+        with fh:
+            stat = os.fstat(fh.fileno())
+            assert stat.st_ino, "no file identity for " + name
+            ident = (stat.st_dev, stat.st_ino)
+            done, kept = UNLEASED_TAKEN[ident] if ident in UNLEASED_TAKEN else (0, [])
+            assert stat.st_size >= done, name + " shrank from " + str(done) + " to " + str(stat.st_size) + " bytes"
+            fh.seek(done)
+            data = fh.read()
+        whole = data[:data.rfind(b"\n") + 1]
+        kept = kept + [{k: row[k] for k in COUNTED if k in row} for row in jsonl_rows(whole)]
+        taken[ident] = (done + len(whole), kept)
+        rows += kept
+    UNLEASED_TAKEN = taken
     return rows
 
 
@@ -1943,11 +2017,12 @@ def print_compliance(machine: str, config: dict, days: float) -> None:
 def compliance_lines(machine: str, days: float) -> list:
     lines = []
     since = time.time() - days * 86400
-    trials = [read_json(p) for p in trial_dir(machine).glob("T*.json")] if trial_dir(machine).is_dir() else []
+    trials = read_folder(trial_dir(machine), lambda name: name.startswith("T") and name.endswith(".json")) \
+        if trial_dir(machine).is_dir() else []
     trials = [t for t in trials if (parse_iso(t.get("started")) or 0) >= since]
     leases = [l for l in all_leases(machine) if (parse_iso(l.get("requested")) or 0) >= since]
     runs = [l for l in leases if l.get("started")]
-    rows = [r for r in iter_unleased(machine) if (parse_iso(r.get("at")) or 0) >= since]
+    rows = [r for r in unleased_counted(machine) if (parse_iso(r.get("at")) or 0) >= since]
     starts = [r for r in rows if r.get("event") == "seen"]
     ends = {r.get("key"): r for r in rows if r.get("event") == "ended"}
     lines.append("Compliance on " + machine + ", last " + format(days, "g") + " days (guidance only, D-260927-4 option b):")
@@ -1979,7 +2054,7 @@ def cmd_notify_test(args, config: dict) -> None:
 def cmd_compliance(args, config: dict) -> None:
     machine = canonical_machine(args.on, config) if args.on else this_machine(config)
     if machine != this_machine(config):
-        print("\n".join(read_report(machine).get("compliance") or ["No compliance summary from " + machine + " yet."]))
+        print("\n".join(read_published(machine).get("compliance") or ["No compliance summary from " + machine + " yet."]))
         print("(the last 7 days, from " + machine + "'s dispatcher report; the full record stays on that machine)")
         return
     print_compliance(machine, config, float(args.days))
@@ -2066,10 +2141,8 @@ class Dispatcher:
         self.unleased_pending = {}                    # key -> candidate younger than the threshold
         self.tool_members = {}                        # key -> the tool shell a process was seen under
         self.desk_cache = {}                          # working folder -> desk (from mail.py desk-of)
-        self.last_report = None
-        self.last_report_at = 0.0
-        self.compliance_cache = []
-        self.compliance_at = -1e9
+        self.last_report = None                       # the stable part of the last report this process wrote
+        self.beat_at = -1e9
         self.learned = read_json(LOCAL_DIR / "learned_peaks.json")
         self.learned_dirty = False
         self.notice_seq = 0
@@ -3216,8 +3289,11 @@ class Dispatcher:
 
     # -- report, housekeeping
     def report(self) -> None:
-        """Publish what other machines need (`--on`): a new report file when the content changed, or at least every
-        REPORT_SECONDS as a heartbeat; never a rewrite in place. Measurements that change every sample do not count as a change."""
+        """Publish what other machines need (`--on`), never rewriting a file in place: a new report file when its content
+        changed since the last one this process wrote (measurements that change every sample do not count as a change),
+        and every REPORT_SECONDS a beat, about 1 KB, with the compliance summary, by which other machines see that this
+        dispatcher runs. Until 2026-10-31 the report itself, 33 KB on Altiplano, was the heartbeat and carried the
+        compliance summary, which changes nearly every time it is counted, so a report went out every 10 minutes."""
         dims = self.meter.dimensions()
         limits = self.limits()
         leases = self.leases()
@@ -3228,18 +3304,18 @@ class Dispatcher:
             if lease.get("state") in OPEN or age_of(lease.get("ended") or lease.get("answered")) < 86400:
                 summary[lease["id"]] = dict({k: lease[k] for k in keep if k in lease},
                                             log=str(side_path(self.machine, lease["id"], ".log")))
-        if time.monotonic() - self.compliance_at > 600:
-            self.compliance_cache = compliance_lines(self.machine, 7)
-            self.compliance_at = time.monotonic()
+        if time.monotonic() - self.beat_at > REPORT_SECONDS:
+            write_report(self.machine, "beats", {"updated": now_iso(), "pid": os.getpid(),
+                                                 "compliance": compliance_lines(self.machine, 7)})
+            self.beat_at = time.monotonic()
         stable = {"machine": self.machine, "pid": os.getpid(), "version": self.version,
                   "capacity": {d: {"capacity": i["capacity"], "limit": limits[d], "label": i.get("label", "")} for d, i in dims.items()},
                   "planned": self.planned(), "queue": [l["id"] for l in leases if l.get("state") == "queued"],
-                  "active": [l["id"] for l in leases if l.get("state") in ACTIVE], "leases": summary,
-                  "compliance": self.compliance_cache}
-        if stable != self.last_report or time.monotonic() - self.last_report_at > REPORT_SECONDS:
-            write_report(self.machine, dict(stable, updated=now_iso(), unleased=self.unleased_now(), system=self.last_system))
+                  "active": [l["id"] for l in leases if l.get("state") in ACTIVE], "leases": summary}
+        if stable != self.last_report:
+            write_report(self.machine, "reports", dict(stable, updated=now_iso(), unleased=self.unleased_now(),
+                                                       system=self.last_system))
             self.last_report = stable
-            self.last_report_at = time.monotonic()
         if self.learned_dirty:
             write_json(LOCAL_DIR / "learned_peaks.json", self.learned)
             self.learned_dirty = False
