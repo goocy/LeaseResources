@@ -228,24 +228,60 @@ def file_stamp() -> str:
     return now.strftime("%y%m%d-%H%M%S-") + "%03dZ" % (now.microsecond // 1000)
 
 
-def report_names(machine: str, kind: str) -> list:
-    """The files of one kind the dispatcher publishes, newest first: "reports" (what other machines need about its
-    leases) or "beats" (its heartbeat with the compliance summary)."""
+REPORT_SLOTS = 5
+CLOCK_AHEAD_SECONDS = 120
+
+
+def report_slots(machine: str, kind: str) -> list:
+    """The fixed files of one kind the dispatcher publishes, slot-0.json to slot-4.json: "reports" (what other machines
+    need about its leases) or "beats" (its heartbeat with the compliance summary). Since 2026-11-09 each one overwrites
+    the oldest slot instead of being a new <stamp>.json with older ones deleted: every deletion left a deleted-file
+    record that all Resilio peers keep and walk for good (some 80,000 from the reports of LeaseResources, ClaudeMail and
+    the supervisors; Pektolith's sync stalled for 12 days in October). With five slots a file changes only every few
+    beats, so no peer is still fetching it when it changes (the Resilio conflicts that made files write-once)."""
+    assert kind in ("reports", "beats"), kind
+    return [synced_dir(machine) / kind / ("slot-%d.json" % i) for i in range(REPORT_SLOTS)]
+
+
+def file_time(path: Path) -> float:
+    """A file's modification time; -inf for one that is not there (an empty slot is used first)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return float("-inf")
+
+
+def report_entries(machine: str, kind: str) -> list:
+    """[(path, report)] of one kind that parse, newest first: by the `updated` written inside (ISO with its offset, so
+    a time zone change or the DST fall-back does not reorder them), then by file time; never by name. The <stamp>.json
+    files of the code before slots are read the same way until their machine deletes them."""
     assert kind in ("reports", "beats"), kind
     folder = synced_dir(machine) / kind
     if not folder.is_dir():
         return []
-    return sorted((p for p in folder.iterdir() if p.name.endswith(".json") and not p.name.startswith(".")),
-                  key=lambda p: (p.stem.endswith("Z"), p.name), reverse=True)    # a local-time name is from before: older
+    entries = []
+    for path in folder.iterdir():
+        if not path.name.endswith(".json") or path.name.startswith("."):
+            continue
+        mtime = file_time(path)
+        report = read_json(path)                         # {} when gone, unreadable or not an object
+        if not report:
+            continue
+        written = parse_iso(report.get("updated"))
+        entries.append((mtime if written is None else written, mtime, path, report))
+    entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    return [(path, report) for _, _, path, report in entries]
+
+
+def report_names(machine: str, kind: str) -> list:
+    """The files of one kind that parse, newest first (report_entries)."""
+    return [path for path, _ in report_entries(machine, kind)]
 
 
 def read_report(machine: str, kind: str) -> dict:
     """The newest dispatcher report (or beat) that parses; Resilio may still be delivering the very newest one."""
-    for path in report_names(machine, kind):
-        report = read_json(path)
-        if report:
-            return report
-    return {}
+    entries = report_entries(machine, kind)
+    return entries[0][1] if entries else {}
 
 
 def read_published(machine: str) -> dict:
@@ -254,15 +290,36 @@ def read_published(machine: str) -> dict:
     return dict(read_report(machine, "reports"), **read_report(machine, "beats"))
 
 
-def write_report(machine: str, kind: str, report: dict) -> None:
-    """A new file per report (never rewritten in place: Resilio conflicts), then all but it and the one before it go."""
-    path = synced_dir(machine) / kind / (file_stamp() + ".json")
-    write_json(path, report)
-    for old in report_names(machine, kind)[2:]:
+def write_report(machine: str, kind: str, report: dict) -> bool:
+    """Overwrites the oldest of the five slots of the kind (report_slots says why) through a temp name and a rename,
+    then deletes any other file there, the <stamp>.json of the code before; after that nothing is ever deleted. Slots
+    with a file time more than CLOCK_AHEAD_SECONDS in the future were written while this clock ran ahead; readers would
+    take them as newest for as long, so the report goes into all of them at once. A slot Resilio holds past the
+    retries (Windows) is skipped for the next oldest. False, and logged, when no slot took it."""
+    now = time.time()
+    slots = sorted(report_slots(machine, kind), key=file_time)     # oldest first; an empty slot before any other
+    ahead = [p for p in slots if file_time(p) > now + CLOCK_AHEAD_SECONDS]
+    written, failed = [], []
+    for path in (ahead or slots):
         try:
-            old.unlink()
-        except OSError:
-            pass
+            write_json(path, report)
+            written.append(path)
+        except OSError as exc:
+            failed.append(path.name + ": " + str(exc))
+            continue
+        if not ahead:
+            break
+    if not written:
+        log(machine, "WARN " + kind + " not written, every slot refused: " + "; ".join(failed))
+        return False
+    keep = report_slots(machine, kind)
+    for old in (synced_dir(machine) / kind).iterdir():
+        if old.name.endswith(".json") and not old.name.startswith(".") and old not in keep:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    return True
 
 
 def report_lease(machine: str, ident: str) -> dict:
@@ -3289,7 +3346,7 @@ class Dispatcher:
 
     # -- report, housekeeping
     def report(self) -> None:
-        """Publish what other machines need (`--on`), never rewriting a file in place: a new report file when its content
+        """Publish what other machines need (`--on`) into the slot files (write_report): a report when its content
         changed since the last one this process wrote (measurements that change every sample do not count as a change),
         and every REPORT_SECONDS a beat, about 1 KB, with the compliance summary, by which other machines see that this
         dispatcher runs. Until 2026-10-31 the report itself, 33 KB on Altiplano, was the heartbeat and carried the
@@ -3305,17 +3362,17 @@ class Dispatcher:
                 summary[lease["id"]] = dict({k: lease[k] for k in keep if k in lease},
                                             log=str(side_path(self.machine, lease["id"], ".log")))
         if time.monotonic() - self.beat_at > REPORT_SECONDS:
-            write_report(self.machine, "beats", {"updated": now_iso(), "pid": os.getpid(),
-                                                 "compliance": compliance_lines(self.machine, 7)})
-            self.beat_at = time.monotonic()
+            if write_report(self.machine, "beats", {"updated": now_iso(), "pid": os.getpid(),
+                                                    "compliance": compliance_lines(self.machine, 7)}):
+                self.beat_at = time.monotonic()
         stable = {"machine": self.machine, "pid": os.getpid(), "version": self.version,
                   "capacity": {d: {"capacity": i["capacity"], "limit": limits[d], "label": i.get("label", "")} for d, i in dims.items()},
                   "planned": self.planned(), "queue": [l["id"] for l in leases if l.get("state") == "queued"],
                   "active": [l["id"] for l in leases if l.get("state") in ACTIVE], "leases": summary}
         if stable != self.last_report:
-            write_report(self.machine, "reports", dict(stable, updated=now_iso(), unleased=self.unleased_now(),
-                                                       system=self.last_system))
-            self.last_report = stable
+            if write_report(self.machine, "reports", dict(stable, updated=now_iso(), unleased=self.unleased_now(),
+                                                          system=self.last_system)):
+                self.last_report = stable                # not written: tried again on the next pass
         if self.learned_dirty:
             write_json(LOCAL_DIR / "learned_peaks.json", self.learned)
             self.learned_dirty = False
