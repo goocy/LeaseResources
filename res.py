@@ -87,6 +87,7 @@ import atexit            # noqa: E402
 import collections       # noqa: E402
 import copy              # noqa: E402
 import datetime          # noqa: E402
+import functools         # noqa: E402
 import json              # noqa: E402
 import shutil            # noqa: E402
 import signal            # noqa: E402
@@ -133,6 +134,7 @@ CONFIG_DIR = Path(os.environ.get("LEASERES_CONFIG") or (SERVICE_DIR / "config"))
 LOCAL_DIR = Path(os.environ.get("LEASERES_LOCAL") or default_local_dir("state"))
 OLD_LOCAL_DIR = Path.home() / ".claude" / "leaseresources"          # until 2026-09-28
 THIS_MACHINE = ""                                                    # set by load_config()
+REPORTS_VIA = ""                                                     # set by load_config(): "files" or "postman"
 MAIL_PY = SYNC_ROOT / "Services" / "ClaudeMail" / "mail.py"
 TASK_NAME = "LeaseResources Dispatcher"
 LAUNCHD_LABEL = "com.goocy.leaseresources"
@@ -159,6 +161,9 @@ def load_config() -> dict:
     if own.is_file():
         with open(own, encoding="utf-8") as fh:
             config.update(json.load(fh))
+    global REPORTS_VIA
+    assert config["reports_via"] in ("files", "postman"), "reports_via must be files or postman: " + repr(config["reports_via"])
+    REPORTS_VIA = config["reports_via"]
     return config
 
 
@@ -230,6 +235,16 @@ def file_stamp() -> str:
 
 REPORT_SLOTS = 5
 CLOCK_AHEAD_SECONDS = 120
+POSTMAN_SERVICES = {"reports": "LeaseResources", "beats": "LeaseResourcesBeats"}     # with reports_via "postman"
+
+
+@functools.lru_cache(maxsize=None)
+def spool():
+    """This machine's postman spool (Services/Postman), where reports go and come from while reports_via is "postman".
+    Imported only then, so a machine without a postman is untouched while the switch is off."""
+    sys.path.insert(0, str(SYNC_ROOT / "Services" / "Postman"))
+    import postman
+    return postman.Spool(postman.spool_root(), postman.load_config())
 
 
 def report_slots(machine: str, kind: str) -> list:
@@ -279,7 +294,13 @@ def report_names(machine: str, kind: str) -> list:
 
 
 def read_report(machine: str, kind: str) -> dict:
-    """The newest dispatcher report (or beat) that parses; Resilio may still be delivering the very newest one."""
+    """The newest dispatcher report (or beat) that parses; Resilio may still be delivering the very newest one. With
+    reports_via "postman", the one the postman holds for the machine: no slots to choose from."""
+    if REPORTS_VIA == "postman":
+        found = [s["body"] for s in spool().states(POSTMAN_SERVICES[kind]) if s["origin"] == machine]
+        assert len(found) <= 1, found
+        return found[0] if found else {}
+    assert REPORTS_VIA == "files", "load_config() has not set reports_via"
     entries = report_entries(machine, kind)
     return entries[0][1] if entries else {}
 
@@ -295,7 +316,13 @@ def write_report(machine: str, kind: str, report: dict) -> bool:
     then deletes any other file there, the <stamp>.json of the code before; after that nothing is ever deleted. Slots
     with a file time more than CLOCK_AHEAD_SECONDS in the future were written while this clock ran ahead; readers would
     take them as newest for as long, so the report goes into all of them at once. A slot Resilio holds past the
-    retries (Windows) is skipped for the next oldest. False, and logged, when no slot took it."""
+    retries (Windows) is skipped for the next oldest. False, and logged, when no slot took it.
+    With reports_via "postman" the report goes to the postman instead, and no slot file is written."""
+    if REPORTS_VIA == "postman":
+        assert spool().me() == machine, "the postman runs as " + spool().me() + ", LeaseResources as " + machine
+        spool().publish(POSTMAN_SERVICES[kind], report)
+        return True
+    assert REPORTS_VIA == "files", "load_config() has not set reports_via"
     now = time.time()
     slots = sorted(report_slots(machine, kind), key=file_time)     # oldest first; an empty slot before any other
     ahead = [p for p in slots if file_time(p) > now + CLOCK_AHEAD_SECONDS]
@@ -3481,6 +3508,7 @@ def cmd_dispatch(args, config: dict) -> None:
     time.sleep(1.0)
     d.sample()
     last_sample = last_unleased = last_beat = last_house = time.monotonic()
+    via = REPORTS_VIA
     d.report()
     while True:
         try:
@@ -3514,6 +3542,9 @@ def cmd_dispatch(args, config: dict) -> None:
             log(machine, "WARN dispatcher: " + type(exc).__name__ + ": " + str(exc))
         if code_version() != d.version and code_compiles():
             log(machine, "code changed; dispatcher restarting onto the new code")
+            sys.exit(EXIT_CODE_CHANGED)
+        if REPORTS_VIA != via:                                # the restarted one publishes its report and beat at once
+            log(machine, "reports_via is now " + REPORTS_VIA + "; dispatcher restarting to publish there")
             sys.exit(EXIT_CODE_CHANGED)
         time.sleep(num(d.config, "tick_seconds", 1))
 

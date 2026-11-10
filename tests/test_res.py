@@ -424,7 +424,8 @@ class World:
             config = json.load(fh)
         config.update({"mail_script": str(self.root / "mail.py"), "allowed_roots": [str(self.allowed)], "notify": False,
                        "tick_seconds": 0.5, "sample_seconds": 1, "smoothing_seconds": 3, "overrun_samples": 2,
-                       "unleased_check_seconds": 2, "unleased_after_seconds": 3, "answer_wait_seconds": 8})
+                       "unleased_check_seconds": 2, "unleased_after_seconds": 3, "answer_wait_seconds": 8,
+                       "reports_via": "files"})        # "postman" would publish into this machine's real spool
         config.update(extra or {})
         (self.config / "defaults.json").write_text(json.dumps(config, indent=1), encoding="utf-8")
         self.procs = []
