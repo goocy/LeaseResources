@@ -49,5 +49,7 @@
   "file_dimensions": {},
 
   "mail_script": "",
-  "notify": true
+  "notify": true,
+
+  "reports_via": "files"
 }
