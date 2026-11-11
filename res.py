@@ -3501,6 +3501,8 @@ def cmd_dispatch(args, config: dict) -> None:
     d = Dispatcher(config)
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", code " + d.version + ", dimensions "
         + ", ".join(d.meter.dimensions()) + ")")
+    for error in d.meter.errors:
+        log(machine, "WARN probe failed at start, asked again at every sample: " + error)
     d.restore_unleased()
     # The compliance scan runs in its own thread: its first pass on a machine with many long-lived tool shells (each new
     # record asks ClaudeMail for a desk) must never delay answers to lease requests (Moosfels, round 3).

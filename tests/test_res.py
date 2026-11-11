@@ -1256,13 +1256,16 @@ class T14Units(Base):
         try:
             folder = Path(tempfile.mkdtemp(dir=str(SCRATCH)))
             probe = probes.DiskProbe({"disk_skip_mounts": []}, folder)
+            probe.start()
             first, asked_first = sorted(probe.dims), len(calls)
             probe.system(5.0)
             asked_quiet = len(calls)
             letters.update(F=5, H=6)
             use = probe.system(5.0)
             added, asked_added, f_aliases = sorted(probe.dims), len(calls), probe.dims["disk:PhysicalDrive5"]["aliases"]
-            fresh = sorted(probes.DiskProbe({"disk_skip_mounts": []}, folder).dims)
+            fresh_probe = probes.DiskProbe({"disk_skip_mounts": []}, folder)
+            fresh_probe.start()
+            fresh = sorted(fresh_probe.dims)
             asked_fresh = len(calls)
             del letters["H"]
             probe.system(5.0)
@@ -1410,6 +1413,7 @@ class T14Units(Base):
 
         def dimensions(folder):
             probe = probes.DiskProbe(config, folder)
+            probe.start()
             return {"dims": probe.dims, "mounts": probe.mounts, "learnable": sorted(probe.learnable)}
         def powershell(argv, **options):
             return SimpleNamespace(stdout="C 0\nD 1\nE 1\n")
@@ -1462,6 +1466,72 @@ class T14Units(Base):
         self.assertIn("/System/Volumes/Data", asked_narrower)
         self.assertEqual(narrower["disk0"], ["/", "/System/Volumes/VM", "/System/Volumes/Preboot", "/System/Volumes/Data",
                                              "/Volumes/Recovery"])
+
+    def test_disk_map_failure_is_asked_again(self):
+        """Sandbank, 2026-11-10: overloaded, `diskutil info /` ran past its timeout at 14:47 and at the 16:27 boot; the
+        mount was left out of the map without a word, the map without disk0 was cached, and with the disks and mounts
+        unchanged the dispatcher never asked again, so it refused every lease naming disk:disk0 for hours. Faked Mac,
+        the real _mac_physical_disk: a failed first map is reported and the probe kept, no incomplete map is cached, the
+        next sample maps the disks with nothing else changed; a failed re-map keeps the dimensions it had and is asked
+        again; and the counters move on through a failed sample, so the next rate is one sample's."""
+        import plistlib
+        import probes
+        from collections import namedtuple
+        from types import SimpleNamespace
+        Part = namedtuple("Part", "device mountpoint fstype")
+        Io = namedtuple("Io", "read_bytes write_bytes read_time write_time")
+        physical = {"/": "disk0", "/Volumes/MarkViewer": "disk2", "/Volumes/Archive": "disk8"}
+        mounted = ["/", "/Volumes/MarkViewer"]
+        moved = {"disk0": 0, "disk2": 0, "disk8": 0}
+        failing = {"/": 1}
+        asked = []
+
+        def diskutil(argv, **options):
+            mount = argv[-1]
+            asked.append(mount)
+            self.assertTrue(options.get("check"), "a failing diskutil must raise")
+            if failing.get(mount, 0) > 0:
+                failing[mount] -= 1
+                raise subprocess.TimeoutExpired(argv, options["timeout"])
+            return SimpleNamespace(stdout=plistlib.dumps({"APFSPhysicalStores": [{"APFSPhysicalStore": physical[mount] + "s2"}]}))
+        saved = (probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters, probes.PROBES)
+        probes.sys = SimpleNamespace(platform="darwin", stderr=sys.stderr)
+        probes.subprocess = SimpleNamespace(run=diskutil)
+        probes.psutil.disk_partitions = lambda all=False: [Part("/dev/x", m, "apfs") for m in mounted]
+        probes.psutil.disk_io_counters = lambda perdisk=False: {physical[m]: Io(moved[physical[m]], 0, 0, 0) for m in mounted}
+        probes.PROBES = [probes.DiskProbe]
+        try:
+            folder = Path(tempfile.mkdtemp(dir=str(SCRATCH)))
+            meter = probes.Meter({"disk_skip_mounts": [], "disk_paths_seconds": 1}, folder)
+            disk = meter.probes[0]
+            start_errors, start_dims = list(meter.errors), sorted(meter.dimensions())
+            cached_after_failure = (folder / "disks.json").exists()
+            meter.sample({})
+            healed, healed_errors = sorted(meter.dimensions()), list(meter.errors)
+            mounted.append("/Volumes/Archive")               # a change, and diskutil times out again on /
+            failing["/"] = 1
+            moved["disk0"] += 100e6
+            meter.sample({})
+            failed_dims, failed_errors = sorted(meter.dimensions()), list(meter.errors)
+            cached_map = probes.read_json(folder / "disks.json")["map"]
+            moved["disk0"] += 100e6
+            rate = disk.system(1.0)["disk:disk0"]
+            after = sorted(meter.dimensions())
+        finally:
+            probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters, probes.PROBES = saved
+        measured("units.disk_map_failure", {"start_errors": start_errors, "healed": healed, "failed_errors": failed_errors,
+                                            "after": after, "rate_after_failed_sample": rate, "asked": asked})
+        self.assertEqual([e.partition(":")[0] for e in start_errors], ["DiskProbe.start"])
+        self.assertIn("TimeoutExpired", start_errors[0])
+        self.assertEqual(start_dims, [], "no dimension from a map that failed")
+        self.assertFalse(cached_after_failure, "an incomplete map is never cached")
+        self.assertEqual(healed, ["disk:disk0", "disk:disk2"], "the next sample asks again, with nothing changed")
+        self.assertEqual(healed_errors, [])
+        self.assertEqual([e.partition(":")[0] for e in failed_errors], ["DiskProbe.system"])
+        self.assertEqual(failed_dims, ["disk:disk0", "disk:disk2"], "a failed re-map keeps the dimensions it had")
+        self.assertEqual(cached_map, {"disk0": ["/"], "disk2": ["/Volumes/MarkViewer"]}, "the good map stays cached")
+        self.assertEqual(after, ["disk:disk0", "disk:disk2", "disk:disk8"])
+        self.assertEqual(rate, 100e6, "one sample's bytes, not two")
 
     def test_detector_windows_shape(self):
         w = World("units-detector")

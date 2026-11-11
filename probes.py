@@ -172,12 +172,16 @@ class Reading:
 class Probe:
     """Base class. `dims` maps dimension -> {"capacity": float, "label": str, "aliases": [str]}."""
     system_only = False          # True: no per-process measurement; callers attribute use themselves
+    keep_without_dims = False    # True: kept by the Meter with no dimensions yet, because they can appear in a later sample
 
     def __init__(self, config: dict, local_dir: Path):
         self.config = config
         self.local_dir = local_dir
         self.dims = {}
         self.learnable = set()           # dimensions whose capacity is learned (not configured), so it may rise
+
+    def start(self) -> None:
+        """Called once by the Meter after construction; what it raises is reported, and the probe is kept."""
 
     def system(self, dt: float) -> dict:
         return {}
@@ -231,19 +235,18 @@ def _whole_disk(identifier: str) -> str:
     return "disk" + digits
 
 
-def _mac_physical_disk(mountpoint: str):
-    try:
-        out = subprocess.run(["diskutil", "info", "-plist", mountpoint], capture_output=True, timeout=10).stdout
-        info = plistlib.loads(out)
-    except (OSError, subprocess.SubprocessError, ValueError, plistlib.InvalidFileException):
-        return None
-    stores = info.get("APFSPhysicalStores") or []
-    for store in stores:
-        ident = store.get("APFSPhysicalStore")
-        if ident:
-            return _whole_disk(ident)
+def _mac_physical_disk(mountpoint: str) -> str:
+    """The whole disk under a mount. Raises when diskutil fails or names none. Until 2026-11-10 every failure returned
+    None and the mount was left out of the map without a word: on Sandbank, overloaded, `diskutil info /` ran past its
+    timeout at 14:47 and again at the 16:27 boot, disk0 vanished from the dispatcher, that incomplete map was cached,
+    and with the disks and mounts unchanged it was never asked again, so every lease naming disk:disk0 was refused."""
+    out = subprocess.run(["diskutil", "info", "-plist", mountpoint], capture_output=True, timeout=30, check=True).stdout
+    info = plistlib.loads(out)
+    for store in info.get("APFSPhysicalStores", []):
+        return _whole_disk(store["APFSPhysicalStore"])
     ident = info.get("ParentWholeDisk") or info.get("DeviceIdentifier")
-    return _whole_disk(ident) if ident else None
+    assert ident, "diskutil names no disk for " + mountpoint
+    return _whole_disk(ident)
 
 
 WINDOWS_PARTITIONS = "Get-Partition | Where-Object DriveLetter | ForEach-Object { [string]$_.DriveLetter + ' ' + [string]$_.DiskNumber }"
@@ -276,9 +279,7 @@ def disk_map(local_dir: Path, signature: list, max_age: float = 3600, skip=()) -
         for part in psutil.disk_partitions(all=False):
             if any(part.mountpoint.startswith(s) for s in skip):
                 continue
-            disk = _mac_physical_disk(part.mountpoint)
-            if disk:
-                mapping.setdefault(disk, []).append(part.mountpoint)
+            mapping.setdefault(_mac_physical_disk(part.mountpoint), []).append(part.mountpoint)
     elif sys.platform == "win32":
         out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PARTITIONS],
                              capture_output=True, text=True, timeout=30, creationflags=no_window(), check=True).stdout
@@ -306,7 +307,10 @@ class DiskProbe(Probe):
     else the highest rate ever seen on that disk (learned by the dispatcher), at least 'disk_default_bytes_per_s'.
     The dimensions are rebuilt whenever a disk or a mount comes or goes (disk_signature, checked on every sample): until
     2026-10-26 they were fixed when the probe was made, and Mistral's dispatcher, started with five disks, refused every
-    lease on the hot-swapped F: and H: for two days ('no such disk here') and put their bytes on the other disks."""
+    lease on the hot-swapped F: and H: for two days ('no such disk here') and put their bytes on the other disks.
+    A map that raises leaves the signature unchanged, so the next sample asks again; the first map is made in start(),
+    which the Meter calls inside its error reporting, so a probe whose first map failed stays and fills in later."""
+    keep_without_dims = True
 
     def __init__(self, config, local_dir):
         super().__init__(config, local_dir)
@@ -314,8 +318,11 @@ class DiskProbe(Probe):
         self.signature = None
         self.mounts = {}
         self.prev = psutil.disk_io_counters(perdisk=True)
-        self.refresh(self.prev)
         self.last_rates = {}
+        self.busy = {}
+
+    def start(self) -> None:
+        self.refresh(self.prev)
 
     def refresh(self, counters: dict) -> None:
         signature = disk_signature(counters, self.skip)
@@ -346,18 +353,18 @@ class DiskProbe(Probe):
 
     def system(self, dt):
         now = psutil.disk_io_counters(perdisk=True)
+        prev, self.prev = self.prev, now             # advanced before a refresh that may raise, so no rate spans two samples
         self.refresh(now)
         use = {}
         busy = {}
         for dim in self.dims:
             disk = dim.partition(":")[2]
-            a, b = self.prev.get(disk), now.get(disk)
+            a, b = prev.get(disk), now.get(disk)
             if a is None or b is None or dt <= 0:
                 use[dim] = 0.0
                 continue
             use[dim] = max(0.0, ((b.read_bytes + b.write_bytes) - (a.read_bytes + a.write_bytes)) / dt)
             busy[dim] = max(0.0, min(1.0, ((b.read_time + b.write_time) - (a.read_time + a.write_time)) / 1000.0 / dt))
-        self.prev = now
         self.last_rates = use
         self.busy = busy
         return use
@@ -584,18 +591,24 @@ class Meter:
         self.local_dir = local_dir
         self.first_sample_rates = first_sample_rates
         self.probes = []
+        self.errors = []                                  # what the probes raised in the last sample (or in start)
         for cls in PROBES:
             try:
                 probe = cls(config, local_dir)
             except Exception as exc:                     # a broken probe must not take the others down
                 sys.stderr.write("probe " + cls.__name__ + " unavailable: " + str(exc) + "\n")
                 continue
-            if probe.dims:
+            try:
+                probe.start()
+            except Exception as exc:                     # reported; the probe asks again in its next sample
+                error = cls.__name__ + ".start: " + type(exc).__name__ + ": " + str(exc)
+                sys.stderr.write("probe " + error + "\n")
+                self.errors.append(error)
+            if probe.dims or probe.keep_without_dims:
                 self.probes.append(probe)
         self.prev = {}                                    # (pid, create_time) -> (time, cpu seconds, disk bytes)
         self.paths = {}                                   # (pid, create_time) -> (time, open files), see process_paths
         self.paths_seconds = float(config["disk_paths_seconds"])
-        self.errors = []                                  # what the probes raised in the last sample
         self.last = time.monotonic()
         self.last_wall = time.time()
 
