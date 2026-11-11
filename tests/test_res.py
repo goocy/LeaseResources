@@ -1506,6 +1506,10 @@ class T14Units(Base):
             disk = meter.probes[0]
             start_errors, start_dims = list(meter.errors), sorted(meter.dimensions())
             cached_after_failure = (folder / "disks.json").exists()
+            asked_before = len(asked)
+            meter.sample({})                                 # inside the retry interval: the error again, no diskutil call
+            waiting_errors, asked_waiting = list(meter.errors), len(asked) - asked_before
+            disk.failed = (disk.failed[0] - disk.retry_seconds, disk.failed[1])
             meter.sample({})
             healed, healed_errors = sorted(meter.dimensions()), list(meter.errors)
             mounted.append("/Volumes/Archive")               # a change, and diskutil times out again on /
@@ -1515,6 +1519,7 @@ class T14Units(Base):
             failed_dims, failed_errors = sorted(meter.dimensions()), list(meter.errors)
             cached_map = probes.read_json(folder / "disks.json")["map"]
             moved["disk0"] += 100e6
+            disk.failed = (disk.failed[0] - disk.retry_seconds, disk.failed[1])
             rate = disk.system(1.0)["disk:disk0"]
             after = sorted(meter.dimensions())
         finally:
@@ -1525,7 +1530,10 @@ class T14Units(Base):
         self.assertIn("TimeoutExpired", start_errors[0])
         self.assertEqual(start_dims, [], "no dimension from a map that failed")
         self.assertFalse(cached_after_failure, "an incomplete map is never cached")
-        self.assertEqual(healed, ["disk:disk0", "disk:disk2"], "the next sample asks again, with nothing changed")
+        self.assertEqual(asked_waiting, 0, "no diskutil call within the retry interval")
+        self.assertEqual([e.partition(":")[0] for e in waiting_errors], ["DiskProbe.system"])
+        self.assertIn("TimeoutExpired", waiting_errors[0])
+        self.assertEqual(healed, ["disk:disk0", "disk:disk2"], "asked again after the interval, with nothing changed")
         self.assertEqual(healed_errors, [])
         self.assertEqual([e.partition(":")[0] for e in failed_errors], ["DiskProbe.system"])
         self.assertEqual(failed_dims, ["disk:disk0", "disk:disk2"], "a failed re-map keeps the dimensions it had")

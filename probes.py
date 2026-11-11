@@ -311,11 +311,13 @@ class DiskProbe(Probe):
     A map that raises leaves the signature unchanged, so the next sample asks again; the first map is made in start(),
     which the Meter calls inside its error reporting, so a probe whose first map failed stays and fills in later."""
     keep_without_dims = True
+    retry_seconds = 60.0         # after a failed map: diskutil may block for up to 30 s, and the dispatcher samples in its main loop
 
     def __init__(self, config, local_dir):
         super().__init__(config, local_dir)
         self.skip = [s for s in config.get("disk_skip_mounts", []) if s]
         self.signature = None
+        self.failed = None                           # (monotonic time, error) of the last failed map
         self.mounts = {}
         self.prev = psutil.disk_io_counters(perdisk=True)
         self.last_rates = {}
@@ -328,7 +330,14 @@ class DiskProbe(Probe):
         signature = disk_signature(counters, self.skip)
         if signature == self.signature:
             return
-        mapping = disk_map(self.local_dir, signature, skip=self.skip)
+        if self.failed is not None and time.monotonic() - self.failed[0] < self.retry_seconds:
+            raise RuntimeError(self.failed[1] + " (asked again " + str(int(self.retry_seconds)) + " s after it failed)")
+        try:
+            mapping = disk_map(self.local_dir, signature, skip=self.skip)
+        except Exception as exc:
+            self.failed = (time.monotonic(), "disk map failed: " + type(exc).__name__ + ": " + str(exc))
+            raise
+        self.failed = None
         learned = _learned(self.local_dir, "learned_peaks")
         configured = self.config.get("disk_capacity", {})
         default = float(self.config.get("disk_default_bytes_per_s", 150e6))
