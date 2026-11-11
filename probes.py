@@ -240,7 +240,7 @@ def _mac_physical_disk(mountpoint: str) -> str:
     None and the mount was left out of the map without a word: on Sandbank, overloaded, `diskutil info /` ran past its
     timeout at 14:47 and again at the 16:27 boot, disk0 vanished from the dispatcher, that incomplete map was cached,
     and with the disks and mounts unchanged it was never asked again, so every lease naming disk:disk0 was refused."""
-    out = subprocess.run(["diskutil", "info", "-plist", mountpoint], capture_output=True, timeout=30, check=True).stdout
+    out = subprocess.run(["diskutil", "info", "-plist", mountpoint], capture_output=True, timeout=10, check=True).stdout
     info = plistlib.loads(out)
     for store in info.get("APFSPhysicalStores", []):
         return _whole_disk(store["APFSPhysicalStore"])
@@ -311,7 +311,7 @@ class DiskProbe(Probe):
     A map that raises leaves the signature unchanged, so the next sample asks again; the first map is made in start(),
     which the Meter calls inside its error reporting, so a probe whose first map failed stays and fills in later."""
     keep_without_dims = True
-    retry_seconds = 60.0         # after a failed map: diskutil may block for up to 30 s, and the dispatcher samples in its main loop
+    retry_seconds = 60.0         # after a failed map: each diskutil call may block for up to 10 s, and the dispatcher samples in its main loop
 
     def __init__(self, config, local_dir):
         super().__init__(config, local_dir)
