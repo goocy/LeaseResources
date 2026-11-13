@@ -4,7 +4,9 @@ Every resource is a dimension (cpu, ram, each disk, each GPU and its memory, eac
 A command that finishes within a 10-second trial needs nothing more. Anything longer asks this machine's dispatcher
 (or another machine's, with --on) for a lease: the trial's profile plus a margin, for a stated duration. The dispatcher
 grants it when, on every dimension, the unleased use measured now plus the leases already granted plus the request
-stays under capacity times the headroom; otherwise it queues it and mails the owner desk when it is granted. A leased
+stays under capacity times the headroom, with the queued leases ahead of it counted as if granted (so a request may
+overtake a blocked queue head but never takes what the head needs, D-261113-1); otherwise it queues it and mails the
+owner desk when it is granted. A leased
 job runs detached from every Claude process and the dispatcher tells its owner when it ends, stalls, runs past its
 duration or uses more than it declared: through the output of a process waiting on the lease (res run --wait, res wait)
 while one is alive, otherwise by mail to the owner desk (ClaudeMail). It never kills a leased job. Design: README.md beside this file,
@@ -2018,8 +2020,8 @@ def cmd_status(args, config: dict) -> None:
     lease = read_json(lease_path(machine, args.id)) if machine == here else report_lease(machine, args.id)
     if not lease:
         raise SystemExit("No lease " + args.id + " on " + machine)
-    for key in ["id", "state", "answer", "desk", "why", "need", "duration", "requested", "granted", "started", "ended",
-                "exit", "seconds", "peak", "notices", "history_note", "run_argv", "run_cwd"]:
+    for key in ["id", "state", "answer", "waits_for", "waiting", "desk", "why", "need", "duration", "requested", "granted",
+                "started", "ended", "exit", "seconds", "peak", "notices", "history_note", "run_argv", "run_cwd"]:
         if key in lease and lease[key] not in ("", None, {}, []):
             value = lease[key]
             if key == "need" or key == "peak":
@@ -2399,19 +2401,30 @@ class Dispatcher:
                          + ", ".join(d for d in dims if kind_of(d) == kind_of(name)) + ")")
         return result, notes, ""
 
-    def fits(self, need: dict, exclude=None) -> tuple:
-        """(fits now, blocking dimension, text)"""
+    def fits(self, need: dict, ahead: dict, exclude=None) -> tuple:
+        """(fits now, blocking dimension, text). `ahead` holds the summed needs of the queued leases ahead of this one,
+        counted as if they were granted (D-261113-1): a request may overtake a blocked queue head, but only into room
+        that leaves everything the leases ahead of it need, so on the head's blocked dimension nothing overtakes."""
         limits = self.limits()
         unleased = self.unleased_now()
         planned = self.planned(exclude)
         for dim, amount in need.items():
-            total = unleased.get(dim, 0.0) + planned.get(dim, 0.0) + amount
+            total = unleased.get(dim, 0.0) + planned.get(dim, 0.0) + ahead.get(dim, 0.0) + amount
             if total > limits.get(dim, 0.0):
                 kind = kind_of(dim)
+                queued = (" + queued ahead " + human(ahead[dim], kind)) if ahead.get(dim) else ""
                 return False, dim, (dim + ": unleased " + human(unleased.get(dim, 0.0), kind) + " + leased "
-                                    + human(planned.get(dim, 0.0), kind) + " + this " + human(amount, kind) + " > "
-                                    + human(limits.get(dim, 0.0), kind) + " allowed")
+                                    + human(planned.get(dim, 0.0), kind) + queued + " + this " + human(amount, kind)
+                                    + " > " + human(limits.get(dim, 0.0), kind) + " allowed")
         return True, "", ""
+
+    def queued_needs(self, queued: list) -> dict:
+        """The summed needs of these queued leases: what fits() reserves for the leases ahead of a request."""
+        total = collections.defaultdict(float)
+        for lease in queued:
+            for d, v in lease["need"].items():
+                total[d] += float(v)
+        return total
 
     def handle_request(self, lease: dict) -> None:
         need, notes, refusal = self.normalise(lease.get("need") or {})
@@ -2438,14 +2451,14 @@ class Dispatcher:
             lease["ended"] = now_iso()
         else:
             queue_ahead = [l for l in self.leases() if l.get("state") == "queued"]
-            ok, dim, text = self.fits(need)
-            if ok and not queue_ahead:
+            ok, dim, text = self.fits(need, self.queued_needs(queue_ahead))
+            if ok:
                 self.grant(lease, notes)
             else:
                 lease["state"] = "queued"
-                lease["waits_for"] = dim if not ok else "the queue"
-                lease["answer"] = ("queued at position " + str(len(queue_ahead) + 1) + ", waiting for "
-                                   + (text if not ok else "the leases ahead of it") + ("; " + "; ".join(notes) if notes else ""))
+                lease["waits_for"] = dim
+                lease["answer"] = ("queued at position " + str(len(queue_ahead) + 1) + ", waiting for " + text
+                                   + ("; " + "; ".join(notes) if notes else ""))
         self.save(lease)
         log(self.machine, "request " + lease["id"] + " from " + lease.get("desk", "?") + ": " + lease["state"] + " - " + lease.get("answer", ""))
         if lease.get("from_machine") != self.machine:
@@ -2473,13 +2486,20 @@ class Dispatcher:
         return "\n".join(lines)
 
     def serve_queue(self) -> None:
+        waiting = []                                        # the queued leases ahead that stay queued in this pass
         for lease in [l for l in self.leases() if l.get("state") == "queued"]:
-            ok, dim, text = self.fits(lease.get("need") or {})
+            # The dimension it already waits for is checked first, so waits_for changes only when that one frees up and
+            # never flips between two blocked dimensions (each change writes a full report).
+            need = dict(sorted(lease["need"].items(), key=lambda item: item[0] != lease.get("waits_for")))
+            ok, dim, text = self.fits(need, self.queued_needs(waiting))
             if not ok:
-                if lease.get("waits_for") != dim:
+                if lease.get("waits_for") != dim or "waiting" not in lease:
                     lease["waits_for"] = dim
+                    lease["waiting"] = text                 # why it waits, as of the last change; answer keeps the first
                     self.save(lease)
-                break                                       # first come, first served: nobody overtakes
+                waiting.append(lease)                       # its needs stay reserved for every lease behind it
+                self.notify_queued(lease, len(waiting), text)
+                continue
             self.grant(lease)
             self.save(lease)
             log(self.machine, "granted queued " + lease["id"])
@@ -2487,6 +2507,31 @@ class Dispatcher:
                 self.mail(lease, "Lease " + lease["id"] + " granted on " + self.machine, self.answer_body(lease), "granted")
             else:
                 self.start_order(lease)
+
+    def notify_queued(self, lease: dict, position: int, text: str) -> None:
+        """One notice to the owner of a lease still queued `queue_notice_minutes` after its answer (D-261113-2): what
+        blocks it now, and the long commands of Claude sessions running here without a lease, which on Mistral on
+        2026-11-12 were most likely the queued job itself, run without its lease while the lease waited 15 hours."""
+        notices = lease.setdefault("notices", {})
+        waited = age_of(lease["answered"])
+        if "queued" in notices or waited < 60 * num(self.config, "queue_notice_minutes", 30):
+            return
+        notices["queued"] = {"at": now_iso(), "waits_for": lease["waits_for"]}
+        self.save(lease)
+        unleased = sorted(list(self.unleased_seen.values()), key=lambda r: r.get("first", 0.0))   # the scan thread's
+        lines = ["  " + r["desk"] + ", for " + human_duration(time.time() - r["first"]) + ": "
+                 + (r["commands"][0] if r["commands"] else r["shell"][-80:])[:160] for r in unleased]
+        on = " --on " + self.machine if lease.get("from_machine") != self.machine else ""
+        log(self.machine, "queued notice " + lease["id"] + ": " + text)
+        self.mail(lease, "Lease " + lease["id"] + " still queued on " + self.machine + " after " + human_duration(waited),
+                  "Your lease " + lease["id"] + " (" + (lease.get("why") or "no --why given") + ") has waited "
+                  + human_duration(waited) + " in the queue on " + self.machine + ", at position " + str(position)
+                  + ", and still does not fit: " + text + ".\n\n"
+                  + "Long commands of Claude sessions running on " + self.machine + " without a lease now"
+                  + (":\n" + "\n".join(lines) if lines else ": none (programs started outside Claude sessions are not attributed).")
+                  + "\n\nIf the job already ran without this lease, or is no longer needed, give the lease back: res release "
+                  + lease["id"] + on + ". While it waits, everything it needs stays reserved: a lease behind it starts"
+                  + " first only where it fits beside all of that (D-261113-1). This notice comes once.", "queued")
 
     # -- runs
     def start_order(self, lease: dict) -> None:
@@ -2545,7 +2590,8 @@ class Dispatcher:
                 need, notes, refusal = self.normalise(ask["need"])
                 merged = dict(lease.get("need") or {})
                 merged.update(need)
-                ok, dim, text = (False, "", refusal) if refusal else self.fits(merged, exclude=ident)
+                # an extension is held to what is free now, not behind the queue (a queued lease's own grant still is)
+                ok, dim, text = (False, "", refusal) if refusal else self.fits(merged, {}, exclude=ident)
                 if ok or lease.get("state") == "queued":
                     lease["need"] = merged
                     for d in need:
@@ -3383,8 +3429,8 @@ class Dispatcher:
         dims = self.meter.dimensions()
         limits = self.limits()
         leases = self.leases()
-        keep = ["id", "state", "answer", "desk", "why", "need", "duration", "requested", "granted", "started", "ended",
-                "exit", "seconds", "from_machine", "run_argv", "history_note"]
+        keep = ["id", "state", "answer", "waits_for", "waiting", "desk", "why", "need", "duration", "requested", "granted",
+                "started", "ended", "exit", "seconds", "from_machine", "run_argv", "history_note"]
         summary = {}
         for lease in leases:
             if lease.get("state") in OPEN or age_of(lease.get("ended") or lease.get("answered")) < 86400:

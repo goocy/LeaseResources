@@ -20,6 +20,7 @@
   "answer_wait_seconds": 6,
   "start_within_minutes": 60,
   "stall_minutes": 30,
+  "queue_notice_minutes": 30,
   "log_tail_lines": 30,
   "keep_days": 30,
   "lease_log_max_bytes": 50000000,

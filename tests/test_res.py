@@ -631,7 +631,8 @@ class T1TrialKill(Base):
 
 class T3Queue(Base):
     """R3: two GPU-heavy leases (GPU simulated as a file dimension gpu:9, beside any real GPU): the second queues on gpu:9 and its owner gets mail
-    when it is granted; FIFO; a queued run order starts on grant; refusal names the dimension."""
+    when it is granted; no overtaking on a dimension a lease ahead needs (D-261113-1); a queued run order starts on grant;
+    refusal names the dimension."""
 
     def test_gpu_queue(self):
         w = World("queue")
@@ -681,6 +682,101 @@ class T3Queue(Base):
         nogpu = w.res("Altiplano", "request", "--need", "tpu=1", "--for", "1m", "--desk", "Altiplano:DeskA")
         measured("R3.no_such_kind", nogpu.stdout.splitlines()[0])
         self.assertIn("refused", nogpu.stdout)
+        w.stop()
+
+
+class T23Overtake(Base):
+    """D-261113-1: a request that fits with every queued lease ahead of it counted as granted overtakes a blocked queue
+    head, both when it is asked and when the queue is served; on the head's blocked dimension nothing overtakes, even a
+    request that would fit beside the granted leases alone. Two simulated GPUs (gpu:9, gpu:8; limit 85 each)."""
+
+    def test_overtake_with_reservation(self):
+        w = World("overtake")
+        cfg = json.loads((w.config / "defaults.json").read_text())
+        cfg["file_dimensions"] = {}
+        for dim in ["gpu:9", "gpu:8"]:
+            path = w.root / (dim.replace(":", "") + ".json")
+            path.write_text(json.dumps({"total": 0, "pids": {}}))
+            cfg["file_dimensions"][dim] = {"capacity": 100, "file": str(path), "label": "simulated " + dim}
+        (w.config / "defaults.json").write_text(json.dumps(cfg))
+        w.dispatcher("Altiplano")
+
+        def ask(need, desk):
+            out = w.res("Altiplano", "request", "--need", need, "--for", "5m", "--desk", "Altiplano:" + desk)
+            return out.stdout + out.stderr, lease_id(out.stdout)
+
+        def state(ident):
+            return w.lease("Altiplano", ident).get("state")
+
+        a_out, la = ask("gpu:9=60", "DeskA")                  # granted, never started: planned on gpu:9
+        self.assertIn("granted", a_out)
+        a2_out, la2 = ask("gpu:8=60", "DeskA2")               # the same on gpu:8
+        self.assertIn("granted", a2_out)
+        b_out, lb = ask("gpu:9=70", "DeskB")                  # the head: 60 + 70 > 85 on gpu:9
+        self.assertIn("queued at position 1", b_out)
+        self.assertEqual(w.lease("Altiplano", lb).get("waits_for"), "gpu:9")
+        c_out, lc = ask("cpu=0.25", "DeskC")                  # shares nothing with the head: overtakes when asked
+        self.assertIn("granted", c_out, "a cpu-only request must overtake a head blocked on gpu:9")
+        d_out, ld = ask("gpu:9=20", "DeskD")                  # 60 + 20 fits beside A alone, but not with B reserved
+        self.assertIn("queued at position 2", d_out)
+        self.assertIn("queued ahead", d_out)
+        e_out, le = ask("gpu:8=60", "DeskE")                  # waits for A2 on gpu:8, behind B and D
+        self.assertIn("queued at position 3", e_out)
+        measured("D-261113-1.overtake_answer", [l for l in c_out.splitlines() if l.startswith("granted")][0])
+        measured("D-261113-1.reserved_answer", [l for l in d_out.splitlines() if l.startswith("queued")][0])
+
+        rel = w.res("Altiplano", "release", la2)
+        self.assertIn("released", rel.stdout, rel.stdout + rel.stderr)
+        w.wait(lambda: state(le) == "granted", 20, "E granted past the blocked B and D once gpu:8 is free")
+        self.assertEqual(state(lb), "queued", "B must stay queued while A holds gpu:9")
+        self.assertEqual(state(ld), "queued", "D must not take gpu:9 room that B, ahead of it, needs")
+
+        rel = w.res("Altiplano", "release", la)
+        self.assertIn("released", rel.stdout, rel.stdout + rel.stderr)
+        w.wait(lambda: state(lb) == "granted", 20, "B granted once A is gone")
+        time.sleep(3)                                         # a few dispatcher ticks: D must count B, granted in that pass
+        self.assertEqual(state(ld), "queued", "D (20) must not fit beside B (70), granted in the same pass")
+        rel = w.res("Altiplano", "release", lb)
+        self.assertIn("released", rel.stdout, rel.stdout + rel.stderr)
+        w.wait(lambda: state(ld) == "granted", 20, "D granted once B is gone")
+        for ident in [lc, ld, le]:
+            w.res("Altiplano", "release", ident)
+        w.stop()
+
+    def test_queued_notice(self):
+        """D-261113-2: a lease still queued queue_notice_minutes after its answer gets one notice naming what blocks it
+        and how to give it back; the report carries waits_for."""
+        w = World("queuenotice")
+        cfg = json.loads((w.config / "defaults.json").read_text())
+        path = w.root / "gpu9.json"
+        path.write_text(json.dumps({"total": 0, "pids": {}}))
+        cfg["file_dimensions"] = {"gpu:9": {"capacity": 100, "file": str(path), "label": "simulated gpu:9"}}
+        cfg["queue_notice_minutes"] = 0.05                    # 3 seconds
+        (w.config / "defaults.json").write_text(json.dumps(cfg))
+        w.dispatcher("Altiplano")
+        a = w.res("Altiplano", "request", "--need", "gpu:9=60", "--for", "5m", "--desk", "Altiplano:DeskA")
+        self.assertIn("granted", a.stdout, a.stdout + a.stderr)
+        b = w.res("Altiplano", "request", "--need", "gpu:9=60", "--for", "5m", "--desk", "Altiplano:DeskB",
+                  "--why", "blocked on purpose")
+        self.assertIn("queued", b.stdout, b.stdout + b.stderr)
+        lb = lease_id(b.stdout)
+        mails = w.wait(lambda: [m for m in w.mail_matching("still queued") if m["to"] == "Altiplano:DeskB"], 20,
+                       "the queued notice to DeskB")
+        body = mails[0]["body"]
+        measured("D-261113-2.notice_subject", mails[0]["subject"])
+        for part in ["gpu:9", "blocked on purpose", "res release " + lb, "position 1"]:
+            self.assertIn(part, body)
+        self.assertIn("queued", w.lease("Altiplano", lb).get("notices", {}))
+        time.sleep(3)                                         # more ticks: still one notice
+        self.assertEqual(len([m for m in w.mail_matching("still queued") if m["to"] == "Altiplano:DeskB"]), 1)
+        record = w.lease("Altiplano", lb)
+        self.assertEqual(record.get("waits_for"), "gpu:9")
+        self.assertIn("leased 60 %", record.get("waiting", ""), record)
+        status = w.res("Altiplano", "status", lb)
+        self.assertIn("waiting", status.stdout, status.stdout + status.stderr)
+        self.assertIn("leased 60 %", status.stdout)
+        w.res("Altiplano", "release", lb)
+        w.res("Altiplano", "release", lease_id(a.stdout))
         w.stop()
 
 

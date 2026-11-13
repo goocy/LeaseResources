@@ -41,9 +41,11 @@ Output echoed from jobs (the trial's tail, log tails, the waiter's stream) is re
 
 A request names its needs per dimension: a trial's peaks plus `margin` (25 %), at least `request_floor` per kind, or explicit amounts with `--need`. It is granted when, on every dimension,
 
-> unleased use + needs of the leases already granted + the request ≤ capacity × headroom
+> unleased use + needs of the leases already granted + needs of the requests queued ahead of it + the request ≤ capacity × headroom
 
-where unleased use is the machine's use minus the measured use of running leases, averaged over `smoothing_seconds` (30), and `headroom` is 0.85 (per dimension in `headroom_by_dimension`). Otherwise it queues, first come first served: nothing overtakes the head of the queue. A request larger than capacity × headroom on any dimension, or for a kind the machine lacks (vram on a Mac), is refused with the dimension named. The answer comes within a second or two.
+where unleased use is the machine's use minus the measured use of running leases, averaged over `smoothing_seconds` (30), and `headroom` is 0.85 (per dimension in `headroom_by_dimension`). Otherwise it queues. The queue is served in request order with the same rule, so a request may overtake a blocked queue head, but only into room that leaves everything the requests ahead of it need. On the dimension the head waits for, nothing overtakes. Strict first come, first served had a cpu-only request wait 14 hours behind a head that was blocked on a busy disk. A request larger than capacity × headroom on any dimension, or for a kind the machine lacks (vram on a Mac), is refused with the dimension named. The answer comes within a second or two.
+
+A queued lease's report entry carries `waits_for`, the dimension it waits for now, and the reason as of the last change of that dimension. A lease still queued `queue_notice_minutes` (30) after its answer gets one notice. The notice names what blocks it and lists the long commands of Claude sessions running on that machine without a lease. It also gives the `res release` line. On 2026-11-12 a lease that waited 15 hours at the head of the queue was most likely blocked by its own job, which had been started without the lease while the lease waited.
 
 A granted lease that is never started expires after `start_within_minutes` (60). `res extend` always grants more time and grants more resources only when they fit now; `--for` sets the new total duration counted from the job's start.
 
