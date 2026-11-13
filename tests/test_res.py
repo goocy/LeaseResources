@@ -112,6 +112,7 @@ if args and args[0] == "desk-of":
         print(os.environ.get("STUB_DESK_OF", "StubDesk") + "\\t" + folder)
     sys.exit(0)
 if args and args[0] == "send":
+    time.sleep(float(os.environ.get("STUB_SEND_SLEEP", "0")))
     record = {"machine": os.environ.get("LEASERES_MACHINE", ""), "at": time.time(), "argv": args}
     for i, a in enumerate(args):
         if a in ("--to", "--subject", "--body-file") and i + 1 < len(args):
@@ -1098,6 +1099,8 @@ class T10Keeper(Base):
             w.wait(lambda: w.logtext("Altiplano").count("dispatcher started") == 2, 20, "restarted dispatcher")
             measured("keeper.restart_seconds", round(time.monotonic() - t0, 1))
             self.assertIn("code changed; dispatcher restarting", w.logtext("Altiplano"))
+            stacks = list((w.data / "logs").glob("stack-altiplano-*.txt"))     # the one that left cleanly removed its own
+            self.assertEqual(len(stacks), 1, stacks)
         finally:
             for child in psutil.Process(keeper.pid).children(recursive=True):
                 child.terminate()
@@ -1139,6 +1142,41 @@ class T10Keeper(Base):
         finally:
             if hung is not None and pid_alive(hung.pid):
                 hung.kill()
+            for child in psutil.Process(keeper.pid).children(recursive=True):
+                child.terminate()
+            keeper.terminate()
+            keeper.wait(5)
+            out.close()
+
+    def test_hang_leaves_a_stack(self):
+        """A dispatcher whose main loop hangs leaves the stacks of its threads, and the keeper names the file when it
+        kills it (Stahlwerk 2026-11-11 hung 7.5 hours and left nothing that showed where). The hang here is a mail call
+        that does not return (the stub sleeps), so unlike a suspended process the dispatcher's other threads run on, as
+        they did in both real hangs; the stacks must show the main thread inside send_mail."""
+        w = World("keeper-stack", {"dispatcher_stall_seconds": 12})
+        out = open(w.root / "watch.out", "ab")
+        keeper = subprocess.Popen([PYTHON, "-B", str(RES), "watch"], stdout=out, stderr=subprocess.STDOUT,
+                                  env=w.env("Altiplano", STUB_SEND_SLEEP="40"), cwd=str(SERVICE))
+        beat = w.root / "local-Altiplano" / "dispatcher.json"
+        try:
+            w.wait(lambda: w.logtext("Altiplano").count("dispatcher started") == 1, 30, "first dispatcher")
+            first = json.loads(beat.read_text(encoding="utf-8"))["pid"]
+            stack = w.data / "logs" / ("stack-altiplano-" + str(first) + ".txt")
+            self.assertTrue(stack.exists(), "no stack file at " + str(stack))
+            time.sleep(5)                                   # dumps every 3 s, each emptied by the next healthy pass
+            self.assertNotIn("in send_mail", stack.read_text(encoding="utf-8"))
+            lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
+            w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleepy.py"), "1")   # no waiter: mailed
+            w.wait(lambda: "WARN dispatcher pid " + str(first) + " wrote no heartbeat" in w.logtext("Altiplano"), 60,
+                   "the keeper's kill", evidence=lambda: w.logtext("Altiplano")[-2000:])
+            self.assertIn("its stack dumps: " + str(stack), w.logtext("Altiplano"))
+            self.assertFalse(pid_alive(first))
+            text = stack.read_text(encoding="utf-8")
+            measured("keeper.stack_dumps", text.count("Timeout ("))
+            self.assertGreaterEqual(text.count("Timeout ("), 2, text)
+            self.assertIn("in send_mail", text)
+            self.assertIn("in compliance_loop", text)       # the other thread, still running
+        finally:
             for child in psutil.Process(keeper.pid).children(recursive=True):
                 child.terminate()
             keeper.terminate()

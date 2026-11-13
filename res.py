@@ -89,6 +89,7 @@ import atexit            # noqa: E402
 import collections       # noqa: E402
 import copy              # noqa: E402
 import datetime          # noqa: E402
+import faulthandler      # noqa: E402
 import functools         # noqa: E402
 import json              # noqa: E402
 import shutil            # noqa: E402
@@ -3480,7 +3481,8 @@ class Dispatcher:
                         pass
         # this machine's daily logs and diagnostic snapshots after keep_days; the LaunchAgent's bootstrap log is cut
         # back when it passes 10 MB (it only holds tracebacks, but a crash loop would grow it)
-        prefixes = ["leaseresources." + self.machine.casefold() + ".", "snapshot-" + self.machine]
+        prefixes = ["leaseresources." + self.machine.casefold() + ".", "snapshot-" + self.machine, "stack-" + self.machine]
+        own_stack = stack_path(self.machine, os.getpid())             # kept open and emptied on every pass
         jobs = LOG_DIR / "leases"
         if jobs.is_dir():
             for path in jobs.iterdir():
@@ -3492,7 +3494,7 @@ class Dispatcher:
         if LOG_DIR.is_dir():
             for path in LOG_DIR.iterdir():
                 try:
-                    if any(path.name.casefold().startswith(pre.casefold()) for pre in prefixes) \
+                    if any(path.name.casefold().startswith(pre.casefold()) for pre in prefixes) and path != own_stack \
                             and time.time() - path.stat().st_mtime > keep:
                         path.unlink()
                     elif path.name == "launchd.log" and sys.platform == "darwin" and path.stat().st_size > 10e6:
@@ -3553,10 +3555,33 @@ def take_lock(machine: str) -> bool:
     return True
 
 
+def stack_path(machine: str, pid: int) -> Path:
+    """The stack dumps of the dispatcher with this pid, in the machine-local log folder (see cmd_dispatch)."""
+    return LOG_DIR / ("stack-" + machine.casefold() + "-" + str(pid) + ".txt")
+
+
+def restart_dispatcher(machine: str, stack, why: str) -> None:
+    """Exits so that the keeper starts a new dispatcher at once. A clean exit leaves no stack file behind."""
+    log(machine, why)
+    faulthandler.cancel_dump_traceback_later()
+    stack.close()
+    stack_path(machine, os.getpid()).unlink()
+    sys.exit(EXIT_CODE_CHANGED)
+
+
 def cmd_dispatch(args, config: dict) -> None:
     machine = this_machine(config)
     if not take_lock(machine):
         sys.exit(EXIT_ALREADY_RUNNING)
+    # A hang leaves its stack (Stahlwerk 2026-11-11, Mistral 2026-11-12: main loop hung, nothing showed where). The
+    # faulthandler watchdog thread is started here, once, and dumps every thread's stack into the stack file every
+    # quarter of dispatcher_stall_seconds; every pass of the main loop empties the file, so after a hang it holds only
+    # the dumps written since the last healthy pass, and the keeper names it when it kills this process. It is never
+    # re-armed: each arming starts a new thread (CPython's faulthandler.c), and when psutil has left the Windows loader
+    # lock held no new thread can start, while one started before still dumps (tried on Stahlwerk with the lock held).
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stack = open(stack_path(machine, os.getpid()), "ab", buffering=0)      # append: dumps land at the end after a truncate
+    faulthandler.dump_traceback_later(float(config["dispatcher_stall_seconds"]) / 4, repeat=True, file=stack)
     seed_local_state(machine)
     d = Dispatcher(config)
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", code " + d.version + ", dimensions "
@@ -3579,6 +3604,7 @@ def cmd_dispatch(args, config: dict) -> None:
             except (OSError, ValueError) as exc:
                 log(machine, "WARN cannot read config, keeping the last one: " + str(exc))
             beat()
+            stack.truncate(0)
             d.ingest_synced()
             d.handle_asks()
             d.handle_new()
@@ -3603,11 +3629,9 @@ def cmd_dispatch(args, config: dict) -> None:
         except Exception as exc:                              # the dispatcher itself must keep running
             log(machine, "WARN dispatcher: " + type(exc).__name__ + ": " + str(exc))
         if code_version() != d.version and code_compiles():
-            log(machine, "code changed; dispatcher restarting onto the new code")
-            sys.exit(EXIT_CODE_CHANGED)
+            restart_dispatcher(machine, stack, "code changed; dispatcher restarting onto the new code")
         if REPORTS_VIA != via:                                # the restarted one publishes its report and beat at once
-            log(machine, "reports_via is now " + REPORTS_VIA + "; dispatcher restarting to publish there")
-            sys.exit(EXIT_CODE_CHANGED)
+            restart_dispatcher(machine, stack, "reports_via is now " + REPORTS_VIA + "; dispatcher restarting to publish there")
         time.sleep(num(d.config, "tick_seconds", 1))
 
 
@@ -3643,7 +3667,8 @@ def keep(machine: str, child: subprocess.Popen, stall: float):
             quiet += poll
         if quiet > stall:
             log(machine, "WARN dispatcher pid " + str(ours or child.pid) + " wrote no heartbeat for " + str(int(quiet))
-                + " s; killed, a new one starts")
+                + " s; killed, a new one starts; "
+                + ("its stack dumps: " + str(stack_path(machine, ours)) if ours is not None else "no stack dumps: it never beat"))
             if ours is None:                         # never beat, so it started no runner yet: its launched interpreter
                 try:
                     victims = [p.pid for p in psutil.Process(child.pid).children()]
