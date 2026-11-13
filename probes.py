@@ -470,7 +470,10 @@ def _number(text: str):
 
 
 class NvidiaProbe(Probe):
-    """gpu:N and vram:N for every NVIDIA GPU, through nvidia-smi."""
+    """gpu:N and vram:N for every NVIDIA GPU, through nvidia-smi. A call that fails or runs past its timeout raises, so
+    the sample leaves the GPU out and the dispatcher logs `WARN probe failed`; until 2026-11-12 it returned no rows, and
+    the GPU left the sample without a word (and a failed first call left the machine without GPU dimensions until the
+    dispatcher restarted). The dimensions come from the first query that succeeds."""
 
     def __init__(self, config, local_dir):
         super().__init__(config, local_dir)
@@ -478,26 +481,23 @@ class NvidiaProbe(Probe):
         if not self.exe and sys.platform == "win32":
             candidate = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "nvidia-smi.exe"
             self.exe = str(candidate) if candidate.is_file() else None
+        self.keep_without_dims = self.exe is not None
         self.gpus = {}
         self.apps = {}
         self.users = {}
         self.vram_per_process = True
-        if not self.exe:
-            return
-        self._query()
-        for index, info in sorted(self.gpus.items()):
-            self.dims["gpu:" + index] = {"capacity": 100.0, "label": info["name"], "aliases": []}
-            self.dims["vram:" + index] = {"capacity": info["total"], "label": info["name"] + " memory", "aliases": []}
+
+    def start(self) -> None:
+        if self.exe:
+            self.system(0.0)
 
     def _run(self, args: list) -> list:
-        try:
-            out = subprocess.run([self.exe] + args, capture_output=True, text=True, timeout=10,
-                                 creationflags=no_window()).stdout
-        except (OSError, subprocess.SubprocessError):
-            return []
+        out = subprocess.run([self.exe] + args, capture_output=True, text=True, timeout=10, creationflags=no_window(),
+                             check=True).stdout
         return [[field.strip() for field in line.split(",")] for line in out.splitlines() if line.strip()]
 
     def _query(self):
+        self.gpus, self.apps, self.users = {}, {}, {}      # a failed query leaves no stale figures for tree()
         gpus = {}
         uuids = {}
         for row in self._run(["--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total",
@@ -524,7 +524,9 @@ class NvidiaProbe(Probe):
     def system(self, dt):
         self._query()
         use = {}
-        for index, info in self.gpus.items():
+        for index, info in sorted(self.gpus.items()):
+            self.dims.setdefault("gpu:" + index, {"capacity": 100.0, "label": info["name"], "aliases": []})
+            self.dims.setdefault("vram:" + index, {"capacity": info["total"], "label": info["name"] + " memory", "aliases": []})
             use["gpu:" + index] = info["util"]
             use["vram:" + index] = info["used"]
         return use
@@ -601,18 +603,25 @@ class Meter:
         self.first_sample_rates = first_sample_rates
         self.probes = []
         self.errors = []                                  # what the probes raised in the last sample (or in start)
+        # Both failures go into self.errors, which the dispatcher logs, and to stderr where there is one: under pythonw
+        # (the Windows dispatcher) sys.stderr is None, and until 2026-11-12 writing to it raised AttributeError, so a
+        # probe failing at start would have ended the dispatcher.
         for cls in PROBES:
             try:
                 probe = cls(config, local_dir)
             except Exception as exc:                     # a broken probe must not take the others down
-                sys.stderr.write("probe " + cls.__name__ + " unavailable: " + str(exc) + "\n")
+                error = cls.__name__ + " unavailable: " + type(exc).__name__ + ": " + str(exc)
+                self.errors.append(error)
+                if sys.stderr is not None:
+                    sys.stderr.write("probe " + error + "\n")
                 continue
             try:
                 probe.start()
             except Exception as exc:                     # reported; the probe asks again in its next sample
                 error = cls.__name__ + ".start: " + type(exc).__name__ + ": " + str(exc)
-                sys.stderr.write("probe " + error + "\n")
                 self.errors.append(error)
+                if sys.stderr is not None:
+                    sys.stderr.write("probe " + error + "\n")
             if probe.dims or probe.keep_without_dims:
                 self.probes.append(probe)
         self.prev = {}                                    # (pid, create_time) -> (time, cpu seconds, disk bytes)

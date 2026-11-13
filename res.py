@@ -930,6 +930,7 @@ def take_notices(ident: str) -> list:
 def send_mail(config: dict, machine: str, desk: str, subject: str, body: str, for_session: str = "") -> bool:
     """Mail to the owner desk; with for_session, only that session of the desk takes it while ClaudeMail can reach it
     (sibling sessions on one desk took each other's lease notices, Altiplano 2026-09-30)."""
+    beat_if_dispatcher()
     outbox = LOCAL_DIR / "outbox"
     outbox.mkdir(parents=True, exist_ok=True)
     path = outbox / (datetime.datetime.now().strftime("%y%m%d-%H%M%S-%f") + ".md")
@@ -970,6 +971,7 @@ MAC_NOTIFY = ["on run argv", "display notification (item 2 of argv) with title (
 
 
 def notify(config: dict, machine: str, title: str, body: str) -> None:
+    beat_if_dispatcher()
     log(machine, "notified: " + title + " - " + " ".join(body.split()))
     if not config.get("notify", True):
         return
@@ -3478,18 +3480,30 @@ def local_heartbeat() -> Path:
     return LOCAL_DIR / "dispatcher.json"
 
 
+def beat() -> None:
+    write_json(local_heartbeat(), {"pid": os.getpid(), "updated": now_iso()})
+
+
+def beat_if_dispatcher() -> None:
+    """Called before each mail and toast, whose calls may take up to 60 and 30 s: a pass of the main loop that mails many
+    notices (a backlog after an outage, mail failing each time) stays alive to the keeper, which reads 600 s without a
+    beat as a hang. Only in the dispatcher holding the lock; other commands mail too."""
+    if read_json(local_heartbeat()).get("pid") == os.getpid():
+        beat()
+
+
 def take_lock(machine: str) -> bool:
-    beat = read_json(local_heartbeat())
-    pid = beat.get("pid")
+    held = read_json(local_heartbeat())
+    pid = held.get("pid")
     if isinstance(pid, int) and pid != os.getpid() and process(pid) is not None:
-        if age_of(beat.get("updated")) < 120:
+        if age_of(held.get("updated")) < 120:
             return False
         try:
             psutil.Process(pid).terminate()
             log(machine, "stopped a dispatcher that stopped reporting (pid " + str(pid) + ")")
         except psutil.Error:
             pass
-    write_json(local_heartbeat(), {"pid": os.getpid(), "updated": now_iso()})
+    beat()
     return True
 
 
@@ -3518,7 +3532,7 @@ def cmd_dispatch(args, config: dict) -> None:
                 d.config = load_config()
             except (OSError, ValueError) as exc:
                 log(machine, "WARN cannot read config, keeping the last one: " + str(exc))
-            write_json(local_heartbeat(), {"pid": os.getpid(), "updated": now_iso()})
+            beat()
             d.ingest_synced()
             d.handle_asks()
             d.handle_new()
@@ -3551,19 +3565,79 @@ def cmd_dispatch(args, config: dict) -> None:
         time.sleep(num(d.config, "tick_seconds", 1))
 
 
+def keep(machine: str, child: subprocess.Popen, stall: float):
+    """Waits for the dispatcher child to exit and returns its exit code; or kills it and returns None once its main loop
+    has written no heartbeat for `stall` seconds (counted from the child's start until its first beat). A hung main loop
+    cannot end itself: on Mistral on 2026-11-12 psutil's open_files() had killed one of its own helper threads with
+    TerminateThread, which leaves the Windows loader lock held forever; from then on no thread of the process could start
+    (subprocess.run's reader thread for nvidia-smi waited for 11 hours, past its timeout) and even os._exit hangs, since
+    ExitProcess takes that lock too. Only a kill from outside (TerminateProcess) ends such a process. Waiting needs no
+    thread here (WaitForSingleObject). The silence is counted in polls that found no new beat, not by the clock, so a Mac
+    waking from sleep does not read as a hang.
+    The dispatcher is the child itself, or on Windows the base interpreter that the venv's python.exe launcher (the
+    child) starts as its own child; it is the process that names itself in the heartbeat. The kill goes to it and to the
+    launcher only, never further down: the leased jobs' runners are the dispatcher's children (detached, still its
+    children by parent pid), and they run on."""
+    poll = 5.0
+    ours = None
+    seen = None
+    quiet = 0.0
+    while True:
+        try:
+            return child.wait(timeout=poll)
+        except subprocess.TimeoutExpired:
+            pass
+        beat = read_json(local_heartbeat())
+        pid = beat.get("pid")
+        if ours is None and isinstance(pid, int) and (pid == child.pid or parent_of(pid) == child.pid):
+            ours = pid
+        if ours is not None and pid == ours and beat.get("updated") != seen:
+            seen, quiet = beat.get("updated"), 0.0
+        else:
+            quiet += poll
+        if quiet > stall:
+            log(machine, "WARN dispatcher pid " + str(ours or child.pid) + " wrote no heartbeat for " + str(int(quiet))
+                + " s; killed, a new one starts")
+            if ours is None:                         # never beat, so it started no runner yet: its launched interpreter
+                try:
+                    victims = [p.pid for p in psutil.Process(child.pid).children()]
+                except psutil.NoSuchProcess:         # it exited since the last wait; child.wait() below collects it
+                    victims = []
+            else:
+                victims = [ours] if ours != child.pid else []
+            for victim in victims:
+                try:
+                    psutil.Process(victim).kill()
+                except psutil.NoSuchProcess:         # already gone, which is what the kill is for
+                    pass
+            child.kill()
+            child.wait()
+            return None
+
+
+def parent_of(pid: int):
+    try:
+        return psutil.Process(pid).ppid()
+    except psutil.NoSuchProcess:                     # an earlier dispatcher's beat, its writer gone
+        return None
+
+
 def cmd_watch(args, config: dict) -> None:
     """The keeper the LaunchAgent / scheduled task runs: keeps a dispatcher child alive, restarts it at once after a code
-    change. Kept tiny, because only a restart of the task renews it."""
+    change or a hang (see keep). Kept tiny, because only a restart of the task renews it."""
     machine = this_machine(config)
+    stall = float(config["dispatcher_stall_seconds"])
     log(machine, "watch started (pid " + str(os.getpid()) + ")")
     while True:
         started = time.monotonic()
         try:
-            code = subprocess.call([sys.executable, "-B", str(SCRIPT), "dispatch"], creationflags=probes.no_window())
+            child = subprocess.Popen([sys.executable, "-B", str(SCRIPT), "dispatch"], creationflags=probes.no_window())
         except OSError as exc:
             log(machine, "WARN cannot start the dispatcher: " + str(exc))
             code = -1
-        if code == EXIT_CODE_CHANGED:
+        else:
+            code = keep(machine, child, stall)
+        if code is None or code == EXIT_CODE_CHANGED:
             continue
         if code == EXIT_ALREADY_RUNNING:
             time.sleep(60)

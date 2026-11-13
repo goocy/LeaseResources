@@ -14,6 +14,7 @@
   "trial_seconds": 10,
   "trial_sample_seconds": 0.25,
   "tick_seconds": 1,
+  "dispatcher_stall_seconds": 600,
   "sample_seconds": 5,
   "smoothing_seconds": 30,
   "answer_wait_seconds": 6,

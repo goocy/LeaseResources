@@ -1009,6 +1009,46 @@ class T10Keeper(Base):
             keeper.wait(5)
             out.close()
 
+    def test_kills_a_hung_dispatcher(self):
+        """A dispatcher whose main loop stops writing its heartbeat is killed by the keeper and replaced (Mistral
+        2026-11-12: hung for 11 hours in a thread start that could never return, while its compliance thread logged on).
+        Suspending the dispatcher stands in for the hang: like that process, it can no longer end itself. A leased job
+        running meanwhile is not touched and is reported by the new dispatcher when it finishes."""
+        w = World("keeper-hang", {"dispatcher_stall_seconds": 12})
+        out = open(w.root / "watch.out", "ab")
+        keeper = subprocess.Popen([PYTHON, "-B", str(RES), "watch"], stdout=out, stderr=subprocess.STDOUT,
+                                  env=w.env("Altiplano"), cwd=str(SERVICE))
+        beat = w.root / "local-Altiplano" / "dispatcher.json"
+        hung = None
+        try:
+            w.wait(lambda: w.logtext("Altiplano").count("dispatcher started") == 1, 30, "first dispatcher")
+            lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
+            w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleepy.py"), "45")
+            w.wait(lambda: w.lease("Altiplano", lid).get("state") == "running", 20, "job running")
+            run = json.loads(w.state("Altiplano", lid + ".run.json").read_text(encoding="utf-8"))
+            time.sleep(15)                                   # longer than the stall limit: a healthy one is left alone
+            self.assertEqual(w.logtext("Altiplano").count("dispatcher started"), 1, w.logtext("Altiplano"))
+            hung = psutil.Process(json.loads(beat.read_text(encoding="utf-8"))["pid"])
+            hung.suspend()
+            t0 = time.monotonic()
+            w.wait(lambda: w.logtext("Altiplano").count("dispatcher started") == 2, 60, "replacement dispatcher",
+                   evidence=lambda: w.logtext("Altiplano")[-2000:])
+            measured("keeper.hang_replaced_seconds", round(time.monotonic() - t0, 1))
+            self.assertIn("WARN dispatcher pid " + str(hung.pid) + " wrote no heartbeat for ", w.logtext("Altiplano"))
+            self.assertFalse(pid_alive(hung.pid))
+            self.assertNotEqual(json.loads(beat.read_text(encoding="utf-8"))["pid"], hung.pid)
+            self.assertTrue(pid_alive(run["runner_pid"]) and pid_alive(run["pid"]), "the leased job was killed with the dispatcher")
+            fin = w.wait(lambda: w.mail_matching("finished"), 60, "completion reported by the new dispatcher")
+            self.assertIn("exit code 0", fin[0]["body"])
+        finally:
+            if hung is not None and pid_alive(hung.pid):
+                hung.kill()
+            for child in psutil.Process(keeper.pid).children(recursive=True):
+                child.terminate()
+            keeper.terminate()
+            keeper.wait(5)
+            out.close()
+
 
 class T13TrialWatchdog(Base):
     """The 10-second kill does not depend on the sampling loop: with one sample every 30 s (standing in for a probe
@@ -1352,6 +1392,52 @@ class T14Units(Base):
         self.assertEqual(quiet, {"vram:0": 0.0, "gpu:0": 0.0})
         self.assertEqual(round(busy["gpu:0"]), 84)
         self.assertGreater(busy["vram:0"], 10e9)
+
+    def test_gpu_probe_failure_reported(self):
+        """An nvidia-smi that fails is reported (Meter.errors, which the dispatcher logs as WARN probe failed), never
+        read as no GPU; a probe whose first call failed gets its dimensions once a later call succeeds, and a failed
+        call leaves no stale figures for the trees. A stand-in nvidia-smi fails while a file `fail` exists beside it."""
+        import probes
+        folder = SCRATCH / "fake-smi"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "fake_smi.py").write_text(
+            "import sys\nfrom pathlib import Path\n"
+            "if (Path(__file__).parent / 'fail').exists():\n    sys.exit(1)\n"
+            "if any(a.startswith('--query-gpu') for a in sys.argv[1:]):\n    print('0, GPU-1, Fake GPU, 50, 1000, 12288')\n",
+            encoding="utf-8")
+        if WINDOWS:
+            exe = folder / "nvidia-smi.cmd"
+            exe.write_text('@"' + PYTHON + '" "%~dp0fake_smi.py" %*\r\n', encoding="utf-8")
+        else:
+            exe = folder / "nvidia-smi"
+            exe.write_text('#!/bin/sh\nexec "' + PYTHON + '" "$(dirname "$0")/fake_smi.py" "$@"\n', encoding="utf-8")
+            exe.chmod(0o755)
+        fail = folder / "fail"
+        fail.write_text("", encoding="utf-8")
+        which, kinds = probes.shutil.which, probes.PROBES
+        probes.shutil.which = lambda name, *a, **k: str(exe) if name == "nvidia-smi" else which(name, *a, **k)
+        probes.PROBES = [probes.NvidiaProbe]
+        try:
+            meter = probes.Meter({"disk_paths_seconds": 1}, folder)
+            start_errors, start_dims = list(meter.errors), sorted(meter.dimensions())
+            fail.unlink()
+            healed, _ = meter.sample({})
+            healed_dims, healed_errors = sorted(meter.dimensions()), list(meter.errors)
+            fail.write_text("", encoding="utf-8")
+            broken, trees = meter.sample({"job": [psutil.Process()]})
+            broken_errors = list(meter.errors)
+        finally:
+            probes.shutil.which, probes.PROBES = which, kinds
+        measured("units.gpu_probe_failure", {"start": start_errors, "healed": healed, "broken": broken_errors})
+        self.assertEqual([e.partition(":")[0] for e in start_errors], ["NvidiaProbe.start"])
+        self.assertIn("CalledProcessError", start_errors[0])
+        self.assertEqual(start_dims, [])
+        self.assertEqual(healed_dims, ["gpu:0", "vram:0"])
+        self.assertEqual(healed_errors, [])
+        self.assertEqual(healed["gpu:0"], 50.0)
+        self.assertEqual([e.partition(":")[0] for e in broken_errors], ["NvidiaProbe.system"])
+        self.assertNotIn("gpu:0", broken)
+        self.assertEqual(trees["job"], {})
 
     def test_disk_cap(self):
         import probes
