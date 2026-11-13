@@ -1,0 +1,11 @@
+# Lease traffic, logs and machine-local state never belong in the repository
+leases/
+logs/
+config/*.json
+!config/defaults.json
+# Candidate and diagnostic copies made while testing a change
+tests/candidate-*/
+tests/diag-*/
+__pycache__/
+*.pyc
+.DS_Store

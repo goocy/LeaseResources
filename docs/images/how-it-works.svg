@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" width="1000" height="600" role="img" aria-labelledby="title desc">
+  <title id="title">How a leased job runs</title>
+  <desc id="desc">A Claude session runs res trial, which runs the command for at most 10 seconds under the meter and saves its profile (1). If it was cut off, res request asks the machine's dispatcher for a lease from that profile (2); the dispatcher admits, queues or refuses it by one rule on every dimension (3). res run --wait starts the job through a detached runner (4) and waits on the lease; the dispatcher meters the job every 5 seconds against what it declared (5) and writes its notices to the waiter, whose exit wakes the session (6). With no waiter alive, notices go by ClaudeMail to the session's desk.</desc>
+  <style>
+    .col { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .alt { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; stroke-dasharray: 6 5; }
+    .box { fill: #ffffff; stroke: #57606a; stroke-width: 1.5; }
+    .cmd { fill: #ddf4ff; stroke: #54aeff; stroke-width: 1.5; }
+    .job { fill: #dafbe1; stroke: #4ac26b; stroke-width: 1.5; }
+    .line { stroke: #57606a; stroke-width: 2; fill: none; }
+    .dash { stroke: #57606a; stroke-width: 2; fill: none; stroke-dasharray: 6 5; }
+    .head { fill: #57606a; }
+    .num { fill: #0969da; }
+    .numtext { fill: #ffffff; font: 700 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { fill: #1f2328; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .h { font-size: 16px; font-weight: 700; }
+    .t { font-size: 14px; font-weight: 600; }
+    .s { font-size: 12px; fill: #59636e; }
+    .lab { font-size: 12px; fill: #59636e; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+    @media (prefers-color-scheme: dark) {
+      .col { fill: #161b22; stroke: #30363d; }
+      .alt { fill: #161b22; stroke: #6e7681; }
+      .box { fill: #0d1117; stroke: #8b949e; }
+      .cmd { fill: #0c2d4b; stroke: #388bfd; }
+      .job { fill: #0f2e1b; stroke: #3fb950; }
+      .line, .dash { stroke: #8b949e; }
+      .head { fill: #8b949e; }
+      .num { fill: #388bfd; }
+      text { fill: #e6edf3; }
+      .s, .lab { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <!-- columns -->
+  <rect class="col" x="20" y="50" width="190" height="430" rx="12"/>
+  <rect class="col" x="290" y="50" width="300" height="430" rx="12"/>
+  <rect class="col" x="670" y="50" width="310" height="430" rx="12"/>
+  <text class="h" x="115" y="35" text-anchor="middle">Claude session</text>
+  <text class="h" x="440" y="35" text-anchor="middle">Its res commands</text>
+  <text class="h" x="825" y="35" text-anchor="middle">The machine's dispatcher</text>
+
+  <!-- session -->
+  <rect class="box" x="35" y="70" width="160" height="390" rx="8"/>
+  <text class="t" x="115" y="250" text-anchor="middle">Claude Code</text>
+  <text class="t" x="115" y="268" text-anchor="middle">session</text>
+  <text class="s" x="115" y="290" text-anchor="middle">runs res through</text>
+  <text class="s" x="115" y="305" text-anchor="middle">its Bash tool</text>
+
+  <!-- res commands -->
+  <rect class="cmd" x="305" y="75" width="270" height="80" rx="6"/>
+  <text class="mono" x="440" y="100" text-anchor="middle">res trial -- &lt;command&gt;</text>
+  <text class="s" x="440" y="120" text-anchor="middle">meters it, kills the whole tree at 10 s</text>
+  <text class="s" x="440" y="137" text-anchor="middle">exit 0: done, no lease · exit 3: profile saved</text>
+
+  <rect class="cmd" x="305" y="185" width="270" height="70" rx="6"/>
+  <text class="mono" x="440" y="212" text-anchor="middle">res request --profile &lt;id&gt;</text>
+  <text class="s" x="440" y="232" text-anchor="middle">peaks + 25 % margin, for a duration</text>
+
+  <rect class="cmd" x="305" y="300" width="270" height="95" rx="6"/>
+  <text class="mono" x="440" y="327" text-anchor="middle">res run --lease &lt;id&gt; --wait</text>
+  <text class="s" x="440" y="347" text-anchor="middle">a background command: the waiter</text>
+  <text class="s" x="440" y="364" text-anchor="middle">streams the log, prints the notices,</text>
+  <text class="s" x="440" y="381" text-anchor="middle">exits with the job's code, or 75</text>
+
+  <!-- dispatcher -->
+  <rect class="box" x="685" y="170" width="280" height="100" rx="8"/>
+  <text class="t" x="825" y="196" text-anchor="middle">Admission, one rule</text>
+  <text class="s" x="825" y="216" text-anchor="middle">on every dimension:</text>
+  <text class="s" x="825" y="234" text-anchor="middle">unleased use + granted leases + request</text>
+  <text class="s" x="825" y="252" text-anchor="middle">≤ capacity × 0.85, else queue</text>
+
+  <rect class="box" x="685" y="300" width="280" height="70" rx="8"/>
+  <text class="t" x="825" y="326" text-anchor="middle">Watching, every 5 s</text>
+  <text class="s" x="825" y="346" text-anchor="middle">overrun, past duration, stall, end</text>
+
+  <rect class="job" x="685" y="395" width="280" height="70" rx="8"/>
+  <text class="t" x="825" y="422" text-anchor="middle">The job, detached</text>
+  <text class="s" x="825" y="442" text-anchor="middle">own process group, own log</text>
+
+  <!-- ClaudeMail fallback -->
+  <rect class="alt" x="305" y="510" width="660" height="70" rx="12"/>
+  <text class="t" x="635" y="538" text-anchor="middle">ClaudeMail to the session's desk</text>
+  <text class="s" x="635" y="558" text-anchor="middle">only when no waiter is alive: a run without --wait, or a lease on another machine</text>
+
+  <!-- 1: trial -->
+  <path class="line" d="M195,115 L303,115" marker-end="url(#arrow)"/>
+  <circle class="num" cx="249" cy="100" r="11"/><text class="numtext" x="249" y="104" text-anchor="middle">1</text>
+
+  <!-- 2: request -->
+  <path class="line" d="M195,220 L303,220" marker-end="url(#arrow)"/>
+  <circle class="num" cx="249" cy="205" r="11"/><text class="numtext" x="249" y="209" text-anchor="middle">2</text>
+  <path class="line" d="M575,208 L683,208" marker-end="url(#arrow)"/>
+  <path class="line" d="M683,240 L577,240" marker-end="url(#arrow)"/>
+  <circle class="num" cx="629" cy="190" r="11"/><text class="numtext" x="629" y="194" text-anchor="middle">3</text>
+  <text class="lab" x="629" y="260" text-anchor="middle">granted,</text>
+  <text class="lab" x="629" y="275" text-anchor="middle">queued or</text>
+  <text class="lab" x="629" y="290" text-anchor="middle">refused</text>
+
+  <!-- 4: run -->
+  <path class="line" d="M195,325 L303,325" marker-end="url(#arrow)"/>
+  <circle class="num" cx="249" cy="310" r="11"/><text class="numtext" x="249" y="314" text-anchor="middle">4</text>
+  <path class="line" d="M575,385 C620,400 640,425 683,428" marker-end="url(#arrow)"/>
+  <text class="lab" x="612" y="440" text-anchor="middle">starts it</text>
+
+  <!-- 5: watching meters the job -->
+  <path class="line" d="M825,393 L825,372" marker-end="url(#arrow)"/>
+  <circle class="num" cx="845" cy="383" r="11"/><text class="numtext" x="845" y="387" text-anchor="middle">5</text>
+
+  <!-- 6: notices to the waiter, exit wakes the session -->
+  <path class="line" d="M683,330 L577,330" marker-end="url(#arrow)"/>
+  <text class="lab" x="629" y="320" text-anchor="middle">notices</text>
+  <path class="line" d="M303,375 L197,375" marker-end="url(#arrow)"/>
+  <circle class="num" cx="249" cy="360" r="11"/><text class="numtext" x="249" y="364" text-anchor="middle">6</text>
+  <text class="lab" x="249" y="395" text-anchor="middle">its exit wakes</text>
+  <text class="lab" x="249" y="410" text-anchor="middle">the session</text>
+
+  <!-- fallback path -->
+  <path class="dash" d="M965,345 C995,380 995,470 965,512" marker-end="url(#arrow)"/>
+  <path class="dash" d="M305,545 C150,545 115,520 115,462" marker-end="url(#arrow)"/>
+</svg>
