@@ -298,13 +298,85 @@ def disk_map(local_dir: Path, signature: list, max_age: float = 3600, skip=()) -
     return mapping
 
 
+WINDOWS_SERIALS = "Get-PhysicalDisk | ForEach-Object { [string]$_.DeviceId + ' ' + [string]$_.SerialNumber }"
+
+
+def disk_serials(local_dir: Path, signature: list) -> dict:
+    """physical disk name -> serial number (upper case, no spaces), for matching a disk to its benchmark (D-261114-1).
+    Windows only, where Get-PhysicalDisk names them without elevation; elsewhere {}, so a Mac's or a Linux machine's
+    disks keep a configured or learned capacity. Cached in the local folder while the disks and mounts stay the same."""
+    if sys.platform != "win32":
+        return {}
+    cache = local_dir / "serials.json"
+    cached = read_json(cache)
+    if cached.get("host") == socket.gethostname() and cached.get("signature") == signature:
+        return cached["serials"]
+    out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SERIALS],
+                         capture_output=True, text=True, timeout=30, creationflags=no_window(), check=True).stdout
+    serials = {}
+    for line in out.splitlines():
+        number, _, serial = line.strip().partition(" ")
+        serial = "".join(serial.split()).upper()
+        if number.isdigit() and serial:
+            serials["PhysicalDrive" + number] = serial
+    write_json(cache, {"host": socket.gethostname(), "signature": signature, "serials": serials})
+    return serials
+
+
+MIB = 1024 * 1024                # DriveBench and the older benchmark scripts write MB for MiB
+
+
+def _read_speeds(path: Path) -> tuple:
+    """(outer read in MiB/s, kind) from one benchmark report, or (None, ''). DriveBench reports and Surface scans have
+    a line 'Read average  155.78 MB/s   outer  207.48 MB/s   inner ...'; the console captures of the older
+    benchmarkDrive.py have one 'Read completed in 5.48 seconds (186.98 MB/s).' per location, the first one outermost."""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines:
+        words = line.split()
+        if words[:2] == ["Read", "average"] and "outer" in words:
+            return float(words[words.index("outer") + 1]), "outer read"
+    located = [float(line.partition("(")[2].partition(" MB/s")[0]) for line in lines
+               if line.strip().startswith("Read completed in") and " MB/s)" in line]
+    if located:
+        return max(located), "fastest of " + str(len(located)) + " read locations"
+    return None, ""
+
+
+def benchmarked_capacity(root: Path, serial: str) -> tuple:
+    """(bytes/s, source) from the newest benchmark of the disk with this serial in the archive `root`, one folder per
+    disk named '<model> <serial>' (DriveBench files its reports there), or (None, ''). The capacity is the outer-track
+    sequential read: a spinning disk is fastest there, and a disk-bound lease is sized to what the disk can do at best
+    (D-261114-1). A folder matches when its last word is the serial, or one is the other's start, at least 8
+    characters long: SAS disks appear both as 'ABCD1234' and as 'ABCD12340000K0000XYZ'."""
+    found = []
+    for folder in root.iterdir():
+        token = folder.name.split()[-1].upper() if folder.is_dir() and folder.name.split() else ""
+        if not token or not (token == serial or (min(len(token), len(serial)) >= 8
+                                                  and (serial.startswith(token) or token.startswith(serial)))):
+            continue
+        for path in folder.iterdir():
+            report = "Benchmark" in path.name or (path.name.startswith("Surface ") and "health" not in path.name)
+            if path.suffix.lower() != ".txt" or not report:   # not 'Surface health', 'Health' or 'Summary'
+                continue
+            speed, kind = _read_speeds(path)
+            if speed is not None:
+                found.append((path.stat().st_mtime, speed, kind, path))
+    if not found:
+        return None, ""
+    _, speed, kind, path = max(found)
+    return speed * MIB, kind + " " + format(speed, ".2f") + " MiB/s in " + path.parent.name + "/" + path.name
+
+
 def _learned(local_dir: Path, name: str) -> dict:
     return read_json(local_dir / (name + ".json"))
 
 
 class DiskProbe(Probe):
     """One dimension per physical disk, in bytes/s. Capacity: 'disk_capacity' in the config (by name or label alias),
-    else the highest rate ever seen on that disk (learned by the dispatcher), at least 'disk_default_bytes_per_s'.
+    else the outer-track read of the disk's newest benchmark in the 'disk_benchmarks' archive, matched by serial
+    (Windows only, D-261114-1), else the highest rate ever seen on that disk (learned by the dispatcher), at least
+    'disk_default_bytes_per_s'. Each dimension says where its capacity came from ('source'), so a disk that still
+    needs a benchmark shows in `res now` and in the report.
     The dimensions are rebuilt whenever a disk or a mount comes or goes (disk_signature, checked on every sample): until
     2026-10-26 they were fixed when the probe was made, and Mistral's dispatcher, started with five disks, refused every
     lease on the hot-swapped F: and H: for two days ('no such disk here') and put their bytes on the other disks.
@@ -339,6 +411,11 @@ class DiskProbe(Probe):
             raise
         self.failed = None
         learned = _learned(self.local_dir, "learned_peaks")
+        serials = disk_serials(self.local_dir, signature)
+        # The archive is optional: a machine without it (or with a config from before 2026-11-14, which Resilio can
+        # deliver after this file) keeps learned capacities, and each disk's source says so.
+        named = self.config.get("disk_benchmarks")
+        archive = Path(os.path.expanduser(named)) if named and Path(os.path.expanduser(named)).is_dir() else None
         configured = self.config.get("disk_capacity", {})
         default = float(self.config.get("disk_default_bytes_per_s", 150e6))
         dims, mounts, learnable = {}, {}, set()
@@ -348,15 +425,22 @@ class DiskProbe(Probe):
                 continue
             dim = "disk:" + disk
             aliases = [disk] + kept + [m.rstrip(":") for m in kept if m.endswith(":")]
-            capacity = None
+            capacity, source = None, ""
             for alias in aliases:
                 if alias in configured:
-                    capacity = float(configured[alias])
+                    capacity, source = float(configured[alias]), "configured (disk_capacity " + alias + ")"
+            if capacity is None and disk in serials and archive is not None:
+                capacity, source = benchmarked_capacity(archive, serials[disk])
+                source = "benchmark: " + source if capacity is not None else ""
             if capacity is None:
                 capacity = max(default, float(learned.get(dim, 0)))
                 learnable.add(dim)
+                source = ("no benchmark for serial " + serials[disk] + (" in " + str(archive) if archive is not None
+                                                                         else " (no disk_benchmarks archive here)")
+                          + "; ") if disk in serials else ""
+                source += "learned" if float(learned.get(dim, 0)) > default else "default"
             label = ", ".join(kept[:3]) + (" ..." if len(kept) > 3 else "")
-            dims[dim] = {"capacity": capacity, "label": label, "aliases": aliases}
+            dims[dim] = {"capacity": capacity, "label": label, "aliases": aliases, "source": source}
             mounts[dim] = kept
         self.dims, self.mounts, self.learnable, self.signature = dims, mounts, learnable, signature
 

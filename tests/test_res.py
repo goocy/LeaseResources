@@ -785,6 +785,52 @@ class T23Overtake(Base):
         w.res("Altiplano", "release", la)
         w.stop()
 
+    def test_disk_need_capped_not_refused(self):
+        """D-261114-1: a disk need above the limit is cut to the limit and granted, not refused (a disk-bound job's
+        trial peak x 1.25 always exceeded capacity x 0.85); a capped lease is held to the capacity itself, so traffic
+        nobody leased does not keep it waiting; cpu and ram above the limit stay refused. disk:sim, capacity 100."""
+        w = World("diskcap")
+        cfg = json.loads((w.config / "defaults.json").read_text())
+        path = w.root / "disksim.json"
+        path.write_text(json.dumps({"total": 0, "pids": {}}))
+        cfg["file_dimensions"] = {"disk:sim": {"capacity": 100, "file": str(path), "label": "simulated disk"}}
+        (w.config / "defaults.json").write_text(json.dumps(cfg))
+        w.dispatcher("Altiplano")
+
+        def ask(need, desk):
+            out = w.res("Altiplano", "request", "--need", need, "--for", "5m", "--desk", "Altiplano:" + desk)
+            return out.stdout + out.stderr
+
+        a_out = ask("disk:sim=150", "DeskA")
+        measured("D-261114-1.capped_answer", [l for l in a_out.splitlines() if l.startswith("granted")][0])
+        self.assertIn("granted", a_out)
+        self.assertIn("disk:sim capped at 85", a_out)
+        la = lease_id(a_out)
+        self.assertEqual(w.lease("Altiplano", la)["need"]["disk:sim"], 85.0)
+        self.assertEqual(w.lease("Altiplano", la)["capped"], ["disk:sim"])
+        same = w.res("Altiplano", "extend", la, "--need", "disk:sim=85")
+        self.assertIn("need now", same.stdout + same.stderr)
+        self.assertEqual(w.lease("Altiplano", la)["capped"], ["disk:sim"], "an unchanged amount keeps the cap")
+        older = w.state("Altiplano", la + ".json")           # a lease written before 2026-11-14 has no 'capped'
+        record = json.loads(older.read_text())
+        del record["capped"]
+        older.write_text(json.dumps(record))
+        more = w.res("Altiplano", "extend", la, "--need", "cpu=0.5")
+        self.assertIn("need now", more.stdout + more.stderr, "an older lease can still be extended")
+        b_out = ask("disk:sim=10", "DeskB")                  # 85 leased + 10 > 85 allowed
+        self.assertIn("queued", b_out)
+        lb = lease_id(b_out)
+        refused = ask("ram=10T", "DeskC")
+        self.assertIn("refused", refused)
+        w.res("Altiplano", "release", lb)
+        w.res("Altiplano", "release", la)
+        path.write_text(json.dumps({"total": 10, "pids": {}}))   # 10 that nobody leased
+        time.sleep(4)                                        # past smoothing_seconds (3)
+        d_out = ask("disk:sim=200", "DeskD")                 # capped at 85: 10 + 85 fits under the capacity of 100
+        self.assertIn("granted", d_out, "a capped need must not wait for unleased traffic to fall to zero")
+        w.res("Altiplano", "release", lease_id(d_out))
+        w.stop()
+
     def test_queued_notice(self):
         """D-261113-2: a lease still queued queue_notice_minutes after its answer gets one notice naming what blocks it
         and how to give it back; the report carries waits_for."""
@@ -1461,7 +1507,8 @@ class T14Units(Base):
         calls = []
 
         def powershell(argv, **options):
-            calls.append(argv)
+            if argv[-1] == probes.WINDOWS_PARTITIONS:    # the map calls; the serial query (D-261114-1) gets no serials here
+                calls.append(argv)
             return SimpleNamespace(stdout="".join(l + " " + str(n) + "\n" for l, n in letters.items()))
         saved = (probes.sys, probes.subprocess, probes.psutil.disk_partitions, probes.psutil.disk_io_counters)
         probes.sys = SimpleNamespace(platform="win32")
@@ -1567,6 +1614,41 @@ class T14Units(Base):
         self.assertEqual(quiet, {"vram:0": 0.0, "gpu:0": 0.0})
         self.assertEqual(round(busy["gpu:0"]), 84)
         self.assertGreater(busy["vram:0"], 10e9)
+
+    def test_disk_capacity_from_benchmark(self):
+        """D-261114-1: a disk's capacity is the outer-track read of its newest benchmark in the archive, matched by the
+        serial Get-PhysicalDisk gives (short and long SAS serials both match); MB in the reports means MiB."""
+        from types import SimpleNamespace
+        import probes
+        root = Path(tempfile.mkdtemp(dir=str(SCRATCH)))
+        drivebench = root / "SEAGATE STMFSND2CLAR4000 ZC19TEST"
+        drivebench.mkdir()
+        (drivebench / "Benchmark 261111.txt").write_text(
+            "DriveBench raw-sector benchmark\nSerial       ZC19TEST\n\n"
+            "Read average   155.78 MB/s   outer  207.48 MB/s   inner  103.62 MB/s   (5/5 locations, 5.00 GB total)\n")
+        (drivebench / "Surface health 261029.txt").write_text("Read average 1.00 MB/s outer 1.00 MB/s\n")
+        old = root / "Seagate ST6000NM0034 S4D1ABCD"
+        old.mkdir()
+        (old / "Benchmark 250503.txt").write_text(
+            "Write completed in 5.48 seconds (186.98 MB/s).\nRead completed in 4.96 seconds (206.60 MB/s).\n"
+            "Read completed in 6.20 seconds (165.00 MB/s).\nGrand Average Read Speed: 185.80 MB/s\n")
+        (root / "Unlabelled disk").mkdir()
+        speed, source = probes.benchmarked_capacity(root, "ZC19TEST")
+        self.assertAlmostEqual(speed, 207.48 * 1024 * 1024)
+        self.assertIn("SEAGATE STMFSND2CLAR4000 ZC19TEST/Benchmark 261111.txt", source)
+        speed, source = probes.benchmarked_capacity(root, "S4D1ABCD0000K0000XYZ")
+        self.assertAlmostEqual(speed, 206.60 * 1024 * 1024)
+        self.assertIn("fastest of 2 read locations", source)
+        self.assertEqual(probes.benchmarked_capacity(root, "ZC19OTHER"), (None, ""))
+        saved = probes.sys, probes.subprocess
+        probes.sys = SimpleNamespace(platform="win32")
+        probes.subprocess = SimpleNamespace(run=lambda *a, **k: SimpleNamespace(stdout="0 ZC19 TEST \n1 \n2 S4D1ABCD0000K0000XYZ\n"))
+        try:
+            serials = probes.disk_serials(Path(tempfile.mkdtemp(dir=str(SCRATCH))), ["sig"])
+        finally:
+            probes.sys, probes.subprocess = saved
+        self.assertEqual(serials, {"PhysicalDrive0": "ZC19TEST", "PhysicalDrive2": "S4D1ABCD0000K0000XYZ"})
+        measured("units.disk_benchmark", {"ZC19TEST": round(probes.benchmarked_capacity(root, "ZC19TEST")[0] / 1e6, 1)})
 
     def test_gpu_probe_failure_reported(self):
         """An nvidia-smi that fails is reported (Meter.errors, which the dispatcher logs as WARN probe failed), never

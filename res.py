@@ -1084,6 +1084,9 @@ def cmd_now(args, config: dict) -> None:
         rows.append([dim, human(cap, kind), human(use, kind), human(planned.get(dim, 0.0), kind), human(unleased, kind),
                      human(max(0.0, free), kind), label])
     print_table(rows)
+    for dim in dims:
+        if "source" in dims[dim]:
+            print("  " + dim + " capacity: " + dims[dim]["source"])
 
 
 def print_table(rows: list) -> None:
@@ -2404,22 +2407,46 @@ class Dispatcher:
                          + ", ".join(d for d in dims if kind_of(d) == kind_of(name)) + ")")
         return result, notes, ""
 
-    def fits(self, need: dict, ahead: dict, exclude=None) -> tuple:
+    def fits(self, need: dict, ahead: dict, capped: list, exclude=None) -> tuple:
         """(fits now, blocking dimension, text). `ahead` holds the summed needs of the queued leases ahead of this one,
         counted as if they were granted (D-261113-1): a request may overtake a blocked queue head, but only into room
-        that leaves everything the leases ahead of it need, so on the head's blocked dimension nothing overtakes."""
+        that leaves everything the leases ahead of it need, so on the head's blocked dimension nothing overtakes.
+        On a dimension in `capped` (a disk or network need cut to the limit, D-261114-1) the sum is held to the
+        capacity itself: the headroom is then the room for the traffic nobody leased, which a need at the limit would
+        otherwise have to wait until it fell to zero."""
         limits = self.limits()
+        dims = self.meter.dimensions()
         unleased = self.unleased_now()
         planned = self.planned(exclude)
         for dim, amount in need.items():
+            # a dimension that has gone (a pulled hot-swap disk) allows nothing, so the lease waits for it to return
+            allowed = (dims[dim]["capacity"] if dim in dims else 0.0) if dim in capped else limits.get(dim, 0.0)
             total = unleased.get(dim, 0.0) + planned.get(dim, 0.0) + ahead.get(dim, 0.0) + amount
-            if total > limits.get(dim, 0.0):
+            if total > allowed:
                 kind = kind_of(dim)
                 queued = (" + queued ahead " + human(ahead[dim], kind)) if ahead.get(dim) else ""
                 return False, dim, (dim + ": unleased " + human(unleased.get(dim, 0.0), kind) + " + leased "
                                     + human(planned.get(dim, 0.0), kind) + queued + " + this " + human(amount, kind)
-                                    + " > " + human(limits.get(dim, 0.0), kind) + " allowed")
+                                    + " > " + human(allowed, kind) + (" (its capacity)" if dim in capped else " allowed"))
         return True, "", ""
+
+    def cap_self_limiting(self, need: dict) -> tuple:
+        """(need, capped dimensions, notes): a disk or network need above this machine's limit is cut to the limit
+        instead of being refused (D-261114-1). A job that saturates a disk peaks at about the disk's own speed, so a
+        trial-based need (peak x 1.25) always exceeded capacity x 0.85 and every disk-bound request was refused; such a
+        job only runs slower when it gets less, while cpu, ram and GPU memory stay refused, where a job can fail."""
+        limits = self.limits()
+        dims = self.meter.dimensions()
+        result, capped, notes = dict(need), [], []
+        for dim, amount in need.items():
+            if kind_of(dim) in ("disk", "net") and amount > limits[dim]:
+                kind = kind_of(dim)
+                result[dim] = limits[dim]
+                capped.append(dim)
+                notes.append(dim + " capped at " + human(limits[dim], kind) + " (asked " + human(amount, kind) + "; "
+                             + human(dims[dim]["capacity"], kind) + " x " + str(headroom(self.config, dim))
+                             + "); the disk or link itself sets the job's pace")
+        return result, capped, notes
 
     def queued_needs(self, queued: list) -> dict:
         """The summed needs of these queued leases: what fits() reserves for the leases ahead of a request."""
@@ -2432,7 +2459,10 @@ class Dispatcher:
     def handle_request(self, lease: dict) -> None:
         need, notes, refusal = self.normalise(lease.get("need") or {})
         limits = self.limits()
+        capped = []
         if not refusal:
+            need, capped, cap_notes = self.cap_self_limiting(need)
+            notes += cap_notes
             for dim, amount in need.items():
                 if amount > limits.get(dim, 0.0):
                     kind = kind_of(dim)
@@ -2442,6 +2472,7 @@ class Dispatcher:
                     break
         lease["need_asked"] = lease.get("need")
         lease["need"] = need
+        lease["capped"] = capped
         lease["answered"] = now_iso()
         lease["start_within_minutes"] = num(self.config, "start_within_minutes", 60)
         runs = read_json(self.folder / "history.json").get(lease.get("command_key") or "") or []
@@ -2454,7 +2485,7 @@ class Dispatcher:
             lease["ended"] = now_iso()
         else:
             queue_ahead = [l for l in self.leases() if l.get("state") == "queued"]
-            ok, dim, text = self.fits(need, self.queued_needs(queue_ahead))
+            ok, dim, text = self.fits(need, self.queued_needs(queue_ahead), capped)
             if ok:
                 self.grant(lease, notes)
             else:
@@ -2494,7 +2525,7 @@ class Dispatcher:
             # The dimension it already waits for is checked first, so waits_for changes only when that one frees up and
             # never flips between two blocked dimensions (each change writes a full report).
             need = dict(sorted(lease["need"].items(), key=lambda item: item[0] != lease.get("waits_for")))
-            ok, dim, text = self.fits(need, self.queued_needs(waiting))
+            ok, dim, text = self.fits(need, self.queued_needs(waiting), lease.get("capped", []))   # none before 2026-11-14
             if not ok:
                 if lease.get("waits_for") != dim or "waiting" not in lease:
                     lease["waits_for"] = dim
@@ -2598,9 +2629,16 @@ class Dispatcher:
                 # whole merged need was tested again, so a lease holding 180 of 186.3 MB/s on one disk, with 13 MB/s
                 # there that the meter did not put on it, was refused more of another disk (Mistral, L261113-141333440).
                 raised = {d: v for d, v in need.items() if v > float(held.get(d, 0.0))}
-                ok, dim, text = (False, "", refusal) if refusal else self.fits(raised, {}, exclude=ident)
+                raised, capped, cap_notes = self.cap_self_limiting(raised)      # D-261114-1, as for a request
+                merged.update(raised)
+                # a capped dimension stays capped unless the extension cuts it; leases from before 2026-11-14 have none
+                capped = [d for d in lease.get("capped", []) if (d not in need or need[d] >= float(held[d]))
+                          and d not in capped] + capped
+                ok, dim, text = (False, "", refusal) if refusal else self.fits(raised, {}, capped, exclude=ident)
                 if ok or lease.get("state") == "queued":
                     lease["need"] = merged
+                    lease["capped"] = capped
+                    parts.extend(cap_notes)
                     for d in need:
                         lease.get("notices", {}).pop("overrun:" + d, None)
                     parts.append("need now " + describe_need(merged))
@@ -3449,7 +3487,8 @@ class Dispatcher:
                                                     "compliance": compliance_lines(self.machine, 7)}):
                 self.beat_at = time.monotonic()
         stable = {"machine": self.machine, "pid": os.getpid(), "version": self.version,
-                  "capacity": {d: {"capacity": i["capacity"], "limit": limits[d], "label": i.get("label", "")} for d, i in dims.items()},
+                  "capacity": {d: dict({"capacity": i["capacity"], "limit": limits[d], "label": i.get("label", "")},
+                                       **({"source": i["source"]} if "source" in i else {})) for d, i in dims.items()},
                   "planned": self.planned(), "queue": [l["id"] for l in leases if l.get("state") == "queued"],
                   "active": [l["id"] for l in leases if l.get("state") in ACTIVE], "leases": summary}
         if stable != self.last_report:
