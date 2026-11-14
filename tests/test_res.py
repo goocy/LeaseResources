@@ -3,7 +3,8 @@
 Run with the venv's python:  ~/venvs/LeaseResources/bin/python -B tests/test_res.py [-v] [TestName ...]
 Scratch goes under LEASERES_TEST_SCRATCH (default: %LOCALAPPDATA%\\LeaseResources\\tests on Windows,
 ~/Library/Caches/LeaseResources/tests on the Mac; never the temp folder, which is a small RAM disk on the Windows
-machines, and never the synced tree), needs 4 GB free, and is deleted at the end, pass or fail. Measured numbers are printed as
+machines, and never the synced tree), needs 4 GB free, and is deleted at the end, pass or fail; a run's folder is named by its host, pid and
+create time, and a later run deletes it only once that process is gone, so runs may overlap. Measured numbers are printed as
 'MEASURED ...' lines and collected in <scratch>/results.json. POSIX only for now (process-group kills, a copied bash
 standing in for a Claude process); the Windows paths of res.py are untested.
 """
@@ -64,22 +65,27 @@ def check_scratch(base: Path) -> None:
                          + " LEASERES_TEST_ALLOW_SMALL_SCRATCH=1 if you are sure.")
 
 
+import psutil  # noqa: E402
+
 SCRATCH_BASE = scratch_base()
 check_scratch(SCRATCH_BASE)
-for _old in SCRATCH_BASE.glob("leaseres-tests-*"):        # left behind by a run that was killed
-    shutil.rmtree(_old, ignore_errors=True)
-SCRATCH = SCRATCH_BASE / ("leaseres-tests-" + time.strftime("%H%M%S"))
+SCRATCH_PREFIX = "leaseres-tests-"
+# The folder's name says which run owns it: leaseres-tests-<HHMMSS>-<host>-<pid>-<create time>, made in one mkdir, so
+# another run starting at any moment can tell whether its owner still runs (remove_leftovers); the host, because
+# LEASERES_TEST_SCRATCH may be a disk two machines share. Never exist_ok: the name is ours.
+HOST = socket.gethostname().partition(".")[0].casefold()
+SCRATCH = SCRATCH_BASE / (SCRATCH_PREFIX + time.strftime("%H%M%S") + "-" + HOST + "-" + str(os.getpid()) + "-"
+                          + format(psutil.Process().create_time(), ".2f"))
+SCRATCH.mkdir(parents=True)
 RESULTS = {}
 # The suite runs its own copy of the code, never the synced service files: touching those (the keeper test did) restarts
 # the production dispatcher on every machine (found on Moosfels, 2026-09-27).
 CODE = SCRATCH / "code"
-CODE.mkdir(parents=True, exist_ok=True)
+CODE.mkdir()
 for _name in ["res.py", "probes.py"]:
     shutil.copy2(SERVICE / _name, CODE / _name)
 RES = CODE / "res.py"
 sys.path.insert(0, str(CODE))
-
-import psutil  # noqa: E402
 
 
 WORLDS = []
@@ -2657,23 +2663,59 @@ class T22QuietPublishing(Base):
         measured("quiet.writes", written)
 
 
-def remove_scratch() -> str:
-    """Kill whatever still runs from the scratch tree, then delete it (retrying: Windows holds files of dying processes)."""
-    for p in processes_in(SCRATCH).values():
+def remove_scratch(folder: Path) -> str:
+    """Kill whatever still runs from a scratch tree, then delete it (retrying: Windows holds files of dying processes)."""
+    for p in processes_in(folder).values():
         try:
             p.kill()
         except psutil.Error:
             pass
     for attempt in range(5):
-        shutil.rmtree(SCRATCH, ignore_errors=True)
-        if not SCRATCH.exists():
+        shutil.rmtree(folder, ignore_errors=True)
+        if not folder.exists():
             return "removed"
         time.sleep(1)
-    return "NOT fully removed: " + str(SCRATCH)
+    return "NOT fully removed: " + str(folder)
+
+
+def owner_alive(pid: int, created: float) -> bool:
+    """Whether the run that made a scratch folder still goes on: its pid exists, is no zombie, and started when the
+    folder's name says (a reused pid starts later). Both create times are read moments after psutil was imported, the
+    owner's for its folder name and this one now, so neither carries the shift psutil 7.1+ adds on the Macs as the boot
+    time moves (res.py, clock_shift)."""
+    try:
+        proc = psutil.Process(pid)
+        return abs(proc.create_time() - created) <= 1.0 and proc.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
+def remove_leftovers() -> None:
+    """Delete the scratch folders of earlier runs that ended without deleting their own (killed, or the machine went
+    down), with whatever still runs from them. A folder whose run still goes on is left alone: each run used to delete
+    every leaseres-tests-* folder when it started, and a 10-second trial of one test class broke a full run in 19 tests
+    (Altiplano, 2026-11-14)."""
+    for folder in sorted(SCRATCH_BASE.glob(SCRATCH_PREFIX + "*")):
+        if folder == SCRATCH:
+            continue
+        parts = folder.name[len(SCRATCH_PREFIX):].split("-")
+        if len(parts) == 1:
+            print("left alone: " + str(folder) + " (named by a suite from before 2026-11-14, which recorded no owner;"
+                  + " delete it by hand when no suite runs from it)", flush=True)
+            continue
+        assert len(parts) >= 4 and parts[0].isdigit() and parts[-2].isdigit(), "not a scratch folder name this suite makes: " + str(folder)
+        host, pid, created = "-".join(parts[1:-2]), int(parts[-2]), float(parts[-1])
+        if host != HOST:
+            print("left alone: " + str(folder) + " (made on " + host + "; only a run there can tell whether it still goes on)", flush=True)
+            continue
+        if owner_alive(pid, created):
+            print("left alone: " + str(folder) + " (its run, pid " + str(pid) + ", still goes on)", flush=True)
+            continue
+        print("leftover " + str(folder) + ": " + remove_scratch(folder), flush=True)
 
 
 def main():
-    SCRATCH.mkdir(parents=True, exist_ok=True)
+    remove_leftovers()
     print("scratch: " + str(SCRATCH) + " (" + format(shutil.disk_usage(str(SCRATCH)).free / 1e9, ".0f") + " GB free)", flush=True)
     try:
         socket.create_connection(("192.0.2.2", 445), timeout=2).close()
@@ -2689,7 +2731,7 @@ def main():
         results = SCRATCH_BASE / "last-results.json"
         results.write_text(json.dumps(RESULTS, indent=1))
         print("results: " + str(results))
-        print("scratch " + remove_scratch())
+        print("scratch " + remove_scratch(SCRATCH))
     sys.exit(0 if ok else 1)
 
 

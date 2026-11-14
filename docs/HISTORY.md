@@ -9,7 +9,7 @@ LeaseResources was designed, built and repaired by Claude Code sessions on the h
 | 2026-09-27 | Designed in the morning, built by a sub-agent in about half an hour, and installed on six machines within a day, with five rounds of Windows fixes in between. |
 | 2026-09-28 to 10-04 | Logs and state off the synced folder; desk names and mail routing; the waiter, so sessions stop depending on mail; faster compliance scans; the macOS background throttle found. |
 | 2026-10-08 to 10-27 | psutil's shifting create times on the Mac; hot-swapped disks and disk attribution on Windows; report names in UTC. |
-| 2026-10-31 to 11-13 | Less traffic on the synced folder (reports on change, beats, fixed slots); a switch for moving reports to a Tailscale postman; disk maps that fail loudly; a watchdog for a dispatcher that cannot recover by itself, and stack dumps from such a hang; queued leases that fit overtake a blocked head; extensions tested only where they raise, and per-process rates over each process's own readings; disk needs capped instead of refused, and disk capacities from benchmarks. |
+| 2026-10-31 to 11-13 | Less traffic on the synced folder (reports on change, beats, fixed slots); a switch for moving reports to a Tailscale postman; disk maps that fail loudly; a watchdog for a dispatcher that cannot recover by itself, and stack dumps from such a hang; queued leases that fit overtake a blocked head; extensions tested only where they raise, and per-process rates over each process's own readings; disk needs capped instead of refused, and disk capacities from benchmarks; test runs that may overlap. |
 
 ## The design: 2026-09-27
 
@@ -69,6 +69,8 @@ The versions between 2026-09-30 15:42 and 2026-10-03 23:34 could not be recovere
 
 **2026-11-14, 13:00, all machines: disk leases near a disk's real speed.** A drive on Teppich that runs up to 220 MB/s could not be leased above 135. Two things stood in the way. A request built from a trial asks for the trial's peak plus 25 %, and a job that runs a disk flat out peaks at about the disk's own speed, so it always asked for more than the 85 % the dispatcher allows, and was refused. And a disk's capacity was learned: it started at 150 MB/s and rose to the highest 5-second rate ever seen, which on one disk meant 150 for days and then 317, more than the drive can do. Now a disk or network need above the limit is cut to the limit and granted, because given less of a disk a job only runs slower; cpu, memory and GPU stay refused, where a job could fail. A capped lease is held to the full capacity, so the headroom absorbs traffic nobody leased. And on Windows each disk's capacity comes from the outer-track read of its newest benchmark in the drive archive, matched by serial number; a disk without one keeps a learned value, and each disk now says where its capacity came from.
 
+**2026-11-14, Altiplano: test runs that overlap.** Every run of the sandbox suite began by deleting all the scratch folders it found, on the assumption that only a killed run leaves one behind. A 4-second run of one test class, started while a full run was going, therefore deleted the full run's copy of the code and its sandboxes, and the full run failed in 19 unrelated tests. Each run's folder now carries its host name, process id and create time in its name, made in a single step, and a starting run deletes only folders whose process has ended (a reused process id has a later create time), after killing anything still running from them.
+
 ## Lessons learned
 
 **Measuring resources**
@@ -96,6 +98,7 @@ The versions between 2026-09-30 15:42 and 2026-10-03 23:34 could not be recovere
 **Testing**
 
 - A test suite that shares files with production can change production: the keeper test restarted every dispatcher on six machines until the suite ran on a private copy.
+- Clean up only what is provably abandoned. A suite that deleted every earlier scratch folder at its start broke any run still in progress; recording the owner in the folder's name made the test exact.
 - Bound test writers by size, not by time. A five-second writer filled the RAM disk that Claude writes its own tool output to and stopped every session on the machine.
 - A sandbox inherits whatever the process running it carries. The lease id of the suite's own lease made a test fail whenever the suite ran the way the house rule requires.
 - A failure turned into "nothing" and then cached becomes permanent. Raise, cache only complete results, and retry on a bounded schedule.
