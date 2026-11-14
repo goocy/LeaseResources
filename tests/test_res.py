@@ -744,6 +744,47 @@ class T23Overtake(Base):
             w.res("Altiplano", "release", ident)
         w.stop()
 
+    def test_extend_tests_only_what_it_raises(self):
+        """`res extend --need` changes only the dimensions it names, and only a raise is tested against what is free:
+        on Mistral on 2026-11-13 a lease holding 180 of 186.3 MB/s on PhysicalDrive6, with 13.1 MB/s unleased there,
+        was refused more of PhysicalDrive2 because PhysicalDrive6 was tested again (L261113-141333440). Here gpu:9 is
+        held at 80 of 85 with 20 unleased, and gpu:8 is raised."""
+        w = World("extendraise")
+        cfg = json.loads((w.config / "defaults.json").read_text())
+        cfg["file_dimensions"] = {}
+        files = {}
+        for dim in ["gpu:9", "gpu:8"]:
+            files[dim] = w.root / (dim.replace(":", "") + ".json")
+            files[dim].write_text(json.dumps({"total": 0, "pids": {}}))
+            cfg["file_dimensions"][dim] = {"capacity": 100, "file": str(files[dim]), "label": "simulated " + dim}
+        (w.config / "defaults.json").write_text(json.dumps(cfg))
+        w.dispatcher("Altiplano")
+        a = w.res("Altiplano", "request", "--need", "gpu:9=80,gpu:8=10", "--for", "5m", "--desk", "Altiplano:DeskA")
+        self.assertIn("granted", a.stdout, a.stdout + a.stderr)
+        la = lease_id(a.stdout)
+        files["gpu:9"].write_text(json.dumps({"total": 20, "pids": {}}))   # someone else's 20 on gpu:9
+        time.sleep(4)                                     # past smoothing_seconds (3): the window holds only the 20
+
+        def extend(need):
+            out = w.res("Altiplano", "extend", la, "--need", need)
+            return out.stdout + out.stderr
+
+        other = extend("gpu:8=50")
+        measured("extend.raise_beside_a_full_dimension", other.strip())
+        self.assertIn("need now", other, "gpu:9, not named, must not be tested again")
+        self.assertEqual(w.lease("Altiplano", la)["need"].get("gpu:8"), 50.0)
+        self.assertEqual(w.lease("Altiplano", la)["need"].get("gpu:9"), 80.0)
+        more = extend("gpu:9=90")                         # 20 + 90 > 85: a raise is still tested
+        measured("extend.raise_refused", more.strip())
+        self.assertIn("refused", more)
+        self.assertIn("gpu:9: unleased 20", more)
+        self.assertEqual(w.lease("Altiplano", la)["need"].get("gpu:9"), 80.0)
+        less = extend("gpu:9=70")                         # a cut always fits, although 20 + 70 > 85
+        self.assertIn("need now", less)
+        self.assertEqual(w.lease("Altiplano", la)["need"].get("gpu:9"), 70.0)
+        w.res("Altiplano", "release", la)
+        w.stop()
+
     def test_queued_notice(self):
         """D-261113-2: a lease still queued queue_notice_minutes after its answer gets one notice naming what blocks it
         and how to give it back; the report carries waits_for."""
@@ -2017,6 +2058,66 @@ class T17Teppich(Base):
         measured("teppich.learned_raise", {disks[0]: meter.dimensions()[disks[0]]["capacity"]})
         self.assertEqual(raised, [disks[0]])
         self.assertEqual(meter.dimensions()[disks[0]]["capacity"], 322e6)
+
+    def test_rate_spans_each_process_own_reading(self):
+        """A process's rates divide by the time between its own two readings, not between two sample starts: reading
+        the open files of each process that moved bytes takes up to 0.4 s on Windows, so the last of 32 pool workers
+        was read seconds later in a sample than in the one before, and a 32-thread machine read 43.5 and 114.7 cores
+        for one lease (Mistral, L261113-141333440). Four fake processes, each one core busy, behind 0.3 s of open-files."""
+        import contextlib
+        import probes
+        t0 = time.monotonic()
+
+        class Times:
+            def __init__(self, user):
+                self.user, self.system = user, 0.0
+
+        class Fake:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def oneshot(self):
+                return contextlib.nullcontext()
+
+            def create_time(self):
+                return 1000.0 + self.pid
+
+            def cpu_times(self):
+                return Times(time.monotonic() - t0)       # one core, all the time
+
+            def memory_info(self):
+                return Rss()
+
+        class Rss:
+            rss = 0
+
+        def slow_paths(proc):
+            time.sleep(0.3)
+            return []                                    # none known: read again at the next sample
+
+        saved = probes.disk_bytes, probes.process_paths
+        probes.disk_bytes = lambda proc: int((time.monotonic() - t0) * 1e6)
+        probes.process_paths = slow_paths
+        try:
+            meter = probes.Meter({"disk_skip_mounts": [], "disk_paths_seconds": 1}, Path(tempfile.mkdtemp()),
+                                 first_sample_rates=False)
+            procs = [Fake(900001 + n) for n in range(4)]
+            meter.sample({"t": procs})                   # first readings, no rates yet, so no open files read: fast
+            time.sleep(0.3)
+            second = meter.sample({"t": procs})[1]["t"]["cpu"]   # each process now waits for the open files of those before it
+            time.sleep(0.3)
+            third = meter.sample({"t": procs})[1]["t"]["cpu"]
+            time.sleep(0.3)
+            # A process in two trees (a leased job's own `res run`) is read once and counted in the first: a second read
+            # milliseconds later would divide one 15.6 ms cpu_times step on Windows by almost nothing.
+            twice = meter.sample({"t": procs, "inner": procs[:1]})[1]
+        finally:
+            probes.disk_bytes, probes.process_paths = saved
+        measured("units.cpu_of_four_one_core_processes", {"second": round(second, 2), "third": round(third, 2)})
+        self.assertAlmostEqual(second, 4.0, delta=0.4)
+        self.assertAlmostEqual(third, 4.0, delta=0.4)
+        self.assertAlmostEqual(twice["t"]["cpu"], 4.0, delta=0.4)
+        self.assertEqual(twice["inner"]["cpu"], 0.0)
 
 
 class T18OutputCaps(Base):

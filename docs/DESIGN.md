@@ -31,6 +31,8 @@ This is the design in depth, adapted from the service's own README. The [README]
 
 **Startup bursts** are not rates: a process is metered from its second sample on, since a program's first fraction of a second once read as 1.45 cores for a sleeping job.
 
+**Each process's rates span its own two readings**, timed when it is read, not the two sample starts. Reading other processes' open files delays a process within a sample by up to 0.4 s each on Windows, so when a pool of 32 fresh workers was read quickly in one sample and slowly in the next, the late workers were given seconds of extra cpu over too short a span, and a 32-thread machine read 43.5 and 114.7 cores for one job (fixed 2026-11-13). A process in two lease trees (a leased job's own `res run`) is read once per sample and counted in the first.
+
 ## The trial
 
 `res trial -- <command>` starts the command and meters its whole process tree every `trial_sample_seconds` (0.25). A timer thread kills the tree at `trial_seconds` (10), independently of the sampling loop. On the Macs the kill goes to the command's own process group plus every process seen in the tree (including a `setsid` child and an orphaned new-session grandchild). On Windows the command is started suspended, put into a Job Object with kill-on-close, and only then resumed, so no child can start outside the job. Background processes the command leaves behind are killed too. The trial prints whether it finished, the output tail and the profile (peak and mean per dimension), saves the profile under an id, and exits 0 when the command finished inside the limit and 3 when it was cut off. It keeps at most `trial_output_max_bytes` (10 MB) of output.
@@ -47,7 +49,7 @@ where unleased use is the machine's use minus the measured use of running leases
 
 A queued lease's report entry carries `waits_for`, the dimension it waits for now, and the reason as of the last change of that dimension. A lease still queued `queue_notice_minutes` (30) after its answer gets one notice. The notice names what blocks it and lists the long commands of Claude sessions running on that machine without a lease. It also gives the `res release` line. On 2026-11-12 a lease that waited 15 hours at the head of the queue was most likely blocked by its own job, which had been started without the lease while the lease waited.
 
-A granted lease that is never started expires after `start_within_minutes` (60). `res extend` always grants more time and grants more resources only when they fit now; `--for` sets the new total duration counted from the job's start.
+A granted lease that is never started expires after `start_within_minutes` (60). `res extend` always grants more time and grants more resources only when they fit now; `--for` sets the new total duration counted from the job's start. `--need` changes only the dimensions it names, and only the dimensions it raises are tested, by the admission rule without the queue and with the lease's new amount in place of its old one. A cut is always accepted, and what the lease already holds is never tested again: until 2026-11-13 the whole changed need was, and a lease holding 180 of 186 MB/s on one disk, with 13 MB/s there that the meter did not put on the lease, was refused more of another disk.
 
 ## Running a job
 

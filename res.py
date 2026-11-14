@@ -1545,7 +1545,9 @@ def cmd_extend(args, config: dict) -> None:
     lease = read_json(path) if target == here else report_lease(target, args.id)
     if not lease and target == here:
         raise SystemExit("No lease " + args.id + " on " + target)
-    ask = {"asked": now_iso(), "from_machine": here}
+    # `asked` is also how the answer is found again, so it is exact to the microsecond: to the second, a second extend
+    # within the same second printed the first one's answer (the sandbox, 2026-11-13).
+    ask = {"asked": datetime.datetime.now().astimezone().isoformat(timespec="microseconds"), "from_machine": here}
     if args.duration:
         ask["duration"] = parse_duration(args.duration)
     margin = float(lease.get("margin", num(config, "margin", 0.25)))
@@ -2589,17 +2591,22 @@ class Dispatcher:
                 parts.append("duration now " + human_duration(lease["duration"]) + " in total, counted from the start")
             if ask.get("need"):
                 need, notes, refusal = self.normalise(ask["need"])
-                merged = dict(lease.get("need") or {})
-                merged.update(need)
-                # an extension is held to what is free now, not behind the queue (a queued lease's own grant still is)
-                ok, dim, text = (False, "", refusal) if refusal else self.fits(merged, {}, exclude=ident)
+                held = dict(lease.get("need") or {})
+                merged = dict(held, **need)
+                # An extension is held to what is free now, not behind the queue (a queued lease's own grant still is),
+                # and only on the dimensions it raises: what the lease already holds stays its own. Until 2026-11-13 the
+                # whole merged need was tested again, so a lease holding 180 of 186.3 MB/s on one disk, with 13 MB/s
+                # there that the meter did not put on it, was refused more of another disk (Mistral, L261113-141333440).
+                raised = {d: v for d, v in need.items() if v > float(held.get(d, 0.0))}
+                ok, dim, text = (False, "", refusal) if refusal else self.fits(raised, {}, exclude=ident)
                 if ok or lease.get("state") == "queued":
                     lease["need"] = merged
                     for d in need:
                         lease.get("notices", {}).pop("overrun:" + d, None)
                     parts.append("need now " + describe_need(merged))
                 else:
-                    parts.append("more resources refused for now (" + text + "); the lease keeps " + describe_need(lease.get("need", {})))
+                    parts.append("more resources refused for now (" + text + "; leased counts the other leases, this is"
+                                 + " the new total asked); the lease keeps " + describe_need(lease.get("need", {})))
             answer = ident + ": " + "; ".join(parts)
             lease["last_extend"] = {"asked": ask.get("asked"), "answer": answer, "at": now_iso()}
             self.save(lease)
@@ -3752,7 +3759,8 @@ def main() -> None:
     p.add_argument("--on")
     p.add_argument("--why")
     p.add_argument("--desk")
-    p.add_argument("--margin", type=float)
+    p.add_argument("--margin", type=float, help="the fraction added to a trial's peaks, replacing the default 0.25:"
+                   " 0.25 asks for 1.25 times the peaks, 1.0 for twice them, 0 for the peaks alone")
     p.add_argument("--extend", help="extend this lease instead (same as res extend)")
     p = sub.add_parser("extend", help="more time or resources for a lease")
     p.add_argument("id")

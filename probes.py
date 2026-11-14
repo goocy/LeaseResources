@@ -672,12 +672,17 @@ class Meter:
             disk = disk_bytes(proc)
         except (psutil.Error, OSError):
             return None
+        # The rates span this process's own two readings. Until 2026-11-13 they spanned two sample starts, and a process
+        # read later in a sample than in the one before (behind other processes' open files, 0.04 to 0.4 s each on
+        # Windows) was given the extra seconds of cpu and bytes over too short a span: 43.5 and 114.7 cores on Mistral's
+        # 32 threads, L261113-141333440, a job whose pools of 32 fresh workers were read fast once, then slowly.
+        read_at = time.monotonic()
         reading = Reading(proc.pid)
         reading.rss = rss
         key = (proc.pid, ctime)
         before = self.prev.get(key)
         if before is not None:
-            span = now - before[0]
+            span = read_at - before[0]
             if span > 0:
                 reading.cpu_rate = max(0.0, (cpu - before[1]) / span)
                 if disk is not None and before[2] is not None:
@@ -686,7 +691,7 @@ class Meter:
             span = max(0.05, time.time() - ctime)        # born since the last sample: its whole life so far
             reading.cpu_rate = cpu / span
             reading.disk_rate = (disk or 0) / span
-        self.prev[key] = (now, cpu, disk)
+        self.prev[key] = (read_at, cpu, disk)
         # Open files matter only for a process that moved bytes. They are read at once when none are known (a writer
         # that opened, filled and closed a 200 MB file within a second was missed by a plain 1-second cache, suite
         # T1 on Mistral, 2026-10-26) and otherwise at most every disk_paths_seconds; an idle process is never read.
@@ -717,6 +722,8 @@ class Meter:
         for name, procs in trees.items():
             readings = []
             for proc in procs:
+                if proc.pid in seen:                     # in an earlier tree too (a leased job's own `res run`): read once,
+                    continue                             # counted there; a second read milliseconds later is no rate
                 r = self._read(proc, now)
                 if r is not None:
                     readings.append(r)
