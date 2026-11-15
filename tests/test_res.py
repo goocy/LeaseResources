@@ -1256,17 +1256,17 @@ class T10Keeper(Base):
             first = json.loads(beat.read_text(encoding="utf-8"))["pid"]
             stack = w.data / "logs" / ("stack-altiplano-" + str(first) + ".txt")
             self.assertTrue(stack.exists(), "no stack file at " + str(stack))
-            time.sleep(5)                                   # dumps every 3 s, each emptied by the next healthy pass
-            self.assertNotIn("in send_mail", stack.read_text(encoding="utf-8"))
+            time.sleep(5)                                   # longer than the 3 s after which a pass is overdue; a slow
+            self.assertNotIn("in send_mail", stack.read_text(encoding="utf-8"))   # pass may dump (T14 tests none)
             lid = lease_id(w.res("Altiplano", "request", "--need", "cpu=0.5", "--for", "5m", "--desk", "Altiplano:Owner").stdout)
             w.res("Altiplano", "run", "--lease", lid, "--", PYTHON, str(w.allowed / "sleepy.py"), "1")   # no waiter: mailed
             w.wait(lambda: "WARN dispatcher pid " + str(first) + " wrote no heartbeat" in w.logtext("Altiplano"), 60,
                    "the keeper's kill", evidence=lambda: w.logtext("Altiplano")[-2000:])
             self.assertIn("its stack dumps: " + str(stack), w.logtext("Altiplano"))
-            self.assertFalse(pid_alive(first))
+            w.wait(lambda: not pid_alive(first), 10, "the hung dispatcher's end")    # the keeper logs, then kills
             text = stack.read_text(encoding="utf-8")
-            measured("keeper.stack_dumps", text.count("Timeout ("))
-            self.assertGreaterEqual(text.count("Timeout ("), 2, text)
+            measured("keeper.stack_dumps", text.count("main loop overdue"))
+            self.assertGreaterEqual(text.count("main loop overdue"), 2, text)
             self.assertIn("in send_mail", text)
             self.assertIn("in compliance_loop", text)       # the other thread, still running
         finally:
@@ -1327,6 +1327,32 @@ class T14Units(Base):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_stack_watch_dumps_only_when_overdue(self):
+        """The stack watch dumps nothing while the main loop passes, however long that lasts, and dumps every thread
+        once a pass is overdue, again every period while it stays overdue (faulthandler's own watchdog dumped every
+        period regardless, without the GIL, and crashed the Windows dispatchers every few hours, 2026-11-14 and 15)."""
+        w = World("stackwatch")
+        res = self.load(w)
+        res.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        watch = res.StackWatch("Altiplano", 0.5)
+        start = watch.last_dump
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 3:                   # six periods of healthy passes
+            watch.passed()
+            time.sleep(0.1)
+        self.assertEqual(watch.last_dump, start)
+        self.assertEqual(watch.path.read_bytes(), b"")
+        time.sleep(1.8)                                     # overdue from 0.5 s on: dumps near 0.5, 1.0 and 1.5 s
+        text = watch.path.read_text(encoding="utf-8")
+        measured("stackwatch.dumps", text.count("main loop overdue"))
+        self.assertGreaterEqual(text.count("main loop overdue"), 2, text)
+        self.assertIn("in test_stack_watch_dumps_only_when_overdue", text)
+        self.assertIn("in watch", text)                     # the watch thread itself
+        watch.passed()
+        self.assertEqual(watch.path.read_bytes(), b"")
+        watch.close()
+        self.assertFalse(watch.path.exists())
 
     def test_clock_correction_does_not_lose_a_runner(self):
         """psutil 7.1+ on macOS moves create times by however far the boot time has moved since it was imported. A

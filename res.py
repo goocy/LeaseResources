@@ -3606,12 +3606,65 @@ def stack_path(machine: str, pid: int) -> Path:
     return LOG_DIR / ("stack-" + machine.casefold() + "-" + str(pid) + ".txt")
 
 
-def restart_dispatcher(machine: str, stack, why: str) -> None:
+class StackWatch:
+    """Dumps every thread's stack into the stack file while the main loop is overdue, and only then (see cmd_dispatch).
+    Its thread is a plain Python thread started once, when the dispatcher starts, and never again: when psutil has left
+    the Windows loader lock held no new thread can start, while one started before runs on (tried on Stahlwerk,
+    2026-11-13). It dumps with faulthandler.dump_traceback while holding the GIL, so the other threads stand still
+    while their frames are read. faulthandler's own watchdog (dump_traceback_later, used from 2026-11-13 to 2026-11-15)
+    reads them without the GIL while they run, and every 150 s even on a healthy dispatcher: about one dump in a few
+    hundred met a frame being freed, and the Windows dispatchers died of access violations in python311.dll's
+    traceback code every few hours (Moosfels, Mistral, Teppich, 2026-11-14 and 15). The price of the GIL: a hang that
+    holds it (a C call that never releases it) shows no dump until it lets go."""
+
+    def __init__(self, machine: str, period: float):
+        self.machine = machine
+        self.path = stack_path(machine, os.getpid())
+        self.file = open(self.path, "ab", buffering=0)               # append: dumps land at the end after a truncate
+        self.period = period
+        self.lock = threading.Lock()
+        self.closed = False
+        self.last_pass = self.last_dump = time.monotonic()
+        threading.Thread(target=self.run, name="stackwatch", daemon=True).start()
+
+    def passed(self) -> None:
+        """A healthy pass of the main loop: the dumps of an earlier slow stretch are emptied."""
+        with self.lock:
+            self.last_pass = time.monotonic()
+            self.file.truncate(0)
+
+    def run(self) -> None:
+        try:
+            self.watch()
+        except BaseException as exc:                    # under pythonw nothing else would show that it ended
+            log(self.machine, "WARN the stack watch ended, so a hang leaves no stack: " + type(exc).__name__ + ": " + str(exc))
+            raise
+
+    def watch(self) -> None:
+        while True:
+            time.sleep(self.period / 10)
+            with self.lock:
+                if self.closed:
+                    return
+                now = time.monotonic()
+                if now - self.last_pass >= self.period and now - self.last_dump >= self.period:
+                    self.file.write(("main loop overdue: no pass for " + str(int(now - self.last_pass)) + " s, at "
+                                     + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode("utf-8"))
+                    faulthandler.dump_traceback(file=self.file, all_threads=True)
+                    self.last_dump = now
+
+    def close(self) -> None:
+        """A clean exit leaves no stack file behind."""
+        with self.lock:
+            self.closed = True
+            self.file.close()
+        self.path.unlink()
+
+
+def restart_dispatcher(machine: str, watch: StackWatch, why: str) -> None:
     """Exits so that the keeper starts a new dispatcher at once. A clean exit leaves no stack file behind."""
     log(machine, why)
-    faulthandler.cancel_dump_traceback_later()
-    stack.close()
-    stack_path(machine, os.getpid()).unlink()
+    watch.close()
     sys.exit(EXIT_CODE_CHANGED)
 
 
@@ -3620,14 +3673,12 @@ def cmd_dispatch(args, config: dict) -> None:
     if not take_lock(machine):
         sys.exit(EXIT_ALREADY_RUNNING)
     # A hang leaves its stack (Stahlwerk 2026-11-11, Mistral 2026-11-12: main loop hung, nothing showed where). The
-    # faulthandler watchdog thread is started here, once, and dumps every thread's stack into the stack file every
-    # quarter of dispatcher_stall_seconds; every pass of the main loop empties the file, so after a hang it holds only
-    # the dumps written since the last healthy pass, and the keeper names it when it kills this process. It is never
-    # re-armed: each arming starts a new thread (CPython's faulthandler.c), and when psutil has left the Windows loader
-    # lock held no new thread can start, while one started before still dumps (tried on Stahlwerk with the lock held).
+    # StackWatch thread is started here, once; once no pass of the main loop has come for a quarter of
+    # dispatcher_stall_seconds it dumps every thread's stack into the stack file, and again every quarter while that
+    # lasts. Every pass empties the file, so after a hang it holds only the dumps since the last healthy pass, and the
+    # keeper names it when it kills this process.
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    stack = open(stack_path(machine, os.getpid()), "ab", buffering=0)      # append: dumps land at the end after a truncate
-    faulthandler.dump_traceback_later(float(config["dispatcher_stall_seconds"]) / 4, repeat=True, file=stack)
+    watch = StackWatch(machine, float(config["dispatcher_stall_seconds"]) / 4)
     seed_local_state(machine)
     d = Dispatcher(config)
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", code " + d.version + ", dimensions "
@@ -3650,7 +3701,7 @@ def cmd_dispatch(args, config: dict) -> None:
             except (OSError, ValueError) as exc:
                 log(machine, "WARN cannot read config, keeping the last one: " + str(exc))
             beat()
-            stack.truncate(0)
+            watch.passed()
             d.ingest_synced()
             d.handle_asks()
             d.handle_new()
@@ -3675,9 +3726,9 @@ def cmd_dispatch(args, config: dict) -> None:
         except Exception as exc:                              # the dispatcher itself must keep running
             log(machine, "WARN dispatcher: " + type(exc).__name__ + ": " + str(exc))
         if code_version() != d.version and code_compiles():
-            restart_dispatcher(machine, stack, "code changed; dispatcher restarting onto the new code")
+            restart_dispatcher(machine, watch, "code changed; dispatcher restarting onto the new code")
         if REPORTS_VIA != via:                                # the restarted one publishes its report and beat at once
-            restart_dispatcher(machine, stack, "reports_via is now " + REPORTS_VIA + "; dispatcher restarting to publish there")
+            restart_dispatcher(machine, watch, "reports_via is now " + REPORTS_VIA + "; dispatcher restarting to publish there")
         time.sleep(num(d.config, "tick_seconds", 1))
 
 
