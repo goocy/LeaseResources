@@ -155,7 +155,9 @@ SUFFIXES = [".order.json", ".run.json", ".extend.json", ".release.json"]
 # ---------------------------------------------------------------- config, machine, time
 
 def load_config() -> dict:
-    """config/defaults.json overlaid with config/<machine>.json (lower case); each machine edits only its own file."""
+    """config/defaults.json overlaid with config/<machine>.json (lower case); each machine edits only its own file. An
+    object in the machine's file is merged key by key into the default object (so `"headroom_by_dimension": {"vram":
+    0.95}` keeps the default disk, net, gpu and cpu entries); any other value replaces the default."""
     with open(CONFIG_DIR / "defaults.json", encoding="utf-8") as fh:
         config = json.load(fh)
     global THIS_MACHINE
@@ -163,7 +165,11 @@ def load_config() -> dict:
     own = CONFIG_DIR / (THIS_MACHINE.casefold() + ".json")
     if own.is_file():
         with open(own, encoding="utf-8") as fh:
-            config.update(json.load(fh))
+            for key, value in json.load(fh).items():
+                if isinstance(value, dict) and isinstance(config.get(key), dict):
+                    config[key] = {**config[key], **value}
+                else:
+                    config[key] = value
     global REPORTS_VIA
     assert config["reports_via"] in ("files", "postman"), "reports_via must be files or postman: " + repr(config["reports_via"])
     REPORTS_VIA = config["reports_via"]
@@ -1064,7 +1070,9 @@ def cmd_now(args, config: dict) -> None:
                           "dispatcher_fresh": fresh}, indent=1))
         return
     print(machine + ": dispatcher " + ("up (pid " + str(report.get("pid")) + ")" if fresh else "NOT RUNNING")
-          + ", headroom " + str(num(config, "headroom", 0.85)) + ", " + str(len([l for l in leases if l.get("state") in ACTIVE]))
+          + ", headroom " + str(num(config, "headroom", 0.85))
+          + "".join(" " + k + " " + str(v) for k, v in config.get("headroom_by_dimension", {}).items())
+          + ", " + str(len([l for l in leases if l.get("state") in ACTIVE]))
           + " active and " + str(len([l for l in leases if l.get("state") == "queued"])) + " queued leases")
     rows = [["dimension", "capacity", "use now", "leased (planned)", "unleased", "free", "label"]]
     busy = meter.disk_busy()
@@ -2433,8 +2441,9 @@ class Dispatcher:
     def cap_self_limiting(self, need: dict) -> tuple:
         """(need, capped dimensions, notes): a disk or network need above this machine's limit is cut to the limit
         instead of being refused (D-261114-1). A job that saturates a disk peaks at about the disk's own speed, so a
-        trial-based need (peak x 1.25) always exceeded capacity x 0.85 and every disk-bound request was refused; such a
-        job only runs slower when it gets less, while cpu, ram and GPU memory stay refused, where a job can fail."""
+        trial-based need (peak x 1.25) always exceeded capacity x headroom and every disk-bound request was refused; such
+        a job only runs slower when it gets less, while cpu, ram and GPU memory stay refused, where a job can fail. Since
+        2026-11-18 the default headroom of disk and net is 1.0, so the limit is the capacity itself."""
         limits = self.limits()
         dims = self.meter.dimensions()
         result, capped, notes = dict(need), [], []

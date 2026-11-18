@@ -432,7 +432,9 @@ class World:
         config.update({"mail_script": str(self.root / "mail.py"), "allowed_roots": [str(self.allowed)], "notify": False,
                        "tick_seconds": 0.5, "sample_seconds": 1, "smoothing_seconds": 3, "overrun_samples": 2,
                        "unleased_check_seconds": 2, "unleased_after_seconds": 3, "answer_wait_seconds": 8,
-                       "reports_via": "files"})        # "postman" would publish into this machine's real spool
+                       "reports_via": "files",         # "postman" would publish into this machine's real spool
+                       "headroom_by_dimension": {}})   # the admission tests count on 0.85 everywhere; the defaults' own
+                                                       # per-dimension values are tested in test_default_headroom
         config.update(extra or {})
         (self.config / "defaults.json").write_text(json.dumps(config, indent=1), encoding="utf-8")
         self.procs = []
@@ -835,6 +837,40 @@ class T23Overtake(Base):
         d_out = ask("disk:sim=200", "DeskD")                 # capped at 85: 10 + 85 fits under the capacity of 100
         self.assertIn("granted", d_out, "a capped need must not wait for unleased traffic to fall to zero")
         w.res("Altiplano", "release", lease_id(d_out))
+        w.stop()
+
+    def test_default_headroom(self):
+        """2026-11-18: the shipped headroom_by_dimension lets a lease take a whole disk or GPU (1.0), and a machine's
+        own headroom_by_dimension is merged into it key by key instead of replacing it. disk:sim and gpu:9, capacity 100."""
+        with open(SERVICE / "config" / "defaults.json", encoding="utf-8") as fh:
+            shipped = json.load(fh)["headroom_by_dimension"]
+        self.assertEqual(shipped["disk"], 1.0)
+        w = World("headroomdefault", {"headroom_by_dimension": shipped})
+        cfg = json.loads((w.config / "defaults.json").read_text())
+        disk, gpu = w.root / "disksim.json", w.root / "gpu9.json"
+        for path in (disk, gpu):
+            path.write_text(json.dumps({"total": 0, "pids": {}}))
+        cfg["file_dimensions"] = {"disk:sim": {"capacity": 100, "file": str(disk), "label": "simulated disk"},
+                                  "gpu:9": {"capacity": 100, "file": str(gpu), "label": "simulated gpu:9"}}
+        (w.config / "defaults.json").write_text(json.dumps(cfg))
+        (w.config / "altiplano.json").write_text(json.dumps({"headroom_by_dimension": {"vram": 0.95}}))
+        w.dispatcher("Altiplano")
+
+        def ask(need, desk):
+            out = w.res("Altiplano", "request", "--need", need, "--for", "5m", "--desk", "Altiplano:" + desk)
+            return out.stdout + out.stderr
+
+        now = w.res("Altiplano", "now").stdout
+        self.assertIn("disk 1.0", now, "the machine's vram entry must not drop the default disk entry")
+        self.assertIn("vram 0.95", now)
+        whole = ask("disk:sim=100,gpu:9=100", "DeskA")
+        self.assertIn("granted", whole, "a whole disk and a whole GPU can be leased")
+        self.assertNotIn("capped", whole)
+        w.res("Altiplano", "release", lease_id(whole))
+        over = ask("disk:sim=150", "DeskB")
+        self.assertIn("disk:sim capped at 100", over)
+        w.res("Altiplano", "release", lease_id(over))
+        self.assertIn("refused", ask("gpu:9=101", "DeskC"), "a GPU need above its capacity is still refused")
         w.stop()
 
     def test_queued_notice(self):

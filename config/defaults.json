@@ -1,10 +1,10 @@
 {
-  "_about": "LeaseResources settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case), which only that machine edits. Units: cpu in cores, ram and vram in bytes, disk and net in bytes per second, gpu in percent. See README.md for each key.",
+  "_about": "LeaseResources settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case), which only that machine edits; a key holding an object there is merged key by key into the default object, any other key replaces the default. Units: cpu in cores, ram and vram in bytes, disk and net in bytes per second, gpu in percent. See README.md for each key.",
   "machines": ["Mistral", "Moosfels", "Stahlwerk", "Teppich", "Altiplano", "Sandbank", "Pulvermaar", "Pektolith"],
   "hostnames": {},
 
   "headroom": 0.85,
-  "headroom_by_dimension": {},
+  "headroom_by_dimension": {"disk": 1.0, "net": 1.0, "gpu": 1.0, "cpu": 0.95},
   "margin": 0.25,
   "request_floor": {"cpu": 0.25, "ram": 134217728, "disk": 5000000, "net": 1000000, "gpu": 5, "vram": 268435456},
   "overrun_margin": 0.1,

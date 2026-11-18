@@ -40,7 +40,7 @@ He also chose, that same day, to make the mandate guidance only. Nothing caps or
 
 1. **Trial.** `res trial -- <command>` runs the command under the meter and kills its whole process tree at 10 seconds (on Windows a process that detaches within a quarter of a second can escape; see [docs/DESIGN.md](docs/DESIGN.md)). It prints whether the command finished, the tail of its output and a profile: peak and mean on every dimension. A command that finished needed no lease (exit code 0). One that was cut off (exit code 3) needs a lease, and its profile is saved under an id.
 2. **Request.** `res request --profile <trial id> --for 2h --why "..."` asks this machine's dispatcher for the trial's peaks plus a margin (25 %, never less than a small floor per kind), for two hours. The answer comes within a second or two.
-3. **Admission.** The dispatcher grants the lease when, on every dimension, the unleased use measured now, plus the needs of the leases already granted, plus the request, stays under the capacity times a headroom (0.85), with every request still queued ahead of it counted as if granted. Otherwise the request queues. So a small request can overtake a queue head that waits for a busy disk, but it never takes anything the head needs. A lease still queued after 30 minutes gets one notice saying what blocks it. A cpu, memory or GPU request larger than the machine could ever allow, or one for a kind of resource the machine lacks, is refused with the dimension named. A disk or network request above the limit is cut to the limit and granted, because a job that runs a disk flat out asks for more than the disk has, and given less it only runs slower.
+3. **Admission.** The dispatcher grants the lease when, on every dimension, the unleased use measured now, plus the needs of the leases already granted, plus the request, stays under the capacity times a headroom (1.0 for disks, network links and GPU compute, which only slow a job down when shared; 0.95 for cpu; 0.85 for ram and GPU memory, where a job can fail), with every request still queued ahead of it counted as if granted. Otherwise the request queues. So a small request can overtake a queue head that waits for a busy disk, but it never takes anything the head needs. A lease still queued after 30 minutes gets one notice saying what blocks it. A cpu, memory or GPU request larger than the machine could ever allow, or one for a kind of resource the machine lacks, is refused with the dimension named. A disk or network request above the limit is cut to the limit and granted, because a job that runs a disk flat out asks for more than the disk has, and given less it only runs slower.
 4. **Run.** `res run --lease <id> --wait -- python job.py` starts the job through a short-lived intermediate, so the job has no live ancestor among the session's processes and survives the turn being interrupted, the session closing and the app restarting. Its output goes to a log of its own.
 5. **Watching.** Every 5 seconds the dispatcher meters each running lease's process tree. A job that uses more than it declared, runs past its duration or writes nothing to its log for 30 minutes gets one notice each. The dispatcher never kills a leased job: the owner renegotiates with `res extend` or stops the job with `res release --kill`.
 6. **Notices.** `res run --wait` registers itself as the lease's waiter, streams the job's log and prints the dispatcher's notices. It exits with the job's exit code when the job ends, or with 75 when the job is still running but has overrun, run past its duration or stalled. A session that started it as a background command is woken by that exit with the notice in the output, so it spends no turns polling. With no waiter alive (a job started without `--wait`, or on another machine), each notice goes by [ClaudeMail](https://github.com/goocy/ClaudeMail) to the session that requested the lease.
@@ -79,19 +79,19 @@ and `res now` on a busy Windows machine like this:
 
 ```
 > python res.py now
-Stahlwerk: dispatcher up (pid 20248), headroom 0.85, 1 active and 1 queued leases
+Stahlwerk: dispatcher up (pid 20248), headroom 0.85 disk 1.0 net 1.0 gpu 1.0 cpu 0.95, 1 active and 1 queued leases
 dimension            capacity     use now     leased (planned)  unleased    free        label
-cpu                  12.00 cores  8.54 cores  1.20 cores        7.78 cores  1.22 cores  12 logical cores
+cpu                  12.00 cores  8.54 cores  1.20 cores        7.78 cores  2.42 cores  12 logical cores
 ram                  68.6 GB      41.3 GB     3.0 GB            41.2 GB     14.1 GB     physical memory
-disk:PhysicalDrive0  165.9 MB/s   0 B/s       0 B/s             0 B/s       141.0 MB/s  D:
-disk:PhysicalDrive1  474.3 MB/s   10.7 MB/s   150.0 MB/s        10.5 MB/s   242.6 MB/s  E:
-disk:PhysicalDrive2  1.3 GB/s     1.2 MB/s    0 B/s             1.2 MB/s    1.1 GB/s    C:
-gpu:0                100 %        17 %        0 %               17 %        68 %        NVIDIA GeForce RTX 2060 SUPER
+disk:PhysicalDrive0  165.9 MB/s   0 B/s       0 B/s             0 B/s       165.9 MB/s  D:
+disk:PhysicalDrive1  474.3 MB/s   10.7 MB/s   150.0 MB/s        10.5 MB/s   313.8 MB/s  E:
+disk:PhysicalDrive2  1.3 GB/s     1.2 MB/s    0 B/s             1.2 MB/s    1.3 GB/s    C:
+gpu:0                100 %        17 %        0 %               17 %        83 %        NVIDIA GeForce RTX 2060 SUPER
 vram:0               8.6 GB       719.3 MB    0 B               719.3 MB    6.6 GB      NVIDIA GeForce RTX 2060 SUPER memory
-net:Ethernet         125.0 MB/s   17.3 MB/s   0 B/s             17.3 MB/s   89.0 MB/s   1000 Mbit/s link
+net:Ethernet         125.0 MB/s   17.3 MB/s   0 B/s             17.3 MB/s   107.7 MB/s  1000 Mbit/s link
 ```
 
-Here a running lease has planned 1.2 cores, 3 GB and 150 MB/s on E:, and only 1.22 cores are free under the headroom, so a request for two cores would queue until something ends.
+Here a running lease has planned 1.2 cores, 3 GB and 150 MB/s on E:, and only 2.42 cores are free under the headroom, so a request for three cores would queue until something ends.
 
 ## Commands
 
@@ -166,7 +166,7 @@ All settings are in `config/defaults.json`, with units in its `_about` (cpu in c
 | Key | Meaning (default) |
 |---|---|
 | `machines`, `hostnames` | The machines of the house, and computer names that differ from them. |
-| `headroom`, `headroom_by_dimension` | The share of each capacity that leases plus unleased use may fill (0.85), overridable per dimension. |
+| `headroom`, `headroom_by_dimension` | The share of each capacity that leases plus unleased use may fill: 0.85, with `headroom_by_dimension` setting disk, net and gpu to 1.0 and cpu to 0.95. A machine's own `headroom_by_dimension` is merged into the default one key by key. |
 | `margin`, `request_floor` | What a request adds to a trial's peaks (25 %), and the least it asks per kind. |
 | `overrun_margin`, `overrun_floor`, `overrun_samples` | When a running lease counts as using more than it declared: by more than 10 % and the floor, for 3 samples in a row. |
 | `trial_seconds` | The trial's hard limit (10). |
