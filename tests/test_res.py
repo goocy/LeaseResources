@@ -910,6 +910,46 @@ class T23Overtake(Base):
         w.stop()
 
 
+class T24ChainedRuns(Base):
+    """A queue of short run orders on one dimension moves on within about a tick of each job's end, not at the next
+    sample: starts and ends are watched every tick, while metering stays on sample_seconds (5 here, as in production).
+    Before 2026-11-20 a chain of 1-second moves on Mistral idled up to 5 s between jobs."""
+
+    def test_next_granted_within_a_tick(self):
+        w = World("chain", {"sample_seconds": 5, "tick_seconds": 0.5})
+        gpu = w.root / "gpu.json"
+        gpu.write_text(json.dumps({"total": 0, "pids": {}}), encoding="utf-8")
+        cfg = json.loads((w.config / "defaults.json").read_text())
+        cfg["file_dimensions"] = {"gpu:9": {"capacity": 100, "file": str(gpu), "label": "simulated GPU"}}
+        (w.config / "defaults.json").write_text(json.dumps(cfg))
+        w.dispatcher("Altiplano")
+        ids = []
+        for n in range(4):
+            r = w.res("Altiplano", "request", "--need", "gpu:9=60", "--for", "2m", "--desk", "Altiplano:Chain")
+            self.assertIn("queued" if n else "granted", r.stdout, r.stdout + r.stderr)
+            ids.append(lease_id(r.stdout))
+        for ident in ids[1:]:
+            order = w.res("Altiplano", "run", "--lease", ident, "--", PYTHON, str(w.allowed / "sleepy.py"), "1")
+            self.assertIn("Run order written", order.stdout, order.stdout + order.stderr)
+        first = w.res("Altiplano", "run", "--lease", ids[0], "--", PYTHON, str(w.allowed / "sleepy.py"), "1")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        w.wait(lambda: w.lease("Altiplano", ids[-1]).get("state") == "finished", 60, "the last of the chain finished",
+               evidence=lambda: w.logtext("Altiplano")[-3000:])
+        gaps = []
+        for before, after in zip(ids, ids[1:]):
+            ended = res_time(w.lease("Altiplano", before)["ended"])
+            granted = res_time(w.lease("Altiplano", after)["granted"])
+            gaps.append(granted - ended)
+        measured("chain.end_to_next_grant_seconds", gaps)
+        self.assertLessEqual(max(gaps), 2.0, "grant gaps " + str(gaps) + " (the stamps have whole seconds)")
+        w.stop()
+
+
+def res_time(stamp: str) -> float:
+    import datetime
+    return datetime.datetime.fromisoformat(stamp).timestamp()
+
+
 class T4Overrun(Base):
     """R4: a lease that exceeds its declared RAM produces mail to its owner and is not killed; completion mail carries
     the log tail. Also stall and past-duration mail."""

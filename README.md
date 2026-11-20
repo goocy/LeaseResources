@@ -170,7 +170,7 @@ All settings are in `config/defaults.json`, with units in its `_about` (cpu in c
 | `margin`, `request_floor` | What a request adds to a trial's peaks (25 %), and the least it asks per kind. |
 | `overrun_margin`, `overrun_floor`, `overrun_samples` | When a running lease counts as using more than it declared: by more than 10 % and the floor, for 3 samples in a row. |
 | `trial_seconds` | The trial's hard limit (10). |
-| `sample_seconds`, `smoothing_seconds` | How often running leases are metered (5) and over how long unleased use is averaged (30). |
+| `sample_seconds`, `smoothing_seconds` | How often running leases are metered (5) and over how long unleased use is averaged (30). Starts and ends of runs are noticed, and the queue served, every `tick_seconds` (1). |
 | `stall_minutes`, `start_within_minutes` | No log growth for this long is a stall (30); a granted lease never started expires after this (60). |
 | `dispatcher_stall_seconds` | How long the keeper waits for a heartbeat before it restarts the dispatcher (600); once no pass of the dispatcher's main loop has come for a quarter of it (150 s), the dispatcher writes stack dumps, again every quarter while that lasts. |
 | `allowed_programs`, `allowed_roots`, `check_local_runs` | The program rule for jobs the dispatcher starts (see Safety). |

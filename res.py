@@ -2772,7 +2772,12 @@ class Dispatcher:
                 self.handle_request(lease)
 
     # -- watching
-    def watch(self) -> None:
+    def watch(self, metered: bool) -> None:
+        """Every tick: starts, ends, lost runners, expiries and failed starts, so the queue moves on within a second of a
+        job's end. Only right after a sample (`metered`): peaks, overruns, the duration and stall notices, which go by
+        what that sample measured. Until 2026-11-20 all of it ran once per sample (5 s), and a chain of 1-second moves
+        to K: on Mistral idled 5 s between jobs; the user, 2026-11-20, on that cadence: "I think we can dial it down to
+        one second." """
         overrun_margin = num(self.config, "overrun_margin", 0.1)
         floors = self.config.get("overrun_floor", {})
         need_samples = int(num(self.config, "overrun_samples", 3))
@@ -2811,7 +2816,7 @@ class Dispatcher:
             if proc is None:
                 self.finish(lease, run, lost=True)
                 continue
-            if state != "running":
+            if state != "running" or not metered:
                 continue
             notices = lease.setdefault("notices", {})
             changed = False
@@ -3743,12 +3748,14 @@ def cmd_dispatch(args, config: dict) -> None:
             except Exception as exc:                          # a damaged notice file must not hold up metering and the queue
                 log(machine, "WARN notices: " + type(exc).__name__ + ": " + str(exc))
             now = time.monotonic()
-            if now - last_sample >= num(d.config, "sample_seconds", 5):
+            metered = now - last_sample >= num(d.config, "sample_seconds", 5)
+            if metered:
                 d.sample()
-                d.watch()
-                d.serve_queue()
-                d.report()
                 last_sample = now
+            d.watch(metered)
+            d.serve_queue()
+            if metered:
+                d.report()
             if now - last_beat >= 3600:
                 log(machine, "heartbeat: " + str(len([l for l in d.leases() if l.get("state") in ACTIVE])) + " active leases")
                 last_beat = now
