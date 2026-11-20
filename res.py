@@ -1059,6 +1059,24 @@ def dispatcher_state(machine: str, config: dict) -> tuple:
     return fresh, report
 
 
+def measured_use(dim: str, system: dict, per: dict, running_need: dict, system_only: set) -> float:
+    """The use on `dim` that counts as the running leases' own; the rest of the machine's use is unleased. A system-only
+    dimension (net) is credited to the leases that named it, up to their needs. A disk takes the larger of what the
+    leases' processes were seen moving and that same credit: a writer's bytes count in its process when it writes into
+    the page cache, and on the disk when the cache drains, later. A move of 3 GB from the RAM disk to K: wrote all of it
+    into the cache in under a second and then waited in fsync for 15 s while K: wrote 210 MB/s, with the process's
+    counters standing still, so none of its 170 move leases on Mistral on 2026-11-20 recorded any disk use, and the
+    smoothing window held their bytes as unleased traffic for 20 s after each ended (reported by the moves' owner). The
+    credit cannot let admission overbook: the full needs of those leases are counted as leased anyway."""
+    named = min(system.get(dim, 0.0), running_need.get(dim, 0.0))
+    if dim in system_only:
+        return named
+    seen = sum(t.get(dim, 0.0) for t in per.values())
+    if kind_of(dim) == "disk":
+        return max(seen, named)
+    return seen
+
+
 def cmd_now(args, config: dict) -> None:
     machine = this_machine(config)
     meter = probes.Meter(config, LOCAL_DIR)
@@ -1093,11 +1111,7 @@ def cmd_now(args, config: dict) -> None:
         kind = kind_of(dim)
         cap = dims[dim]["capacity"]
         use = system.get(dim, 0.0)
-        if dim in system_only:
-            measured = min(use, running_need.get(dim, 0.0))
-        else:
-            measured = sum(t.get(dim, 0.0) for t in per.values())
-        unleased = max(0.0, use - measured)
+        unleased = max(0.0, use - measured_use(dim, system, per, running_need, system_only))
         free = cap * headroom(config, dim) - unleased - planned.get(dim, 0.0)
         label = dims[dim].get("label", "")
         if dim in busy and sys.platform != "win32":     # Windows' per-disk read/write times stay 0 (Stahlwerk): not shown
@@ -2379,11 +2393,7 @@ class Dispatcher:
                 running_need[d] += float(v)
         unleased = {}
         for dim in self.meter.dimensions():
-            if dim in system_only:
-                measured = min(system.get(dim, 0.0), running_need.get(dim, 0.0))
-            else:
-                measured = sum(t.get(dim, 0.0) for t in per.values())
-            unleased[dim] = max(0.0, system.get(dim, 0.0) - measured)
+            unleased[dim] = max(0.0, system.get(dim, 0.0) - measured_use(dim, system, per, running_need, system_only))
         now = time.monotonic()
         self.window.append((now, unleased))
         horizon = num(self.config, "smoothing_seconds", 30)

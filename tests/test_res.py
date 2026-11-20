@@ -1390,6 +1390,24 @@ class T14Units(Base):
         watch.close()
         self.assertFalse(watch.path.exists())
 
+    def test_disk_drained_from_cache_counts_as_leased(self):
+        """A lease's disk is credited with the disk's traffic up to the lease's need, even when its processes moved no
+        bytes in that sample: a writer fills the page cache at once and the disk drains it later, while the writer waits
+        in fsync (every move to K: on Mistral counted as unleased, 2026-11-20). Beyond the need, and on cpu, only what the
+        processes were seen moving counts; net stays credited by need alone."""
+        res = self.load(World("units-measured"))
+        system = {"disk:PhysicalDrive4": 210e6, "disk:PhysicalDrive0": 50e6, "cpu": 3.0, "net:eth0": 90e6}
+        idle = {"L1": {"disk:PhysicalDrive4": 0.0, "disk:PhysicalDrive0": 0.0, "cpu": 0.1}}
+        need = {"disk:PhysicalDrive4": 250e6, "cpu": 2.0, "net:eth0": 40e6}
+        only = {"net:eth0"}
+        self.assertEqual(res.measured_use("disk:PhysicalDrive4", system, idle, need, only), 210e6)
+        self.assertEqual(res.measured_use("disk:PhysicalDrive4", system, idle, {"disk:PhysicalDrive4": 170e6}, only), 170e6)
+        self.assertEqual(res.measured_use("disk:PhysicalDrive0", system, idle, need, only), 0.0)
+        self.assertEqual(res.measured_use("cpu", system, idle, need, only), 0.1)
+        self.assertEqual(res.measured_use("net:eth0", system, idle, need, only), 40e6)
+        busy = {"L1": {"disk:PhysicalDrive0": 30e6}}
+        self.assertEqual(res.measured_use("disk:PhysicalDrive0", system, busy, {}, only), 30e6)
+
     def test_ids_unique_in_one_millisecond(self):
         """Ids made at once with the clock standing still are all different, for leases and trials, and a claim older
         than a day is pruned (four requests in one millisecond got three ids on Mistral, 2026-11-19)."""
