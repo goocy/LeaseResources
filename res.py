@@ -483,19 +483,32 @@ def log(machine: str, message: str) -> None:
 def new_id(prefix: str, machine: str, folder: Path) -> str:
     """<prefix><yymmdd-HHMMSS><mmm>-<Machine>: milliseconds included, because a request sent to another machine leaves
     the inbox once taken, so the folder alone cannot tell a new id from one used a moment ago (two requests in one
-    second got one id, 2026-09-28). A local record of ids sent to other machines covers the rest."""
+    second got one id, 2026-09-28). Each id is claimed by creating a folder of its name under the local state, which
+    only one process can do: four requests in one millisecond got three ids, two holders sharing one (Mistral
+    2026-11-19), because checking the lease folder and a shared list of sent ids left a gap between the check and the
+    write. Claims are kept a day, so a clock set back (summer time ending) cannot hand out an id again."""
     now = datetime.datetime.now()
     base = prefix + now.strftime("%y%m%d-%H%M%S") + "%03d" % (now.microsecond // 1000) + "-" + machine
-    sent = LOCAL_DIR / "sent_ids.json"
-    used = read_json(sent)
+    claims = LOCAL_DIR / "ids"
+    claims.mkdir(parents=True, exist_ok=True)
     ident, n = base, 1
-    while (folder / (ident + ".json")).exists() or ident in used:
+    while True:
+        if not (folder / (ident + ".json")).exists():
+            try:
+                (claims / ident).mkdir()
+                break
+            except FileExistsError:
+                pass
         n += 1
         ident = base + "-" + str(n)
-    if prefix == "L":
-        used = {k: v for k, v in used.items() if age_of(v) < 86400}
-        used[ident] = now_iso()
-        write_json(sent, used)
+    with os.scandir(claims) as entries:
+        names = [e.path for e in entries]
+    for path in names:
+        try:
+            if time.time() - os.stat(path).st_mtime > 86400:
+                os.rmdir(path)
+        except FileNotFoundError:                  # another process pruned it in the same moment
+            pass
     return ident
 
 

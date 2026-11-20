@@ -1390,6 +1390,46 @@ class T14Units(Base):
         watch.close()
         self.assertFalse(watch.path.exists())
 
+    def test_ids_unique_in_one_millisecond(self):
+        """Ids made at once with the clock standing still are all different, for leases and trials, and a claim older
+        than a day is pruned (four requests in one millisecond got three ids on Mistral, 2026-11-19)."""
+        import datetime
+        import threading
+        w = World("ids")
+        res = self.load(w)
+        frozen = datetime.datetime(2026, 11, 19, 17, 30, 43, 401000)
+
+        class Frozen(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen
+
+        res.datetime = type("clock", (), {"datetime": Frozen})
+        folder = w.root / "lease-folder"
+        folder.mkdir()
+        (folder / "L261119-173043401-Mistral.json").write_text("{}", encoding="utf-8")   # an existing lease is skipped
+        stale = res.LOCAL_DIR / "ids" / "L200101-000000000-Mistral"
+        stale.mkdir(parents=True)
+        os.utime(stale, (time.time() - 2 * 86400, time.time() - 2 * 86400))
+        got = []
+        start = threading.Barrier(8)
+
+        def make(prefix):
+            start.wait()
+            for _ in range(25):
+                got.append(res.new_id(prefix, "Mistral", folder))
+
+        threads = [threading.Thread(target=make, args=("LT"[i % 2],)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(got), 200)
+        self.assertEqual(len(set(got)), 200)
+        self.assertNotIn("L261119-173043401-Mistral", got)
+        self.assertIn("T261119-173043401-Mistral", got)
+        self.assertFalse(stale.exists())
+
     def test_clock_correction_does_not_lose_a_runner(self):
         """psutil 7.1+ on macOS moves create times by however far the boot time has moved since it was imported. A
         dispatcher that has run for days must still recognise a runner that recorded its own create time a moment ago
