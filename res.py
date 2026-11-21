@@ -3643,6 +3643,61 @@ def stack_path(machine: str, pid: int) -> Path:
     return LOG_DIR / ("stack-" + machine.casefold() + "-" + str(pid) + ".txt")
 
 
+def write_memory_dump(machine: str, pid: int) -> str:
+    """Windows: writes a full memory dump of the hung dispatcher next to its stack dumps, before the keeper kills it, and
+    returns a phrase for the keeper's log line. The stack dumps show only Python frames; what blocks a thread start
+    (Teppich 2026-11-16, -17 and -21: a new thread that never ran, each time in subprocess.run's reader thread) is native
+    code, and WinDbg on this dump (`!cs ntdll!LdrpLoaderLock`, `~*k`) names the owner of the loader lock, or shows that
+    the owner no longer exists, as a thread killed by TerminateThread would. It is read from outside with
+    ReadProcessMemory, so the held lock does not stop it. Pruned with the stack files after keep_days (the "stack-" prefix)."""
+    ctypes, k32 = _win_kernel()
+    from ctypes import wintypes
+    import msvcrt
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    dbghelp = ctypes.WinDLL("dbghelp", use_last_error=True)
+    dbghelp.MiniDumpWriteDump.restype = wintypes.BOOL
+    dbghelp.MiniDumpWriteDump.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    access = 0x0400 | 0x0010 | 0x0040        # PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_DUP_HANDLE
+    # MiniDumpWithFullMemory, WithHandleData, WithUnloadedModules, WithFullMemoryInfo, WithThreadInfo
+    kind = 0x0002 | 0x0004 | 0x0020 | 0x0800 | 0x1000
+    handle = k32.OpenProcess(access, False, pid)
+    if not handle:
+        return "no memory dump: OpenProcess failed with error " + str(ctypes.get_last_error())
+    path = stack_path(machine, pid).with_suffix(".dmp")
+    with open(path, "wb") as fh:
+        ok = dbghelp.MiniDumpWriteDump(handle, pid, msvcrt.get_osfhandle(fh.fileno()), kind, None, None, None)
+        error = ctypes.get_last_error()
+    k32.CloseHandle(handle)
+    if not ok:
+        path.unlink()
+        return "no memory dump: MiniDumpWriteDump failed with error " + hex(error & 0xFFFFFFFF)
+    return "memory dump: " + str(path)
+
+
+def cmd_memdump(args, config: dict) -> None:
+    """The keeper's helper: writes the memory dump in a process of its own and prints the phrase for the log line."""
+    print(write_memory_dump(args.machine, int(args.pid)))
+
+
+def memory_dump_by_helper(machine: str, pid: int) -> str:
+    """Runs write_memory_dump in a helper process (`res.py _memdump`) and returns its phrase. In the keeper itself an
+    exception there (a full disk at open(), a missing dbghelp) would end the keeper before its kill and leave the hung
+    dispatcher hanging for good, and a dump that never returned would hold the kill back; here either costs only the
+    dump, which the returned phrase says, and the kill follows. sys.executable is the venv's interpreter, also in the
+    base interpreter that the venv launcher starts."""
+    try:
+        done = subprocess.run([sys.executable, "-B", str(SCRIPT), "_memdump", machine, str(pid)], capture_output=True,
+                              text=True, timeout=180, creationflags=probes.no_window(), cwd=str(SERVICE_DIR))
+    except subprocess.TimeoutExpired:                # run() has killed the helper; the dispatcher is killed next
+        return "no memory dump: the helper took more than 180 s"
+    if done.returncode != 0:
+        tail = done.stderr.strip().splitlines()
+        return "no memory dump: the helper exited with " + str(done.returncode) + (": " + tail[-1] if tail else "")
+    return done.stdout.strip()
+
+
 class StackWatch:
     """Dumps every thread's stack into the stack file while the main loop is overdue, and only then (see cmd_dispatch).
     Its thread is a plain Python thread started once, when the dispatcher starts, and never again: when psutil has left
@@ -3802,9 +3857,11 @@ def keep(machine: str, child: subprocess.Popen, stall: float):
         else:
             quiet += poll
         if quiet > stall:
+            dump = ("; " + memory_dump_by_helper(machine, ours)) if ours is not None and sys.platform == "win32" else ""
             log(machine, "WARN dispatcher pid " + str(ours or child.pid) + " wrote no heartbeat for " + str(int(quiet))
                 + " s; killed, a new one starts; "
-                + ("its stack dumps: " + str(stack_path(machine, ours)) if ours is not None else "no stack dumps: it never beat"))
+                + ("its stack dumps: " + str(stack_path(machine, ours)) if ours is not None else "no stack dumps: it never beat")
+                + dump)
             if ours is None:                         # never beat, so it started no runner yet: its launched interpreter
                 try:
                     victims = [p.pid for p in psutil.Process(child.pid).children()]
@@ -3934,13 +3991,17 @@ def main() -> None:
     p.add_argument("machine")
     p.add_argument("ident")
     p.add_argument("launch")
+    p = sub.add_parser("_memdump")
+    p.add_argument("machine")
+    p.add_argument("pid")
     args = parser.parse_args()
     config = load_config()
-    if args.cmd not in ("_runner", "_launch"):
+    if args.cmd not in ("_runner", "_launch", "_memdump"):
         seed_local_state(THIS_MACHINE)
     handlers = {"now": cmd_now, "mine": cmd_mine, "trial": cmd_trial, "request": cmd_request, "extend": cmd_extend,
                 "release": cmd_release, "run": cmd_run, "wait": cmd_wait, "leases": cmd_leases, "status": cmd_status,
-                "compliance": cmd_compliance, "notify-test": cmd_notify_test, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner, "_launch": cmd_launch}
+                "compliance": cmd_compliance, "notify-test": cmd_notify_test, "dispatch": cmd_dispatch, "watch": cmd_watch, "_runner": cmd_runner, "_launch": cmd_launch,
+                "_memdump": cmd_memdump}
     handlers[args.cmd](args, config)
 
 

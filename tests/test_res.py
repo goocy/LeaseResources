@@ -1303,6 +1303,12 @@ class T10Keeper(Base):
                    evidence=lambda: w.logtext("Altiplano")[-2000:])
             measured("keeper.hang_replaced_seconds", round(time.monotonic() - t0, 1))
             self.assertIn("WARN dispatcher pid " + str(hung.pid) + " wrote no heartbeat for ", w.logtext("Altiplano"))
+            if WINDOWS:                                       # a full memory dump of the hung one, for WinDbg (Teppich 2026-11-21)
+                dump = w.data / "logs" / ("stack-altiplano-" + str(hung.pid) + ".dmp")
+                self.assertIn("memory dump: " + str(dump), w.logtext("Altiplano"))
+                with open(dump, "rb") as fh:
+                    self.assertEqual(fh.read(4), b"MDMP")
+                measured("keeper.memory_dump_mb", round(dump.stat().st_size / 1e6, 1))
             self.assertFalse(pid_alive(hung.pid))
             self.assertNotEqual(json.loads(beat.read_text(encoding="utf-8"))["pid"], hung.pid)
             self.assertTrue(pid_alive(run["runner_pid"]) and pid_alive(run["pid"]), "the leased job was killed with the dispatcher")
